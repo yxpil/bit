@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -30,6 +31,12 @@ pub struct Ctx {
     pub mcp: Mutex<Vec<crate::mcp::McpServer>>,
     /// 小圆片播放/暂停状态（true = 播放，自动总结进行中）
     pub autopilot_running: AtomicBool,
+    /// 会话中断标志（session_id → flag），chat_interrupt 置位后执行循环在检查点停止
+    pub interrupts: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 待审批工具调用（request_id → 应答通道）
+    pub approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// 审批请求自增 id
+    pub approval_seq: AtomicU64,
     pub server_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
@@ -118,6 +125,9 @@ impl Ctx {
             todos: Mutex::new(todos),
             sessions: Mutex::new(sessions),
             mcp: Mutex::new(mcp),
+            interrupts: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(HashMap::new()),
+            approval_seq: AtomicU64::new(1),
             autopilot_running: AtomicBool::new(false),
             server_task: Mutex::new(None),
         })

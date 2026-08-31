@@ -1,8 +1,96 @@
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ai::{self, ChatMessage};
 use crate::state::{Ctx, CHAT_MAX};
+
+/// 会话中断：注册标志（chat_interrupt 置位后，执行循环在各检查点停止）
+fn register_interrupt(ctx: &Arc<Ctx>, target: &str) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    ctx.interrupts
+        .lock()
+        .unwrap()
+        .insert(target.to_string(), flag.clone());
+    flag
+}
+
+fn clear_interrupt(ctx: &Arc<Ctx>, target: &str) {
+    ctx.interrupts.lock().unwrap().remove(target);
+}
+
+fn interrupted(ctx: &Arc<Ctx>, target: &str) -> bool {
+    ctx.interrupts
+        .lock()
+        .unwrap()
+        .get(target)
+        .map(|f| f.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+/// 工具审批：
+/// - ask：每次询问用户（全局事件 tool-approval，前端弹卡片，等待应答，120 秒超时自动拒绝）
+/// - auto：记忆/技能/目标/待办沉淀与只读类查询自动通过，其余询问
+/// - allow_all：完全放行
+async fn approve_tool(ctx: &Arc<Ctx>, tool: &str, params: &serde_json::Value) -> Result<(), String> {
+    let mode = ctx.config.lock().unwrap().tool_approval.clone();
+    if mode == "allow_all" || (mode == "auto" && is_safe_tool(tool)) {
+        return Ok(());
+    }
+    use tauri::Emitter;
+    let id = format!("ap-{}", ctx.approval_seq.fetch_add(1, Ordering::Relaxed));
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    ctx.approvals.lock().unwrap().insert(id.clone(), tx);
+    let _ = ctx.app.emit(
+        "tool-approval",
+        json!({ "id": id, "tool": tool, "params": params }),
+    );
+    crate::audit::record(
+        ctx,
+        "ai-self",
+        "tool.approval_request",
+        tool,
+        json!({ "params": params }),
+        true,
+    );
+    match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+        Ok(Ok(true)) => {
+            crate::audit::record(ctx, "user", "tool.approved", tool, json!({}), true);
+            Ok(())
+        }
+        Ok(Ok(false)) => {
+            ctx.approvals.lock().unwrap().remove(&id);
+            crate::audit::record(ctx, "user", "tool.rejected", tool, json!({}), false);
+            Err(format!("用户拒绝执行工具 `{tool}`"))
+        }
+        _ => {
+            ctx.approvals.lock().unwrap().remove(&id);
+            Err("审批超时（120 秒），已自动拒绝".into())
+        }
+    }
+}
+
+/// auto 模式下自动通过的工具：沉淀类（记忆/技能/目标/待办/AI 自写工具）与只读类查询
+fn is_safe_tool(tool: &str) -> bool {
+    const SAFE: &[&str] = &[
+        "add_memory",
+        "add_skill",
+        "goal_create",
+        "goal_update",
+        "todo_add",
+        "todo_update",
+        "todo_write",
+        "write_plugin",
+        "write_tool",
+    ];
+    if SAFE.iter().any(|s| s.eq_ignore_ascii_case(tool)) {
+        return true;
+    }
+    let lower = tool.to_lowercase();
+    ["read", "list", "search", "get", "view", "query"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
 
 /// 执行 AI 输出的单个工具调用（含 AI 自写插件能力）
 pub async fn execute_tool_call(
@@ -10,6 +98,7 @@ pub async fn execute_tool_call(
     name: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    approve_tool(ctx, name, params).await?;
     match name {
         // ---- AI 基础能力：为自己写插件并注册 ----
         "write_plugin" => {
@@ -193,6 +282,7 @@ pub async fn chat_turn(
     } else {
         session_id.to_string()
     };
+    register_interrupt(ctx, &target);
 
     // 2) 构造发给模型的对话（system + 历史 + 每轮追加的工具反馈）
     let mut convo: Vec<ChatMessage> = {
@@ -207,6 +297,10 @@ pub async fn chat_turn(
     };
 
     for round in 0..5 {
+        if interrupted(ctx, &target) {
+            clear_interrupt(ctx, &target);
+            return Err("对话已中断".into());
+        }
         // 图片只在第一轮（真正的用户轮）随请求发送，工具反馈轮不再重复携带
         let round_images: &[String] = if round == 0 { &images } else { &[] };
         let reply = ai::chat_with_images(ctx, &convo, round_images).await?;
@@ -216,6 +310,10 @@ pub async fn chat_turn(
                 // 执行工具，收集可视化记录
                 let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
                 for call in calls.iter().take(6) {
+                    if interrupted(ctx, &target) {
+                        clear_interrupt(ctx, &target);
+                        return Err("对话已中断".into());
+                    }
                     let name = call.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
                     let params = call.get("params").cloned().unwrap_or(json!({}));
                     let outcome = if name.is_empty() {
@@ -272,6 +370,7 @@ pub async fn chat_turn(
                     }
                 }
                 crate::session::persist(ctx);
+                clear_interrupt(ctx, &target);
                 let out = ctx
                     .sessions
                     .lock()
@@ -285,6 +384,7 @@ pub async fn chat_turn(
             }
         }
     }
+    clear_interrupt(ctx, &target);
     Err("工具调用轮次超出上限（5 轮）".into())
 }
 
@@ -330,6 +430,7 @@ pub async fn chat_turn_stream(
     } else {
         session_id.to_string()
     };
+    let iflag = register_interrupt(ctx, &target);
 
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
@@ -342,20 +443,41 @@ pub async fn chat_turn_stream(
     };
 
     for round in 0..5 {
+        if interrupted(ctx, &target) {
+            clear_interrupt(ctx, &target);
+            let e = "对话已中断".to_string();
+            emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
+            return Err(e);
+        }
         // 流式获取本轮回复，逐 token 推给前端
         emit(json!({ "type": "round_start" }));
         // 图片只在第一轮随请求发送
         let round_images: &[String] = if round == 0 { &images } else { &[] };
+        // 流式过程中若收到中断请求：停止推送增量，等本轮请求返回后终止
+        let stream_cancelled = Arc::new(AtomicBool::new(false));
         let reply = {
             let emit_ref = &emit;
-            ai::chat_stream_with_images(ctx, &convo, round_images, |tok| {
+            let sc = stream_cancelled.clone();
+            let iflag2 = iflag.clone();
+            ai::chat_stream_with_images(ctx, &convo, round_images, move |tok| {
+                if iflag2.load(Ordering::Relaxed) {
+                    sc.store(true, Ordering::Relaxed);
+                    return;
+                }
                 emit_ref(json!({ "type": "delta", "text": tok }));
             })
             .await
         };
+        if interrupted(ctx, &target) || stream_cancelled.load(Ordering::Relaxed) {
+            clear_interrupt(ctx, &target);
+            let e = "对话已中断".to_string();
+            emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
+            return Err(e);
+        }
         let reply = match reply {
             Ok(r) => r,
             Err(e) => {
+                clear_interrupt(ctx, &target);
                 emit(json!({ "type": "error", "error": e.clone() }));
                 return Err(e);
             }
@@ -365,6 +487,12 @@ pub async fn chat_turn_stream(
             Some(calls) if !calls.is_empty() && looks_like_tool_calls(&calls) => {
                 let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
                 for call in calls.iter().take(6) {
+                    if interrupted(ctx, &target) {
+                        clear_interrupt(ctx, &target);
+                        let e = "对话已中断".to_string();
+                        emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
+                        return Err(e);
+                    }
                     let name = call.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
                     let params = call.get("params").cloned().unwrap_or(json!({}));
                     let outcome = if name.is_empty() {
@@ -421,6 +549,7 @@ pub async fn chat_turn_stream(
                     }
                 }
                 crate::session::persist(ctx);
+                clear_interrupt(ctx, &target);
                 let out = ctx
                     .sessions
                     .lock()
@@ -435,9 +564,33 @@ pub async fn chat_turn_stream(
             }
         }
     }
+    clear_interrupt(ctx, &target);
     let err = "工具调用轮次超出上限（5 轮）".to_string();
     emit(json!({ "type": "error", "error": err.clone() }));
     Err(err)
+}
+
+/// 构造发给模型的完整上下文（system prompt + 最近消息 + 工具清单），对话与预览共用
+pub fn build_context(
+    ctx: &Arc<Ctx>,
+    session_id: &str,
+) -> Result<(Vec<ChatMessage>, serde_json::Value), String> {
+    let target = if session_id.is_empty() {
+        ctx.sessions.lock().unwrap().active.clone()
+    } else {
+        session_id.to_string()
+    };
+    let store = ctx.sessions.lock().unwrap();
+    let sess = store
+        .sessions
+        .iter()
+        .find(|s| s.id == target)
+        .ok_or("会话不存在")?;
+    let mut v = vec![ChatMessage::system(ai::system_prompt(ctx))];
+    for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
+        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
+    }
+    Ok((v, ai::tools_manifest(ctx)))
 }
 
 /// 从回复里去掉裸 JSON 工具调用块，只保留 AI 的自然语言说明

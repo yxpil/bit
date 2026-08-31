@@ -67,6 +67,13 @@ export const api = {
   mcpToggle: (id, enabled) => invoke("mcp_toggle", { id, enabled }),
   mcpRemove: (id) => invoke("mcp_remove", { id }),
   mcpImport: (id) => invoke("mcp_import", { id }),
+
+  // ── 中断 / 工具审批 / 上下文预览 ──
+  chatInterrupt: (session_id) => invoke("chat_interrupt", { sessionId: session_id || "" }),
+  toolApprove: (id, allow) => invoke("tool_approve", { id, allow }),
+  setToolApproval: (mode) => invoke("set_tool_approval", { mode }),
+  getToolApproval: () => invoke("get_tool_approval"),
+  contextPreview: (session_id) => invoke("context_preview", { sessionId: session_id || "" }),
   listSessions: () => invoke("list_sessions"),
   getSession: (session_id) => invoke("get_session", { sessionId: session_id || "" }),
   createSession: (title) => invoke("create_session", { title: title || "" }),

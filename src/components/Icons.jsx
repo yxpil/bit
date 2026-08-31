@@ -127,6 +127,34 @@ export const IconRefresh = (p) => (
   </I>
 );
 
+export const IconStop = (p) => (
+  <I {...p}>
+    <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />
+  </I>
+);
+
+export const IconEye = (p) => (
+  <I {...p}>
+    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+    <circle cx="12" cy="12" r="3" />
+  </I>
+);
+
+export const IconShield = (p) => (
+  <I {...p}>
+    <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3z" />
+  </I>
+);
+
+export const IconQueue = (p) => (
+  <I {...p}>
+    <line x1="4" y1="6" x2="20" y2="6" />
+    <line x1="4" y1="12" x2="20" y2="12" />
+    <line x1="4" y1="18" x2="14" y2="18" />
+    <path d="M18 15l3 3-3 3" />
+  </I>
+);
+
 export const IconTarget = (p) => (
   <I {...p}>
     <circle cx="12" cy="12" r="9" />

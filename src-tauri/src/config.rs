@@ -17,6 +17,13 @@ pub struct Config {
     pub password_enabled: bool,
     /// 每次保存配置自动递增
     pub revision: u64,
+    /// 工具审批模式：ask = 每次询问 / auto = 危险操作询问、安全操作自动通过 / allow_all = 完全放行
+    #[serde(default = "default_approval")]
+    pub tool_approval: String,
+}
+
+fn default_approval() -> String {
+    "allow_all".into()
 }
 
 fn default_true() -> bool {
@@ -45,6 +52,7 @@ impl Default for Config {
             access_password: Some(generate_access_password()),
             password_enabled: true,
             revision: 1,
+            tool_approval: default_approval(),
         }
     }
 }

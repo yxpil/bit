@@ -545,6 +545,104 @@ pub async fn chat_stream(
     Ok(json!({ "messages": messages }))
 }
 
+/// 立即中断某会话正在执行的任务（执行循环在下个检查点停止）
+#[tauri::command]
+pub async fn chat_interrupt(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let sid = if session_id.is_empty() { ctx.sessions.lock().unwrap().active.clone() } else { session_id };
+    let hit = {
+        let map = ctx.interrupts.lock().unwrap();
+        match map.get(&sid) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    };
+    crate::audit::record(&ctx, "local-app", "chat.interrupt", &sid, json!({ "was_running": hit }), true);
+    Ok(json!({ "id": sid, "interrupted": hit }))
+}
+
+/// 工具审批应答（允许 / 拒绝）
+#[tauri::command]
+pub async fn tool_approve(state: State<'_, Arc<Ctx>>, id: String, allow: bool) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let sender = ctx.approvals.lock().unwrap().remove(&id);
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(allow);
+            Ok(json!({ "id": id, "allow": allow }))
+        }
+        None => Err("审批请求不存在或已处理".into()),
+    }
+}
+
+/// 设置工具审批模式：ask（每次询问）/ auto（危险询问、安全自动通过）/ allow_all（完全放行）
+#[tauri::command]
+pub async fn set_tool_approval(state: State<'_, Arc<Ctx>>, mode: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    if !["ask", "auto", "allow_all"].contains(&mode.as_str()) {
+        return Err("无效的审批模式".into());
+    }
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.tool_approval = mode.clone();
+        cfg.revision += 1;
+        cfg.save(&ctx.data_dir);
+    }
+    crate::audit::record(&ctx, "local-app", "tool.approval_mode", &mode, json!({ "mode": mode }), true);
+    Ok(json!({ "mode": mode }))
+}
+
+/// 获取当前审批模式
+#[tauri::command]
+pub async fn get_tool_approval(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let mode = ctx.config.lock().unwrap().tool_approval.clone();
+    Ok(json!({ "mode": mode }))
+}
+
+/// AI 接收信息预览：当前会话实际发给模型的 system prompt / 消息 / 工具清单
+#[tauri::command]
+pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let (convo, tools) = crate::agent::build_context(&ctx, &session_id)?;
+    // 粗略 token 估算（约 2 字符/token）
+    let chars: usize = convo.iter().map(|m| m.content.chars().count()).sum();
+    let messages: Vec<serde_json::Value> = convo
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            json!({
+                "index": i,
+                "role": m.role,
+                "content": m.content,
+                "preview": m.content.chars().take(500).collect::<String>(),
+            })
+        })
+        .collect();
+    let tools_list = tools
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| {
+            Some(json!({
+                "name": t.get("name")?.as_str()?,
+                "description": t.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "system": convo.first().map(|m| m.content.clone()).unwrap_or_default(),
+        "messages": messages,
+        "tools": tools_list,
+        "est_tokens": chars / 2,
+        "approval_mode": ctx.config.lock().unwrap().tool_approval.clone(),
+    }))
+}
+
 /// 解析上传的文件（Excel→Markdown 表格 / Word(.docx)→纯文本 / CSV→原文）。
 /// `filename` 用于按后缀分派，`data` 为 base64（可含 data:URL 前缀）。
 #[tauri::command]

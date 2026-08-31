@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "../api.js";
 import { useLang } from "../i18n.js";
 import {
@@ -11,6 +12,10 @@ import {
   IconFile,
   IconLink,
   IconX,
+  IconStop,
+  IconEye,
+  IconShield,
+  IconQueue,
 } from "../components/Icons.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
 import Markdown from "../components/Markdown.jsx";
@@ -39,6 +44,27 @@ export default function ChatPage({ onStats }) {
   const [urlParse, setUrlParse] = useState(true); // true=解析网址抓正文；false=仅作为文本插入
   const imgInput = useRef(null);
   const docInput = useRef(null);
+
+  // 等待发送队列：会话执行中提交的新消息先排队，任务结束后自动按顺序发送
+  const [queues, setQueues] = useState({}); // {sid: [{bubble, composed, imgData}]}
+  const [queuePaused, setQueuePaused] = useState({}); // 中断后暂停自动续发
+  const pausedRef = useRef({});
+  // 工具审批：ask = 每次询问 / auto = 自动审批 / allow_all = 完全放行
+  const [approvals, setApprovals] = useState([]); // 待审批 [{id, tool, params}]
+  const [approvalMode, setApprovalMode] = useState("allow_all");
+  const [approvalMenu, setApprovalMenu] = useState(false);
+  // AI 接收内容预览（system / 消息 / 工具清单）
+  const [preview, setPreview] = useState(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  // 审批模式初始化 + 全局审批请求监听
+  useEffect(() => {
+    api.getToolApproval().then((r) => r?.mode && setApprovalMode(r.mode)).catch(() => {});
+    const un = listen("tool-approval", (e) => {
+      setApprovals((arr) => [...arr, e.payload]);
+    });
+    return () => un.then((f) => f());
+  }, []);
 
   // 派生：当前会话状态与全局运行数
   const busy = !!busyMap[activeId]; // 当前会话是否执行中
@@ -215,7 +241,7 @@ export default function ChatPage({ onStats }) {
   const send = async () => {
     const text = input.trim();
     // 允许只带附件（图片/文档）而无文字时也可发送
-    if ((!text && !hasAttachments) || busy || !activeId) return;
+    if ((!text && !hasAttachments) || !activeId) return;
     const sid = activeId; // 锁定目标会话：之后用户切换页面不影响本次执行
 
     // 文档正文（Excel/Word/CSV/网页）拼接到消息前作为上下文
@@ -231,23 +257,39 @@ export default function ChatPage({ onStats }) {
 
     // 气泡里展示用户实际输入（不含附件正文），并标注附件数量
     const bubble =
-      (text || (hasAttachments ? "" : "")) +
+      (text || "") +
       (hasAttachments
         ? `${text ? "\n\n" : ""}📎 ${images.length ? t("chat.attachImages") + ` ×${images.length}` : ""}${
             images.length && docs.length ? t("chat.attachSep") : ""
           }${docs.length ? t("chat.attachDocs") + ` ×${docs.length}` : ""}`
         : "");
+    const item = { composed, bubble: bubble || text, imgData };
 
     setInput("");
-    setBusyMap((m) => ({ ...m, [sid]: true }));
-    setLiveMap((m) => ({ ...m, [sid]: { text: "", cards: [] } }));
-    if (activeRef.current === sid) {
-      setMessages((msgs) => [...msgs, { role: "user", content: bubble || text }]);
-    }
-    // 发送后清空附件
     setImages([]);
     setDocs([]);
     setAttachErr("");
+
+    // 会话执行中：加入等待队列，当前任务结束后自动按顺序发送
+    if (busyMap[sid]) {
+      setQueues((q) => ({ ...q, [sid]: [...(q[sid] || []), item] }));
+      if (activeRef.current === sid) {
+        setMessages((msgs) => [...msgs, { role: "user", content: `${item.bubble}\n\n⏳` }]);
+      }
+      return;
+    }
+
+    setBusyMap((m) => ({ ...m, [sid]: true }));
+    setLiveMap((m) => ({ ...m, [sid]: { text: "", cards: [] } }));
+    if (activeRef.current === sid) {
+      setMessages((msgs) => [...msgs, { role: "user", content: item.bubble }]);
+    }
+    runTask(sid, item);
+  };
+
+  // 实际执行一次对话任务（流式），结束时自动续发该会话的等待队列
+  const runTask = async (sid, item) => {
+    setLiveMap((m) => ({ ...m, [sid]: m[sid] || { text: "", cards: [] } }));
     // 结束时移除该会话的运行/流式状态
     const endLive = () =>
       setLiveMap((m) => {
@@ -256,7 +298,7 @@ export default function ChatPage({ onStats }) {
         return n;
       });
     try {
-      const res = await api.chatStream(sid, composed, null, (ev) => {
+      const res = await api.chatStream(sid, item.composed, null, (ev) => {
         if (!ev || typeof ev !== "object") return;
         switch (ev.type) {
           case "round_start":
@@ -285,6 +327,7 @@ export default function ChatPage({ onStats }) {
             endLive();
             break;
           case "error":
+            if (ev.interrupted) setPausedFor(sid, true); // 中断后队列暂停，不自动续发
             if (activeRef.current === sid) {
               setMessages((msgs) => [...msgs, { role: "assistant", content: t("chat.callFailed") + ev.error }]);
             }
@@ -293,7 +336,7 @@ export default function ChatPage({ onStats }) {
           default:
             break;
         }
-      }, imgData);
+      }, item.imgData);
       if (activeRef.current === sid && res?.messages) setMessages(res.messages);
       endLive();
       loadSessions();
@@ -309,6 +352,69 @@ export default function ChatPage({ onStats }) {
         delete n[sid];
         return n;
       });
+      pumpQueue(sid);
+    }
+  };
+
+  // ── 等待发送队列 ──
+  const setPausedFor = (sid, v) => {
+    pausedRef.current = { ...pausedRef.current, [sid]: v };
+    setQueuePaused(pausedRef.current);
+  };
+
+  const clearQueue = (sid) => {
+    setQueues((q) => {
+      const n = { ...q };
+      delete n[sid];
+      return n;
+    });
+  };
+
+  const removeQueueItem = (sid, i) =>
+    setQueues((q) => ({ ...q, [sid]: (q[sid] || []).filter((_, j) => j !== i) }));
+
+  // 任务结束后按顺序续发；被中断的会话暂停续发，需手动「继续」
+  const pumpQueue = (sid) => {
+    if (pausedRef.current[sid]) return;
+    setQueues((q) => {
+      const arr = q[sid] || [];
+      if (arr.length === 0) return q;
+      const [next, ...rest] = arr;
+      setTimeout(() => runTask(sid, next), 50);
+      return { ...q, [sid]: rest };
+    });
+  };
+
+  const resumeQueue = (sid) => {
+    setPausedFor(sid, false);
+    pumpQueue(sid);
+  };
+
+  // 立即中断当前会话任务；队列保留并暂停
+  const interrupt = async () => {
+    if (!activeId) return;
+    setPausedFor(activeId, true);
+    await api.chatInterrupt(activeId).catch(() => {});
+  };
+
+  // ── 工具审批 ──
+  const answerApproval = async (id, allow) => {
+    setApprovals((arr) => arr.filter((a) => a.id !== id));
+    await api.toolApprove(id, allow).catch(() => {});
+  };
+
+  const changeApprovalMode = (mode) => {
+    setApprovalMode(mode);
+    setApprovalMenu(false);
+    api.setToolApproval(mode).catch(() => {});
+  };
+
+  // ── AI 接收内容预览 ──
+  const openPreview = async () => {
+    const r = await api.contextPreview(activeId).catch(() => null);
+    if (r) {
+      setPreview(r);
+      setPreviewOpen(true);
     }
   };
 
@@ -553,6 +659,60 @@ export default function ChatPage({ onStats }) {
             </div>
           )}
 
+          {/* 等待发送队列 */}
+          {queues[activeId]?.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 px-1">
+              <span className="flex items-center gap-1 text-[11px] text-neutral-400">
+                <IconQueue size={13} />
+                {queues[activeId].length} {t("chat.queued")}
+              </span>
+              {queues[activeId].map((q, i) => (
+                <span
+                  key={i}
+                  className="flex max-w-[220px] items-center gap-1 rounded-full bg-neutral-900/5 px-2.5 py-1 text-[11px] dark:bg-white/10"
+                >
+                  <span className="truncate">{(q.bubble || "").split("\n")[0]}</span>
+                  <button onClick={() => removeQueueItem(activeId, i)} title={t("common.remove")}>
+                    <IconX size={10} />
+                  </button>
+                </span>
+              ))}
+              {queuePaused[activeId] && (
+                <>
+                  <span className="text-[11px] text-amber-500">{t("chat.queuePaused")}</span>
+                  <button onClick={() => resumeQueue(activeId)} className="text-[11px] text-emerald-500 hover:underline">
+                    {t("chat.resumeQueue")}
+                  </button>
+                </>
+              )}
+              <button onClick={() => clearQueue(activeId)} className="text-[11px] text-neutral-400 hover:text-red-500">
+                {t("chat.clearAll")}
+              </button>
+            </div>
+          )}
+
+          {/* 工具审批卡片 */}
+          {approvals.map((a) => (
+            <div key={a.id} className="card border-amber-400/60 p-3 dark:border-amber-500/40">
+              <div className="mb-2 flex items-center gap-2 text-sm font-medium">
+                <IconShield size={15} className="text-amber-500" />
+                {t("chat.approvalTitle")}
+                <span className="font-mono">{a.tool}</span>
+              </div>
+              <pre className="mb-2 max-h-32 overflow-auto rounded-xl bg-neutral-100 p-2 text-[11px] dark:bg-neutral-900">
+                {JSON.stringify(a.params, null, 2)}
+              </pre>
+              <div className="flex gap-2">
+                <button onClick={() => answerApproval(a.id, true)} className="pill pill-hover">
+                  {t("chat.approve")}
+                </button>
+                <button onClick={() => answerApproval(a.id, false)} className="pill pill-outline text-red-500">
+                  {t("chat.reject")}
+                </button>
+              </div>
+            </div>
+          ))}
+
           {/* 隐藏文件输入 */}
           <input
             ref={imgInput}
@@ -665,6 +825,48 @@ export default function ChatPage({ onStats }) {
           )}
 
           <div className="flex items-center gap-2">
+            {/* 上下文预览 */}
+            <button
+              onClick={openPreview}
+              disabled={!activeId}
+              title={t("chat.preview")}
+              className="shrink-0 rounded-full p-2 text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-white/10 dark:hover:text-white"
+            >
+              <IconEye size={18} />
+            </button>
+            {/* 工具审批模式 */}
+            <div className="relative shrink-0">
+              <button
+                onClick={() => setApprovalMenu((v) => !v)}
+                title={t("chat.approvalMode")}
+                className={`shrink-0 rounded-full p-2 transition-colors ${
+                  approvalMode !== "allow_all"
+                    ? "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                    : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
+                }`}
+              >
+                <IconShield size={18} />
+              </button>
+              {approvalMenu && (
+                <div className="card absolute bottom-11 left-0 z-20 w-44 p-1">
+                  {[
+                    ["ask", "chat.approvalAsk"],
+                    ["auto", "chat.approvalAuto"],
+                    ["allow_all", "chat.approvalAllowAll"],
+                  ].map(([m, k]) => (
+                    <button
+                      key={m}
+                      onClick={() => changeApprovalMode(m)}
+                      className={`w-full rounded-lg px-3 py-1.5 text-left text-xs hover:bg-neutral-900/5 dark:hover:bg-white/10 ${
+                        approvalMode === m ? "font-semibold" : "text-neutral-500 dark:text-neutral-400"
+                      }`}
+                    >
+                      {t(k)}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             {/* 附件工具栏 */}
             <button
               onClick={() => imgInput.current?.click()}
@@ -707,18 +909,99 @@ export default function ChatPage({ onStats }) {
               }
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && send()}
-              disabled={busy || !activeId}
+              disabled={!activeId}
             />
+            {busy && (
+              <button
+                onClick={interrupt}
+                title={t("chat.stop")}
+                className="pill shrink-0 bg-red-500/10 text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-400"
+              >
+                <IconStop size={13} />
+                {t("chat.stop")}
+              </button>
+            )}
             <button
               onClick={send}
-              disabled={busy || (!input.trim() && !hasAttachments) || !activeId}
+              disabled={(!input.trim() && !hasAttachments) || !activeId}
+              title={busy ? t("chat.enqueue") : t("common.send")}
               className="pill pill-hover shrink-0"
             >
-              <IconSend size={15} />
-              {t("common.send")}
+              {busy ? <IconQueue size={15} /> : <IconSend size={15} />}
+              {busy ? t("chat.enqueue") : t("common.send")}
             </button>
           </div>
         </div>
+
+        {/* AI 接收内容预览 */}
+        {previewOpen && preview && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6"
+            onClick={() => setPreviewOpen(false)}
+          >
+            <div
+              className="card flex max-h-[85vh] w-full max-w-2xl flex-col gap-3 overflow-hidden p-4"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between">
+                <h3 className="font-semibold">{t("chat.preview")}</h3>
+                <div className="flex items-center gap-3 text-xs text-neutral-400">
+                  <span>
+                    {preview.messages.length - 1} {t("chat.previewMsgsCount")}
+                  </span>
+                  <span>
+                    {preview.tools.length} {t("chat.previewToolsShort")}
+                  </span>
+                  <span>
+                    {t("chat.previewTokens")} ~{preview.est_tokens}
+                  </span>
+                  <button onClick={() => setPreviewOpen(false)} title={t("common.close")}>
+                    <IconX size={14} />
+                  </button>
+                </div>
+              </div>
+              <div className="min-h-0 flex-1 space-y-3 overflow-y-auto">
+                <div>
+                  <p className="mb-1 text-xs font-semibold text-neutral-500">{t("chat.previewSystem")}</p>
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-xl bg-neutral-100 p-2.5 text-[11px] leading-relaxed dark:bg-neutral-900">
+                    {preview.system}
+                  </pre>
+                </div>
+                <div>
+                  <p className="mb-1 text-xs font-semibold text-neutral-500">{t("chat.previewMsgs")}</p>
+                  <div className="space-y-1">
+                    {preview.messages.slice(1).map((m) => (
+                      <div
+                        key={m.index}
+                        className="rounded-xl bg-neutral-100 px-2.5 py-1.5 text-[11px] dark:bg-neutral-900"
+                      >
+                        <span className="mr-2 font-mono font-semibold">{m.role}</span>
+                        <span className="text-neutral-500">
+                          {m.preview}
+                          {m.content.length > m.preview.length ? "…" : ""}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <p className="mb-1 text-xs font-semibold text-neutral-500">{t("chat.previewTools")}</p>
+                  <div className="flex flex-wrap gap-1">
+                    {preview.tools.map((tl, i) => (
+                      <span
+                        key={i}
+                        title={tl.description}
+                        className="rounded-full border border-neutral-200 px-2 py-0.5 font-mono text-[10px] dark:border-neutral-700"
+                      >
+                        {tl.name}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

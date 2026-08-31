@@ -1,6 +1,6 @@
 [package]
 name = "bit"
-version = "0.1.5"
+version = "0.1.6"
 description = "BIT - Agent Tool Hub with audit and remote access"
 edition = "2021"
 
