@@ -603,6 +603,43 @@ pub async fn get_tool_approval(state: State<'_, Arc<Ctx>>) -> Result<serde_json:
     Ok(json!({ "mode": mode }))
 }
 
+/// 读取模型采样参数（温度 / 思考强度）
+#[tauri::command]
+pub fn get_ai_params(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let cfg = ctx.ai_config.lock().unwrap();
+    json!({ "temperature": cfg.temperature, "reasoning_effort": cfg.reasoning_effort })
+}
+
+/// 设置模型采样参数：temperature None=默认（0-2）；reasoning_effort ""=默认 / low / medium / high
+#[tauri::command]
+pub fn set_ai_params(
+    state: State<'_, Arc<Ctx>>,
+    temperature: Option<f64>,
+    reasoning_effort: String,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let effort = match reasoning_effort.as_str() {
+        "low" | "medium" | "high" => reasoning_effort,
+        _ => String::new(),
+    };
+    {
+        let mut cfg = ctx.ai_config.lock().unwrap();
+        cfg.temperature = temperature.filter(|t| (0.0..=2.0).contains(t));
+        cfg.reasoning_effort = effort.clone();
+    }
+    ctx.save_ai_config();
+    crate::audit::record(
+        &ctx,
+        "local-app",
+        "ai.params",
+        "set",
+        json!({ "temperature": temperature, "reasoning_effort": effort }),
+        true,
+    );
+    Ok(json!({ "ok": true }))
+}
+
 /// AI 接收信息预览：当前会话实际发给模型的 system prompt / 消息 / 工具清单
 #[tauri::command]
 pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {

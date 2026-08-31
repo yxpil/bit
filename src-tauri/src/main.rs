@@ -97,6 +97,8 @@ fn main() {
             commands::tool_approve,
             commands::set_tool_approval,
             commands::get_tool_approval,
+            commands::get_ai_params,
+            commands::set_ai_params,
             commands::context_preview,
             commands::list_sessions,
             commands::get_session,

@@ -32,6 +32,10 @@ export const api = {
     invoke("update_provider", { id, name, protocol, baseUrl: base_url, apiKey: api_key, model }),
   removeProvider: (id) => invoke("remove_provider", { id }),
   setProviderActive: (id, active) => invoke("set_provider_active", { id, active }),
+  // 模型采样参数：temperature null=默认（0-2）；reasoningEffort ""=默认 / low / medium / high
+  getAiParams: () => invoke("get_ai_params"),
+  setAiParams: (temperature, reasoning_effort) =>
+    invoke("set_ai_params", { temperature, reasoningEffort: reasoning_effort }),
   chat: (session_id, message, images) =>
     invoke("chat", { sessionId: session_id, message, images: images || null }),
   // 流式对话：过程通过 Tauri 事件 event_name 推送增量，onEvent 收到 {type, ...} payload。

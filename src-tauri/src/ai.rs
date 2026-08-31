@@ -40,6 +40,12 @@ impl Provider {
 pub struct AiConfig {
     #[serde(default)]
     pub providers: Vec<Provider>,
+    /// 思考强度：""=默认（不发送参数）/ low / medium / high
+    #[serde(default)]
+    pub reasoning_effort: String,
+    /// 温度：None=默认（不发送参数），范围 0-2
+    #[serde(default)]
+    pub temperature: Option<f64>,
 }
 
 impl AiConfig {
@@ -91,6 +97,64 @@ pub async fn chat(ctx: &Arc<crate::state::Ctx>, messages: &[ChatMessage]) -> Res
     chat_with_images(ctx, messages, &[]).await
 }
 
+/// 把用户设置的思考强度 / 温度按协议注入请求体。
+/// 默认档（空 / None）不发送任何参数，保持提供方自身默认，避免不支持参数的模型报错。
+/// - OpenAI：reasoning_effort + temperature
+/// - Claude：thinking.budget_tokens（low=2048/medium=8192/high=16384），max_tokens 自动放大；温度范围 0-1，开思考时忽略
+/// - Gemini：generationConfig.thinkingBudget（low=1024/medium=8192/high=24576）+ temperature
+fn apply_params(protocol: &str, body: &mut serde_json::Value, cfg: &AiConfig) {
+    let effort = cfg.reasoning_effort.as_str();
+    let temp = cfg.temperature;
+    match protocol {
+        "openai" => {
+            if let Some(t) = temp {
+                body["temperature"] = serde_json::json!(t);
+            }
+            if !effort.is_empty() {
+                body["reasoning_effort"] = serde_json::json!(effort);
+            }
+        }
+        "claude" => {
+            if !effort.is_empty() {
+                let budget = match effort {
+                    "low" => 2048,
+                    "high" => 16384,
+                    _ => 8192,
+                };
+                let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096);
+                // Claude 要求 max_tokens > budget_tokens
+                body["max_tokens"] = serde_json::json!(max_tokens.max(budget + 4096));
+                body["thinking"] =
+                    serde_json::json!({ "type": "enabled", "budget_tokens": budget });
+            } else if let Some(t) = temp {
+                // Claude 温度范围 0-1（OpenAI 风格 0-2 折半映射）
+                body["temperature"] = serde_json::json!(t / 2.0);
+            }
+        }
+        "gemini" => {
+            let mut gc = serde_json::Map::new();
+            if let Some(t) = temp {
+                gc.insert("temperature".to_string(), serde_json::json!(t));
+            }
+            if !effort.is_empty() {
+                let budget = match effort {
+                    "low" => 1024,
+                    "high" => 24576,
+                    _ => 8192,
+                };
+                gc.insert(
+                    "thinkingConfig".to_string(),
+                    serde_json::json!({ "thinkingBudget": budget }),
+                );
+            }
+            if !gc.is_empty() {
+                body["generationConfig"] = serde_json::Value::Object(gc);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 带图片（base64 data URL）的一次性对话：图片仅附加到最后一条 user 消息（多模态）
 pub async fn chat_with_images(
     ctx: &Arc<crate::state::Ctx>,
@@ -105,6 +169,10 @@ pub async fn chat_with_images(
     if p.api_key.is_empty() {
         return Err(format!("提供方「{}」未填写 API Key", p.name));
     }
+    let params = {
+        let cfg = ctx.ai_config.lock().unwrap();
+        cfg.clone()
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -112,9 +180,9 @@ pub async fn chat_with_images(
         .map_err(|e| e.to_string())?;
 
     match p.protocol.as_str() {
-        "gemini" => chat_gemini(&client, &p, messages, images).await,
-        "claude" => chat_claude(&client, &p, messages, images).await,
-        _ => chat_openai(&client, &p, messages, images).await,
+        "gemini" => chat_gemini(&client, &p, messages, images, &params).await,
+        "claude" => chat_claude(&client, &p, messages, images, &params).await,
+        _ => chat_openai(&client, &p, messages, images, &params).await,
     }
 }
 
@@ -135,24 +203,28 @@ pub async fn chat_stream_with_images<F: FnMut(&str)>(
     if p.api_key.is_empty() {
         return Err(format!("提供方「{}」未填写 API Key", p.name));
     }
+    let params = {
+        let cfg = ctx.ai_config.lock().unwrap();
+        cfg.clone()
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|e| e.to_string())?;
 
     let res = match p.protocol.as_str() {
-        "gemini" => stream_gemini(&client, &p, messages, images, &mut on_token).await,
-        "claude" => stream_claude(&client, &p, messages, images, &mut on_token).await,
-        _ => stream_openai(&client, &p, messages, images, &mut on_token).await,
+        "gemini" => stream_gemini(&client, &p, messages, images, &params, &mut on_token).await,
+        "claude" => stream_claude(&client, &p, messages, images, &params, &mut on_token).await,
+        _ => stream_openai(&client, &p, messages, images, &params, &mut on_token).await,
     };
     match res {
         Ok(full) => Ok(full),
         // 流式失败（部分服务不支持 SSE）时退回普通请求
         Err(_) => {
             let full = match p.protocol.as_str() {
-                "gemini" => chat_gemini(&client, &p, messages, images).await,
-                "claude" => chat_claude(&client, &p, messages, images).await,
-                _ => chat_openai(&client, &p, messages, images).await,
+                "gemini" => chat_gemini(&client, &p, messages, images, &params).await,
+                "claude" => chat_claude(&client, &p, messages, images, &params).await,
+                _ => chat_openai(&client, &p, messages, images, &params).await,
             }?;
             on_token(&full);
             Ok(full)
@@ -308,11 +380,13 @@ async fn stream_openai<F: FnMut(&str)>(
     p: &Provider,
     messages: &[ChatMessage],
     images: &[String],
+    params: &AiConfig,
     on_token: &mut F,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
     let msgs = openai_messages(messages, images);
-    let body = serde_json::json!({ "model": p.model, "messages": msgs, "stream": true });
+    let mut body = serde_json::json!({ "model": p.model, "messages": msgs, "stream": true });
+    apply_params("openai", &mut body, params);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", p.api_key))
@@ -346,12 +420,14 @@ async fn stream_claude<F: FnMut(&str)>(
     p: &Provider,
     messages: &[ChatMessage],
     images: &[String],
+    params: &AiConfig,
     on_token: &mut F,
 ) -> Result<String, String> {
     let (system_txt, msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model, "max_tokens": 4096, "messages": msgs, "stream": true
     });
+    apply_params("claude", &mut body, params);
     if !system_txt.is_empty() {
         body["system"] = serde_json::json!(system_txt);
     }
@@ -392,10 +468,12 @@ async fn stream_gemini<F: FnMut(&str)>(
     p: &Provider,
     messages: &[ChatMessage],
     images: &[String],
+    params: &AiConfig,
     on_token: &mut F,
 ) -> Result<String, String> {
     let (system_txt, contents) = gemini_contents(messages, images);
     let mut body = serde_json::json!({ "contents": contents });
+    apply_params("gemini", &mut body, params);
     if !system_txt.is_empty() {
         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system_txt }] });
     }
@@ -434,11 +512,13 @@ async fn chat_openai(
     p: &Provider,
     messages: &[ChatMessage],
     images: &[String],
+    params: &AiConfig,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
     // 只发送 role/content（图片挂到最后一条 user），剥离本地可视化用的 tool_calls 字段
     let msgs = openai_messages(messages, images);
-    let body = serde_json::json!({ "model": p.model, "messages": msgs });
+    let mut body = serde_json::json!({ "model": p.model, "messages": msgs });
+    apply_params("openai", &mut body, params);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", p.api_key))
@@ -460,10 +540,12 @@ async fn chat_gemini(
     p: &Provider,
     messages: &[ChatMessage],
     images: &[String],
+    params: &AiConfig,
 ) -> Result<String, String> {
     // system 合并进 systemInstruction，其余转为 contents（role: user/model），图片挂到最后一条 user
     let (system_txt, contents) = gemini_contents(messages, images);
     let mut body = serde_json::json!({ "contents": contents });
+    apply_params("gemini", &mut body, params);
     if !system_txt.is_empty() {
         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system_txt }] });
     }
@@ -493,6 +575,7 @@ async fn chat_claude(
     p: &Provider,
     messages: &[ChatMessage],
     images: &[String],
+    params: &AiConfig,
 ) -> Result<String, String> {
     // system 单独抽出，其余作为 messages（role: user/assistant），图片挂到最后一条 user
     let (system_txt, msgs) = claude_messages(messages, images);
@@ -501,6 +584,7 @@ async fn chat_claude(
         "max_tokens": 4096,
         "messages": msgs,
     });
+    apply_params("claude", &mut body, params);
     if !system_txt.is_empty() {
         body["system"] = serde_json::json!(system_txt);
     }

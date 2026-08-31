@@ -279,16 +279,16 @@ export default function ChatPage({ onStats }) {
       return;
     }
 
-    setBusyMap((m) => ({ ...m, [sid]: true }));
-    setLiveMap((m) => ({ ...m, [sid]: { text: "", cards: [] } }));
     if (activeRef.current === sid) {
       setMessages((msgs) => [...msgs, { role: "user", content: item.bubble }]);
     }
     runTask(sid, item);
   };
 
-  // 实际执行一次对话任务（流式），结束时自动续发该会话的等待队列
+  // 实际执行一次对话任务（流式），结束时自动续发该会话的等待队列。
+  // busy 标记统一在此设置：无论是直接发送还是队列续发，执行期间新消息都会正确排队
   const runTask = async (sid, item) => {
+    setBusyMap((m) => ({ ...m, [sid]: true }));
     setLiveMap((m) => ({ ...m, [sid]: m[sid] || { text: "", cards: [] } }));
     // 结束时移除该会话的运行/流式状态
     const endLive = () =>

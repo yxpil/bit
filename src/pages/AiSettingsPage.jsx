@@ -21,12 +21,25 @@ export default function AiSettingsPage({ onStats, stats }) {
   const [form, setForm] = useState(EMPTY); // 新增 / 编辑用同一张表单
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
+  // 模型采样参数：temperature null=默认；reasoning_effort ""=默认 / low / medium / high
+  const [params, setParams] = useState({ temperature: null, reasoning_effort: "" });
+  const [paramsSaved, setParamsSaved] = useState(false);
 
   const load = () =>
     api.listProviders().then((r) => setProviders(r.providers || [])).catch(() => {});
   useEffect(() => {
     load();
+    api.getAiParams().then((r) => setParams({ temperature: r?.temperature ?? null, reasoning_effort: r?.reasoning_effort || "" })).catch(() => {});
   }, []);
+
+  // 变更即保存
+  const saveParams = (next) => {
+    setParams(next);
+    api.setAiParams(next.temperature, next.reasoning_effort).then(() => {
+      setParamsSaved(true);
+      setTimeout(() => setParamsSaved(false), 1500);
+    }).catch(() => {});
+  };
 
   const editing = form.id !== null;
 
@@ -178,6 +191,93 @@ export default function AiSettingsPage({ onStats, stats }) {
             </button>
           </div>
         ))}
+      </div>
+
+      {/* 模型参数：思考强度 + 温度 */}
+      <div className="card flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-medium">{t("ai.paramsTitle")}</p>
+          {paramsSaved && (
+            <span className="flex items-center gap-1 text-xs text-neutral-500">
+              <IconCheck size={14} />
+              {t("common.saved")}
+            </span>
+          )}
+        </div>
+
+        <div>
+          <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.reasoningLabel")}</label>
+          <div className="flex gap-2">
+            {[
+              ["", t("ai.thinkDefault")],
+              ["low", t("ai.thinkLow")],
+              ["medium", t("ai.thinkMedium")],
+              ["high", t("ai.thinkHigh")],
+            ].map(([v, label]) => (
+              <button
+                key={v || "default"}
+                type="button"
+                onClick={() => saveParams({ ...params, reasoning_effort: v })}
+                className={`flex-1 rounded-full px-3 py-2 text-xs font-medium transition-all ${
+                  params.reasoning_effort === v
+                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1 px-2 text-[11px] text-neutral-400">{t("ai.reasoningHint")}</p>
+        </div>
+
+        <div>
+          <div className="mb-1 flex items-center justify-between px-2">
+            <label className="text-xs text-neutral-500">{t("ai.temperatureLabel")}</label>
+            <div className="flex gap-1">
+              <button
+                type="button"
+                onClick={() => params.temperature !== null && saveParams({ ...params, temperature: null })}
+                className={`rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                  params.temperature === null
+                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
+                }`}
+              >
+                {t("ai.thinkDefault")}
+              </button>
+              <button
+                type="button"
+                onClick={() => (params.temperature === null ? saveParams({ ...params, temperature: 0.7 }) : saveParams({ ...params, temperature: Math.min(2, Math.max(0, params.temperature)) }))}
+                className={`rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                  params.temperature !== null
+                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
+                }`}
+              >
+                {t("ai.tempCustom")}
+              </button>
+            </div>
+          </div>
+          {params.temperature !== null ? (
+            <div className="flex items-center gap-3 px-2">
+              <input
+                type="range"
+                min="0"
+                max="2"
+                step="0.1"
+                value={params.temperature}
+                onChange={(e) => setParams({ ...params, temperature: parseFloat(e.target.value) })}
+                onMouseUp={(e) => saveParams({ ...params, temperature: parseFloat(e.target.value) })}
+                onTouchEnd={(e) => saveParams({ ...params, temperature: parseFloat(e.target.value) })}
+                className="flex-1"
+              />
+              <span className="w-10 text-right text-xs tabular-nums">{params.temperature.toFixed(1)}</span>
+            </div>
+          ) : (
+            <p className="px-2 text-[11px] text-neutral-400">{t("ai.temperatureDefaultHint")}</p>
+          )}
+        </div>
       </div>
 
       {/* 新增 / 编辑表单 */}
