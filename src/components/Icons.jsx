@@ -223,3 +223,27 @@ export const IconChevronRight = (p) => (
     <path d="M9 6l6 6-6 6" />
   </I>
 );
+
+/* ---- 附件：图片 / 文件 / 链接 ---- */
+
+export const IconImage = (p) => (
+  <I {...p}>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <circle cx="8.5" cy="8.5" r="1.5" />
+    <path d="M21 15l-5-5L5 21" />
+  </I>
+);
+
+export const IconFile = (p) => (
+  <I {...p}>
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <path d="M14 2v6h6" />
+  </I>
+);
+
+export const IconLink = (p) => (
+  <I {...p}>
+    <path d="M10 13a5 5 0 0 0 7.07 0l2-2a5 5 0 0 0-7.07-7.07l-1.5 1.5" />
+    <path d="M14 11a5 5 0 0 0-7.07 0l-2 2a5 5 0 0 0 7.07 7.07l1.5-1.5" />
+  </I>
+);

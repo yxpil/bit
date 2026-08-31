@@ -2,6 +2,7 @@ use crate::state::Ctx;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -45,6 +46,9 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/tools/{id}/invoke", post(invoke_tool))
         .route("/api/chat", post(remote_chat))
         .route("/api/audit", get(list_audit))
+        // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
+        .route("/v1/models", get(openai_models))
+        .route("/v1/chat/completions", post(openai_chat_completions))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
         .with_state(ctx)
 }
@@ -53,12 +57,14 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true, "service": "BIT", "time": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string() }))
 }
 
-/// 双重认证：Bearer Client Key + X-Access-Password 访问密码，含 HTTP 请求审计
+/// 双重认证：Bearer Client Key + X-Access-Password 访问密码，含 HTTP 请求审计。
+/// OpenAI 兼容端点（/v1/）例外：OpenAI 客户端无法携带自定义头，仅校验 Client Key。
 async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     if path == "/api/health" {
         return next.run(req).await;
     }
+    let openai_endpoint = path.starts_with("/v1/");
 
     let cfg = ctx.config.lock().unwrap().clone();
     let provided = req
@@ -80,31 +86,33 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
         );
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "无效的 Client Key" })),
+            Json(json!({ "error": { "message": "无效的 API Key（BIT Client Key）", "type": "invalid_request_error", "code": "invalid_api_key" } })),
         )
             .into_response();
     }
 
-    // 第二重：访问密码校验
-    let provided_pwd = req
-        .headers()
-        .get("x-access-password")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !cfg.verify_access_password(provided_pwd) {
-        crate::audit::record(
-            &ctx,
-            &actor_of(&provided),
-            "http.auth_failed",
-            &path,
-            json!({ "reason": "access_password" }),
-            false,
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "访问密码错误或缺失（需 X-Access-Password 头）" })),
-        )
-            .into_response();
+    // 第二重：访问密码校验（OpenAI 兼容端点跳过）
+    if !openai_endpoint {
+        let provided_pwd = req
+            .headers()
+            .get("x-access-password")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !cfg.verify_access_password(provided_pwd) {
+            crate::audit::record(
+                &ctx,
+                &actor_of(&provided),
+                "http.auth_failed",
+                &path,
+                json!({ "reason": "access_password" }),
+                false,
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "访问密码错误或缺失（需 X-Access-Password 头）" })),
+            )
+                .into_response();
+        }
     }
 
     let actor = actor_of(&provided);
@@ -256,7 +264,7 @@ async fn remote_chat(
             .into_response();
     }
 
-    match crate::agent::chat_turn(&ctx, &session_id, &message).await {
+    match crate::agent::chat_turn(&ctx, &session_id, &message, Vec::new()).await {
         Ok(messages) => {
             let last = messages
                 .iter()
@@ -272,5 +280,191 @@ async fn remote_chat(
             Json(json!({ "error": e })),
         )
             .into_response(),
+    }
+}
+
+// ==================== OpenAI 兼容端点 ====================
+// 第三方 OpenAI 格式客户端（Cherry Studio / LobeChat / 沉浸式翻译等）可直接接入：
+// Base URL = http://<host>:<port>/v1，API Key = BIT 的 Client Key
+
+#[derive(serde::Deserialize)]
+struct OaiRequest {
+    // 接收但忽略：实际路由始终由 BIT 激活的 Provider 决定
+    #[allow(dead_code)]
+    #[serde(default)]
+    model: String,
+    messages: Vec<OaiMessage>,
+    #[serde(default)]
+    stream: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct OaiMessage {
+    role: String,
+    /// OpenAI 格式：字符串 或 多模态数组 [{type:"text",...},{type:"image_url",...}]
+    #[serde(default)]
+    content: serde_json::Value,
+}
+
+/// OpenAI messages → (BIT ChatMessage 列表, 图片列表)
+fn convert_oai_messages(msgs: &[OaiMessage]) -> (Vec<crate::ai::ChatMessage>, Vec<String>) {
+    use crate::ai::ChatMessage;
+    let mut out = Vec::new();
+    let mut images = Vec::new();
+    for m in msgs {
+        let mut text = String::new();
+        match &m.content {
+            serde_json::Value::String(s) => text = s.clone(),
+            serde_json::Value::Array(parts) => {
+                for p in parts {
+                    match p.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                        Some("image_url") => {
+                            if let Some(u) = p
+                                .get("image_url")
+                                .and_then(|iu| iu.get("url"))
+                                .and_then(|v| v.as_str())
+                            {
+                                images.push(u.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push(match m.role.as_str() {
+            "system" | "developer" => ChatMessage::system(&text),
+            "assistant" => ChatMessage::assistant(&text),
+            _ => ChatMessage::user(&text),
+        });
+    }
+    (out, images)
+}
+
+/// GET /v1/models：返回激活 Provider 的模型，供客户端校验
+async fn openai_models(State(ctx): State<Arc<Ctx>>) -> Response {
+    let model = {
+        let cfg = ctx.ai_config.lock().unwrap();
+        cfg.active().map(|p| p.model.clone()).unwrap_or_else(|| "bit".into())
+    };
+    Json(json!({
+        "object": "list",
+        "data": [
+            { "id": model, "object": "model", "created": 0, "owned_by": "bit" },
+            { "id": "bit", "object": "model", "created": 0, "owned_by": "bit" }
+        ]
+    }))
+    .into_response()
+}
+
+/// POST /v1/chat/completions：OpenAI 格式对话（支持 stream SSE 与非流式）
+/// 直接透传给激活的 AI Provider，不进入 Agent 工具循环（客户端发来的是完整对话历史）
+async fn openai_chat_completions(
+    State(ctx): State<Arc<Ctx>>,
+    headers: HeaderMap,
+    Json(req): Json<OaiRequest>,
+) -> Response {
+    let actor = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| actor_of(v.strip_prefix("Bearer ").unwrap_or("")))
+        .unwrap_or_else(|| "agent:unknown".into());
+
+    let (messages, images) = convert_oai_messages(&req.messages);
+    if messages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "messages 不能为空", "type": "invalid_request_error" } })),
+        )
+            .into_response();
+    }
+
+    let model = {
+        let cfg = ctx.ai_config.lock().unwrap();
+        cfg.active().map(|p| p.model.clone()).unwrap_or_else(|| "bit".into())
+    };
+    let created = chrono::Utc::now().timestamp();
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+
+    if req.stream {
+        // 流式：SSE，逐 token 输出 OpenAI chunk 格式
+        let ctx2 = ctx.clone();
+        let actor2 = actor.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+        tauri::async_runtime::spawn(async move {
+            let send_chunk = |delta: serde_json::Value, finish: Option<&str>| {
+                let _ = tx.send(Ok(Event::default().data(
+                    json!({
+                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }]
+                    })
+                    .to_string(),
+                )));
+            };
+            // 首个 chunk 带 role
+            send_chunk(json!({ "role": "assistant" }), None);
+
+            let result = crate::ai::chat_stream_with_images(&ctx2, &messages, &images, |tok| {
+                send_chunk(json!({ "content": tok }), None);
+            })
+            .await;
+
+            match result {
+                Ok(_) => {
+                    send_chunk(json!({}), Some("stop"));
+                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                    crate::audit::record(&ctx2, &actor2, "chat.openai", "/v1/chat/completions", json!({ "stream": true, "ok": true }), true);
+                }
+                Err(e) => {
+                    // SSE 中途出错：以错误 chunk 收尾
+                    let _ = tx.send(Ok(Event::default().data(
+                        json!({ "error": { "message": e, "type": "server_error" } }).to_string(),
+                    )));
+                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                    crate::audit::record(&ctx2, &actor2, "chat.openai", "/v1/chat/completions", json!({ "stream": true, "ok": false }), false);
+                }
+            }
+        });
+
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        // 非流式：整体返回 OpenAI completion 格式
+        match crate::ai::chat_with_images(&ctx, &messages, &images).await {
+            Ok(reply) => {
+                crate::audit::record(&ctx, &actor, "chat.openai", "/v1/chat/completions", json!({ "stream": false, "ok": true, "reply_len": reply.len() }), true);
+                Json(json!({
+                    "id": id, "object": "chat.completion", "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": reply },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+                }))
+                .into_response()
+            }
+            Err(e) => {
+                crate::audit::record(&ctx, &actor, "chat.openai", "/v1/chat/completions", json!({ "stream": false, "ok": false }), false);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": { "message": e, "type": "server_error" } })),
+                )
+                    .into_response()
+            }
+        }
     }
 }

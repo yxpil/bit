@@ -164,6 +164,7 @@ pub async fn chat_turn(
     ctx: &Arc<Ctx>,
     session_id: &str,
     user_input: &str,
+    images: Vec<String>,
 ) -> Result<Vec<ChatMessage>, String> {
     // 1) 追加用户消息到目标会话
     {
@@ -205,8 +206,10 @@ pub async fn chat_turn(
         v
     };
 
-    for _round in 0..5 {
-        let reply = ai::chat(ctx, &convo).await?;
+    for round in 0..5 {
+        // 图片只在第一轮（真正的用户轮）随请求发送，工具反馈轮不再重复携带
+        let round_images: &[String] = if round == 0 { &images } else { &[] };
+        let reply = ai::chat_with_images(ctx, &convo, round_images).await?;
 
         match crate::autopilot::parse_json_array(&reply) {
             Some(calls) if !calls.is_empty() && looks_like_tool_calls(&calls) => {
@@ -292,6 +295,7 @@ pub async fn chat_turn_stream(
     session_id: &str,
     user_input: &str,
     event_name: &str,
+    images: Vec<String>,
 ) -> Result<Vec<ChatMessage>, String> {
     use tauri::Emitter;
     let app = ctx.app.clone();
@@ -337,12 +341,14 @@ pub async fn chat_turn_stream(
         v
     };
 
-    for _round in 0..5 {
+    for round in 0..5 {
         // 流式获取本轮回复，逐 token 推给前端
         emit(json!({ "type": "round_start" }));
+        // 图片只在第一轮随请求发送
+        let round_images: &[String] = if round == 0 { &images } else { &[] };
         let reply = {
             let emit_ref = &emit;
-            ai::chat_stream(ctx, &convo, |tok| {
+            ai::chat_stream_with_images(ctx, &convo, round_images, |tok| {
                 emit_ref(json!({ "type": "delta", "text": tok }));
             })
             .await

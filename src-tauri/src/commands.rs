@@ -521,24 +521,120 @@ pub async fn chat(
     state: State<'_, Arc<Ctx>>,
     session_id: String,
     message: String,
+    images: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    let messages = crate::agent::chat_turn(&ctx, &session_id, &message).await?;
+    let messages = crate::agent::chat_turn(&ctx, &session_id, &message, images.unwrap_or_default()).await?;
     Ok(json!({ "messages": messages }))
 }
 
-/// 流式对话：过程通过 Tauri 事件 `event_name` 推送增量，返回最终完整消息列表
+/// 流式对话：过程通过 Tauri 事件 `event_name` 推送增量，返回最终完整消息列表。
+/// `images` 为可选的图片（base64 data URL），仅随当前用户轮发给多模态模型。
 #[tauri::command]
 pub async fn chat_stream(
     state: State<'_, Arc<Ctx>>,
     session_id: String,
     message: String,
     event_name: String,
+    images: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     let ev = if event_name.trim().is_empty() { "chat-stream".to_string() } else { event_name };
-    let messages = crate::agent::chat_turn_stream(&ctx, &session_id, &message, &ev).await?;
+    let messages =
+        crate::agent::chat_turn_stream(&ctx, &session_id, &message, &ev, images.unwrap_or_default()).await?;
     Ok(json!({ "messages": messages }))
+}
+
+/// 解析上传的文件（Excel→Markdown 表格 / Word(.docx)→纯文本 / CSV→原文）。
+/// `filename` 用于按后缀分派，`data` 为 base64（可含 data:URL 前缀）。
+#[tauri::command]
+pub async fn extract_file(filename: String, data: String) -> Result<serde_json::Value, String> {
+    // 解析可能较重，放到阻塞线程
+    let handle = tauri::async_runtime::spawn_blocking(move || crate::extract::extract(&filename, &data));
+    let text = handle.await.map_err(|e| format!("解析任务失败: {e}"))??;
+    Ok(json!({ "text": text }))
+}
+
+/// 抓取网页并提取正文文字，返回 { title, text }
+#[tauri::command]
+pub async fn fetch_webpage(url: String) -> Result<serde_json::Value, String> {
+    let (title, text) = crate::extract::fetch_webpage(&url).await?;
+    Ok(json!({ "title": title, "text": text }))
+}
+
+/// 端口冲突检测：true=可用，false=已被占用（保存远程配置前调用）
+#[tauri::command]
+pub async fn check_port(host: String, port: u16) -> Result<serde_json::Value, String> {
+    let addr = format!("{}:{}", host.trim(), port);
+    match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => {
+            drop(l);
+            Ok(json!({ "available": true, "addr": addr }))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Ok(json!({ "available": false, "addr": addr, "reason": "端口已被占用" }))
+        }
+        Err(e) => Err(format!("检测 {addr} 失败: {e}")),
+    }
+}
+
+/// 手动压缩会话：用 AI 把全部历史总结为一条摘要（system 消息），释放上下文空间。
+/// 摘要写入会话后返回新消息列表；压缩不影响会话本身，可继续对话。
+#[tauri::command]
+pub async fn compress_session(
+    state: State<'_, Arc<Ctx>>,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let target = if session_id.is_empty() {
+        ctx.sessions.lock().unwrap().active.clone()
+    } else {
+        session_id
+    };
+
+    // 取出历史（在锁外进行 AI 调用，避免阻塞其他会话）
+    let history: Vec<crate::ai::ChatMessage> = {
+        let store = ctx.sessions.lock().unwrap();
+        let sess = store
+            .sessions
+            .iter()
+            .find(|s| s.id == target)
+            .ok_or("会话不存在")?;
+        sess.messages.iter().filter(|m| m.role != "system").cloned().collect()
+    };
+    if history.len() < 4 {
+        return Err("对话内容太少，无需压缩".into());
+    }
+
+    let mut convo = vec![crate::ai::ChatMessage::system(
+        "你是对话压缩助手。请把下面这段 AI 对话历史浓缩成一份结构化中文摘要，保留：用户的需求与偏好、已达成的结论、关键事实与数据、未完成的待办。直接输出摘要正文，不要寒暄，控制在 800 字以内。",
+    )];
+    for m in &history {
+        let who = if m.role == "user" { "用户" } else { "AI" };
+        convo.push(crate::ai::ChatMessage::user(format!("【{who}】{}", m.content)));
+    }
+    let summary = crate::ai::chat(&ctx, &convo).await?;
+
+    // 用摘要替换全部历史（摘要以 system 消息存放，前端气泡不显示）
+    let before = {
+        let mut store = ctx.sessions.lock().unwrap();
+        let sess = store.get_mut(&target).ok_or("会话不存在")?;
+        let n = sess.messages.len();
+        sess.messages = vec![crate::ai::ChatMessage::system(format!(
+            "以下是对此前对话的压缩摘要，请结合它继续对话：\n\n{summary}"
+        ))];
+        sess.touch();
+        n
+    };
+    crate::session::persist(&ctx);
+    crate::audit::record(&ctx, "local-app", "session.compress", &target, json!({ "messages_before": before }), true);
+    Ok(json!({
+        "messages": ctx.sessions.lock().unwrap()
+            .sessions.iter().find(|s| s.id == target)
+            .map(|s| s.messages.clone()).unwrap_or_default(),
+        "summary": summary,
+        "messages_before": before
+    }))
 }
 
 // ---------- 会话（多对话分组） ----------

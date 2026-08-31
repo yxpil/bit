@@ -1,6 +1,6 @@
 [package]
 name = "bit"
-version = "0.1.1"
+version = "0.1.2"
 description = "BIT - Agent Tool Hub with audit and remote access"
 edition = "2021"
 
@@ -19,3 +19,9 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 rhai = { version = "1", features = ["serde"] }
 futures-util = "0.3"
+# 附件解析：Excel(calamine) / Word(.docx via zip+xml) / 网页正文(scraper) / base64 解码
+calamine = "0.26"
+scraper = "0.20"
+base64 = "0.22"
+zip = "2"
+quick-xml = "0.36"

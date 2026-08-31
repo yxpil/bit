@@ -32,18 +32,33 @@ export const api = {
     invoke("update_provider", { id, name, protocol, baseUrl: base_url, apiKey: api_key, model }),
   removeProvider: (id) => invoke("remove_provider", { id }),
   setProviderActive: (id, active) => invoke("set_provider_active", { id, active }),
-  chat: (session_id, message) => invoke("chat", { sessionId: session_id, message }),
+  chat: (session_id, message, images) =>
+    invoke("chat", { sessionId: session_id, message, images: images || null }),
   // 流式对话：过程通过 Tauri 事件 event_name 推送增量，onEvent 收到 {type, ...} payload。
+  // images 为可选的图片 base64 data URL 数组，仅随当前用户轮发给多模态模型。
   // 返回一个 Promise，resolve 为最终完整消息列表；调用方应先订阅事件再 await。
-  chatStream: async (session_id, message, event_name, onEvent) => {
+  chatStream: async (session_id, message, event_name, onEvent, images) => {
     const ev = event_name || `chat-stream-${Date.now()}`;
     const unlisten = await listen(ev, (e) => onEvent?.(e.payload));
     try {
-      return await invoke("chat_stream", { sessionId: session_id, message, eventName: ev });
+      return await invoke("chat_stream", {
+        sessionId: session_id,
+        message,
+        eventName: ev,
+        images: images || null,
+      });
     } finally {
       unlisten();
     }
   },
+  // 解析上传文件：Excel→Markdown 表格 / Word(.docx)→纯文本 / CSV→原文。data 为 base64（可含 data:URL 前缀）
+  extractFile: (filename, data) => invoke("extract_file", { filename, data }),
+  // 抓取网页正文，返回 { title, text }
+  fetchWebpage: (url) => invoke("fetch_webpage", { url }),
+  // 端口冲突检测：返回 { available, addr, reason? }
+  checkPort: (host, port) => invoke("check_port", { host, port }),
+  // 手动压缩会话：AI 总结全部历史为一条摘要，返回新消息列表
+  compressSession: (session_id) => invoke("compress_session", { sessionId: session_id || "" }),
   listSessions: () => invoke("list_sessions"),
   getSession: (session_id) => invoke("get_session", { sessionId: session_id || "" }),
   createSession: (title) => invoke("create_session", { title: title || "" }),

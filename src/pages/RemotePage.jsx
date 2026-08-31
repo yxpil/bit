@@ -34,6 +34,19 @@ export default function RemotePage({ onStats }) {
   const test = async () => {
     setTestState(null);
     setError("");
+    // 端口冲突预检测：仅当端口发生变化时检测（服务自身监听中的端口不算冲突）
+    if (changed && Number(port) !== cfg.port) {
+      try {
+        const p = await api.checkPort(host.trim() || "127.0.0.1", Number(port));
+        if (!p.available) {
+          setTestState({ error: `端口冲突：${p.addr} ${p.reason || "已被占用"}，请更换端口` });
+          return null;
+        }
+      } catch (e) {
+        setTestState({ error: String(e) });
+        return null;
+      }
+    }
     try {
       const r = await api.saveRemoteConfig(enabled, host, Number(port));
       setTestState("pass");
@@ -251,6 +264,29 @@ export default function RemotePage({ onStats }) {
             保存
           </button>
         </div>
+      </div>
+
+      <div className="card">
+        <p className="mb-3 font-medium">OpenAI 格式接入（API Key 填 Client Key，无需访问密码）</p>
+        <p className="mb-3 text-xs text-neutral-500">
+          任何支持 OpenAI 接口的客户端（Cherry Studio、LobeChat、沉浸式翻译等）均可将 BIT 作为模型服务接入，支持流式输出与图片（多模态透传）。
+        </p>
+        <div className="mb-2 flex gap-2">
+          <input className="field flex-1 font-mono" readOnly value={`http://${cfg.host}:${cfg.port}/v1`} />
+          <button onClick={() => copy(`http://${cfg.host}:${cfg.port}/v1`, "baseurl")} className="pill pill-outline pill-hover shrink-0">
+            {copied === "baseurl" ? <IconCheck size={14} /> : <IconGlobe size={14} />}
+            {copied === "baseurl" ? "已复制" : "复制"}
+          </button>
+        </div>
+        <pre className="overflow-x-auto rounded-2xl bg-neutral-900 p-4 font-mono text-xs leading-relaxed text-neutral-100">{`# 查看可用模型
+curl http://${cfg.host}:${cfg.port}/v1/models \\
+  -H "Authorization: Bearer ${cfg.client_key}"
+
+# 对话（加 "stream": true 即为流式 SSE）
+curl -X POST http://${cfg.host}:${cfg.port}/v1/chat/completions \\
+  -H "Authorization: Bearer ${cfg.client_key}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"bit","messages":[{"role":"user","content":"你好"}]}'`}</pre>
       </div>
 
       <div className="card">

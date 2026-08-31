@@ -88,6 +88,15 @@ pub struct ToolCallRecord {
 
 /// 调用当前激活提供方进行一次对话（按协议分派）
 pub async fn chat(ctx: &Arc<crate::state::Ctx>, messages: &[ChatMessage]) -> Result<String, String> {
+    chat_with_images(ctx, messages, &[]).await
+}
+
+/// 带图片（base64 data URL）的一次性对话：图片仅附加到最后一条 user 消息（多模态）
+pub async fn chat_with_images(
+    ctx: &Arc<crate::state::Ctx>,
+    messages: &[ChatMessage],
+    images: &[String],
+) -> Result<String, String> {
     let provider = {
         let cfg = ctx.ai_config.lock().unwrap();
         cfg.active().cloned()
@@ -103,17 +112,19 @@ pub async fn chat(ctx: &Arc<crate::state::Ctx>, messages: &[ChatMessage]) -> Res
         .map_err(|e| e.to_string())?;
 
     match p.protocol.as_str() {
-        "gemini" => chat_gemini(&client, &p, messages).await,
-        "claude" => chat_claude(&client, &p, messages).await,
-        _ => chat_openai(&client, &p, messages).await,
+        "gemini" => chat_gemini(&client, &p, messages, images).await,
+        "claude" => chat_claude(&client, &p, messages, images).await,
+        _ => chat_openai(&client, &p, messages, images).await,
     }
 }
 
-/// 流式对话：每收到一个文本增量就调用 `on_token`，最终返回完整文本。
+/// 流式对话：图片（base64 data URL）仅附加到最后一条 user 消息（多模态）。
+/// 每收到一个文本增量就调用 `on_token`，最终返回完整文本。
 /// 若提供方/网络不支持流式，则退回一次性请求并把整段作为单个 token 回调。
-pub async fn chat_stream<F: FnMut(&str)>(
+pub async fn chat_stream_with_images<F: FnMut(&str)>(
     ctx: &Arc<crate::state::Ctx>,
     messages: &[ChatMessage],
+    images: &[String],
     mut on_token: F,
 ) -> Result<String, String> {
     let provider = {
@@ -130,18 +141,18 @@ pub async fn chat_stream<F: FnMut(&str)>(
         .map_err(|e| e.to_string())?;
 
     let res = match p.protocol.as_str() {
-        "gemini" => stream_gemini(&client, &p, messages, &mut on_token).await,
-        "claude" => stream_claude(&client, &p, messages, &mut on_token).await,
-        _ => stream_openai(&client, &p, messages, &mut on_token).await,
+        "gemini" => stream_gemini(&client, &p, messages, images, &mut on_token).await,
+        "claude" => stream_claude(&client, &p, messages, images, &mut on_token).await,
+        _ => stream_openai(&client, &p, messages, images, &mut on_token).await,
     };
     match res {
         Ok(full) => Ok(full),
         // 流式失败（部分服务不支持 SSE）时退回普通请求
         Err(_) => {
             let full = match p.protocol.as_str() {
-                "gemini" => chat_gemini(&client, &p, messages).await,
-                "claude" => chat_claude(&client, &p, messages).await,
-                _ => chat_openai(&client, &p, messages).await,
+                "gemini" => chat_gemini(&client, &p, messages, images).await,
+                "claude" => chat_claude(&client, &p, messages, images).await,
+                _ => chat_openai(&client, &p, messages, images).await,
             }?;
             on_token(&full);
             Ok(full)
@@ -181,18 +192,126 @@ async fn read_sse<H: FnMut(&str) -> bool>(
     Ok(())
 }
 
+/// 找到最后一条 user 消息的下标（图片挂到它上面），无则返回 None
+fn last_user_idx(messages: &[ChatMessage]) -> Option<usize> {
+    messages.iter().rposition(|m| m.role == "user")
+}
+
+/// 从 base64 data URL 里拆出 (mime, 纯base64)。无前缀时默认 image/png。
+fn split_data_url(s: &str) -> (String, String) {
+    if let Some(rest) = s.strip_prefix("data:") {
+        if let Some(comma) = rest.find(',') {
+            let meta = &rest[..comma];
+            let b64 = &rest[comma + 1..];
+            let mime = meta.split(';').next().unwrap_or("image/png").to_string();
+            return (mime, b64.to_string());
+        }
+    }
+    ("image/png".to_string(), s.to_string())
+}
+
+/// 构造 OpenAI messages：把图片以 image_url 形式挂到最后一条 user 消息（多模态数组）
+fn openai_messages(messages: &[ChatMessage], images: &[String]) -> Vec<serde_json::Value> {
+    let target = if images.is_empty() { None } else { last_user_idx(messages) };
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if Some(i) == target {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                if !m.content.is_empty() {
+                    parts.push(serde_json::json!({ "type": "text", "text": m.content }));
+                }
+                for img in images {
+                    // OpenAI 直接接受 data URL
+                    let url = if img.starts_with("data:") { img.clone() } else { format!("data:image/png;base64,{img}") };
+                    parts.push(serde_json::json!({ "type": "image_url", "image_url": { "url": url } }));
+                }
+                serde_json::json!({ "role": m.role, "content": parts })
+            } else {
+                serde_json::json!({ "role": m.role, "content": m.content })
+            }
+        })
+        .collect()
+}
+
+/// 构造 Claude 请求：返回 (system 文本, messages)。图片以 image/base64 block 挂到最后一条 user。
+fn claude_messages(messages: &[ChatMessage], images: &[String]) -> (String, Vec<serde_json::Value>) {
+    let target = if images.is_empty() { None } else { last_user_idx(messages) };
+    let mut system_txt = String::new();
+    let mut msgs: Vec<serde_json::Value> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        match m.role.as_str() {
+            "system" => {
+                if !system_txt.is_empty() { system_txt.push_str("\n\n"); }
+                system_txt.push_str(&m.content);
+            }
+            "assistant" => msgs.push(serde_json::json!({ "role": "assistant", "content": m.content })),
+            _ => {
+                if Some(i) == target {
+                    let mut blocks: Vec<serde_json::Value> = Vec::new();
+                    if !m.content.is_empty() {
+                        blocks.push(serde_json::json!({ "type": "text", "text": m.content }));
+                    }
+                    for img in images {
+                        let (mime, b64) = split_data_url(img);
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": mime, "data": b64 }
+                        }));
+                    }
+                    msgs.push(serde_json::json!({ "role": "user", "content": blocks }));
+                } else {
+                    msgs.push(serde_json::json!({ "role": "user", "content": m.content }));
+                }
+            }
+        }
+    }
+    (system_txt, msgs)
+}
+
+/// 构造 Gemini 请求：返回 (system 文本, contents)。图片以 inlineData 挂到最后一条 user。
+fn gemini_contents(messages: &[ChatMessage], images: &[String]) -> (String, Vec<serde_json::Value>) {
+    let target = if images.is_empty() { None } else { last_user_idx(messages) };
+    let mut system_txt = String::new();
+    let mut contents: Vec<serde_json::Value> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        match m.role.as_str() {
+            "system" => {
+                if !system_txt.is_empty() { system_txt.push_str("\n\n"); }
+                system_txt.push_str(&m.content);
+            }
+            "assistant" => contents.push(serde_json::json!({ "role": "model", "parts": [{ "text": m.content }] })),
+            _ => {
+                if Some(i) == target {
+                    let mut parts: Vec<serde_json::Value> = Vec::new();
+                    if !m.content.is_empty() {
+                        parts.push(serde_json::json!({ "text": m.content }));
+                    }
+                    for img in images {
+                        let (mime, b64) = split_data_url(img);
+                        parts.push(serde_json::json!({ "inlineData": { "mimeType": mime, "data": b64 } }));
+                    }
+                    contents.push(serde_json::json!({ "role": "user", "parts": parts }));
+                } else {
+                    contents.push(serde_json::json!({ "role": "user", "parts": [{ "text": m.content }] }));
+                }
+            }
+        }
+    }
+    (system_txt, contents)
+}
+
 /// OpenAI 流式：/chat/completions stream=true
 async fn stream_openai<F: FnMut(&str)>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
+    images: &[String],
     on_token: &mut F,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
-    let msgs: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
-        .collect();
+    let msgs = openai_messages(messages, images);
     let body = serde_json::json!({ "model": p.model, "messages": msgs, "stream": true });
     let resp = client
         .post(&url)
@@ -226,20 +345,10 @@ async fn stream_claude<F: FnMut(&str)>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
+    images: &[String],
     on_token: &mut F,
 ) -> Result<String, String> {
-    let mut system_txt = String::new();
-    let mut msgs: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
-        match m.role.as_str() {
-            "system" => {
-                if !system_txt.is_empty() { system_txt.push_str("\n\n"); }
-                system_txt.push_str(&m.content);
-            }
-            "assistant" => msgs.push(serde_json::json!({ "role": "assistant", "content": m.content })),
-            _ => msgs.push(serde_json::json!({ "role": "user", "content": m.content })),
-        }
-    }
+    let (system_txt, msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model, "max_tokens": 4096, "messages": msgs, "stream": true
     });
@@ -282,20 +391,10 @@ async fn stream_gemini<F: FnMut(&str)>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
+    images: &[String],
     on_token: &mut F,
 ) -> Result<String, String> {
-    let mut system_txt = String::new();
-    let mut contents: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
-        match m.role.as_str() {
-            "system" => {
-                if !system_txt.is_empty() { system_txt.push_str("\n\n"); }
-                system_txt.push_str(&m.content);
-            }
-            "assistant" => contents.push(serde_json::json!({ "role": "model", "parts": [{ "text": m.content }] })),
-            _ => contents.push(serde_json::json!({ "role": "user", "parts": [{ "text": m.content }] })),
-        }
-    }
+    let (system_txt, contents) = gemini_contents(messages, images);
     let mut body = serde_json::json!({ "contents": contents });
     if !system_txt.is_empty() {
         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system_txt }] });
@@ -334,13 +433,11 @@ async fn chat_openai(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
+    images: &[String],
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
-    // 只发送 role/content，剥离本地可视化用的 tool_calls 字段
-    let msgs: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
-        .collect();
+    // 只发送 role/content（图片挂到最后一条 user），剥离本地可视化用的 tool_calls 字段
+    let msgs = openai_messages(messages, images);
     let body = serde_json::json!({ "model": p.model, "messages": msgs });
     let resp = client
         .post(&url)
@@ -362,28 +459,10 @@ async fn chat_gemini(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
+    images: &[String],
 ) -> Result<String, String> {
-    // system 合并进 systemInstruction，其余转为 contents（role: user/model）
-    let mut system_txt = String::new();
-    let mut contents: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
-        match m.role.as_str() {
-            "system" => {
-                if !system_txt.is_empty() {
-                    system_txt.push_str("\n\n");
-                }
-                system_txt.push_str(&m.content);
-            }
-            "assistant" => contents.push(serde_json::json!({
-                "role": "model",
-                "parts": [{ "text": m.content }]
-            })),
-            _ => contents.push(serde_json::json!({
-                "role": "user",
-                "parts": [{ "text": m.content }]
-            })),
-        }
-    }
+    // system 合并进 systemInstruction，其余转为 contents（role: user/model），图片挂到最后一条 user
+    let (system_txt, contents) = gemini_contents(messages, images);
     let mut body = serde_json::json!({ "contents": contents });
     if !system_txt.is_empty() {
         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system_txt }] });
@@ -413,22 +492,10 @@ async fn chat_claude(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
+    images: &[String],
 ) -> Result<String, String> {
-    // system 单独抽出，其余作为 messages（role: user/assistant）
-    let mut system_txt = String::new();
-    let mut msgs: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
-        match m.role.as_str() {
-            "system" => {
-                if !system_txt.is_empty() {
-                    system_txt.push_str("\n\n");
-                }
-                system_txt.push_str(&m.content);
-            }
-            "assistant" => msgs.push(serde_json::json!({ "role": "assistant", "content": m.content })),
-            _ => msgs.push(serde_json::json!({ "role": "user", "content": m.content })),
-        }
-    }
+    // system 单独抽出，其余作为 messages（role: user/assistant），图片挂到最后一条 user
+    let (system_txt, msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model,
         "max_tokens": 4096,

@@ -4,6 +4,7 @@ mod audit;
 mod autopilot;
 mod commands;
 mod config;
+mod extract;
 mod goal;
 mod http_api;
 mod memory;
@@ -78,6 +79,10 @@ fn main() {
             commands::set_provider_active,
             commands::chat,
             commands::chat_stream,
+            commands::extract_file,
+            commands::fetch_webpage,
+            commands::check_port,
+            commands::compress_session,
             commands::list_sessions,
             commands::get_session,
             commands::create_session,
