@@ -1,3 +1,6 @@
+// release 构建隐藏 Windows 控制台窗口；debug 保留便于查看日志
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod agent;
 mod ai;
 mod audit;

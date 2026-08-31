@@ -1,0 +1,4 @@
+fix: 移除启动时的 CMD 控制台窗口，版本升至 0.1.4
+
+- main.rs 添加 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+- release 构建不再弹出控制台黑框；debug 模式保留控制台便于查看日志
