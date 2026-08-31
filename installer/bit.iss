@@ -3,7 +3,7 @@
 ; 再用 "C:\Program Files\Inno Setup 7\ISCC.exe" installer\bit.iss 编译。
 
 #define MyAppName "BIT"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #define MyAppPublisher "BIT"
 #define MyAppExeName "bit.exe"
 ; release 二进制目录（相对本 .iss 文件所在的 installer\ 目录）

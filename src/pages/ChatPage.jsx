@@ -8,6 +8,7 @@ import {
   IconChat,
 } from "../components/Icons.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
+import Markdown from "../components/Markdown.jsx";
 
 // AI 对话：多会话分组 + 工具调用可视化
 export default function ChatPage({ onStats }) {
@@ -251,15 +252,15 @@ export default function ChatPage({ onStats }) {
                       </div>
                     )}
                     {c.visible && c.visible.trim() && (
-                      <div className="whitespace-pre-wrap rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 text-sm leading-relaxed dark:border-neutral-800 dark:bg-neutral-900">
-                        {c.visible}
+                      <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
+                        <Markdown>{c.visible}</Markdown>
                       </div>
                     )}
                   </div>
                 ))}
                 {live.text ? (
-                  <div className="whitespace-pre-wrap rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 text-sm leading-relaxed dark:border-neutral-800 dark:bg-neutral-900">
-                    {live.text}
+                  <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
+                    <Markdown>{live.text}</Markdown>
                     <span className="ml-0.5 inline-block h-3.5 w-[2px] animate-pulse bg-neutral-900 align-middle dark:bg-white" />
                   </div>
                 ) : (
@@ -318,8 +319,8 @@ function MessageBubble({ message }) {
         </div>
       )}
       {hasText && (
-        <div className="whitespace-pre-wrap rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 text-sm leading-relaxed dark:border-neutral-800 dark:bg-neutral-900">
-          {message.content}
+        <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
+          <Markdown>{message.content}</Markdown>
         </div>
       )}
     </div>
