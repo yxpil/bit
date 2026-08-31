@@ -6,3 +6,8 @@ src-tauri/target/
 .DS_Store
 Thumbs.db
 *.log
+
+# 临时文件（提交信息/发布说明/构建检查）
+commit-msg.txt
+release-notes.md
+tmp/
