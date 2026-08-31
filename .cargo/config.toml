@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-gnu]
+# 系统自带 MinGW GCC 8.1.0 过旧（__imp_atan 重复定义 bug），改用 Rust 工具链自带的 GCC 14.2 驱动，
+# 并允许旧 import 库中的重复定义（两处定义指向相同符号，安全）
+linker = "C:/Users/yxpil/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/x86_64-w64-mingw32-gcc.exe"
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]

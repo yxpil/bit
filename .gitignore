@@ -1,0 +1,8 @@
+# 依赖与构建缓存（体积巨大且可再生，不入库）
+node_modules/
+src-tauri/target/
+
+# 编辑器/系统杂项
+.DS_Store
+Thumbs.db
+*.log
