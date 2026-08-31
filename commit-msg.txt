@@ -1,5 +1,0 @@
-feat: 中英双语界面 i18n，版本升至 0.1.3
-
-- 新增轻量 i18n（src/i18n.js）：模块级 store + useSyncExternalStore，localStorage 持久化，zh/en 词典约 190 条
-- 全部页面（对话/工具/记忆/技能/审计/远程/AI 设置/标题栏/工具卡片/关于）文案抽取为 t(key)，缺 key 自动回退
-- 顶栏新增 中/EN 语言切换按钮
