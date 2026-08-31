@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "./api.js";
 import { useTheme } from "./useTheme.js";
+import { useLang } from "./i18n.js";
 import logoUrl from "./assets/logo-64.png";
 import TitleBar from "./components/TitleBar.jsx";
 import ChatPage from "./pages/ChatPage.jsx";
@@ -23,15 +24,15 @@ import {
   IconInfo,
 } from "./components/Icons.jsx";
 
-// 页面登记表：key -> { label, icon, page }
+// 页面登记表：key -> { label, icon, page }（label 为 i18n key，渲染处 t(label)）
 const PAGES = {
-  chat: { label: "对话", icon: IconChat, page: ChatPage },
-  tools: { label: "工具", icon: IconTool, page: ToolsPage },
-  memory: { label: "记忆", icon: IconMemory, page: MemoryPage },
-  skills: { label: "技能", icon: IconSkill, page: SkillsPage },
-  audit: { label: "审计", icon: IconAudit, page: AuditPage },
-  remote: { label: "远程", icon: IconGlobe, page: RemotePage },
-  ai: { label: "AI 设置", icon: IconSettings, page: AiSettingsPage },
+  chat: { label: "nav.chat", icon: IconChat, page: ChatPage },
+  tools: { label: "nav.tools", icon: IconTool, page: ToolsPage },
+  memory: { label: "nav.memory", icon: IconMemory, page: MemoryPage },
+  skills: { label: "nav.skills", icon: IconSkill, page: SkillsPage },
+  audit: { label: "nav.audit", icon: IconAudit, page: AuditPage },
+  remote: { label: "nav.remote", icon: IconGlobe, page: RemotePage },
+  ai: { label: "nav.ai", icon: IconSettings, page: AiSettingsPage },
 };
 
 // 主功能：对话（AI 助手本体）单独置顶
@@ -43,6 +44,7 @@ export default function App() {
   const [tab, setTab] = useState("chat");
   const [stats, setStats] = useState(null);
   const { isDark, toggle } = useTheme();
+  const { t, lang, toggleLang } = useLang();
   const [showAbout, setShowAbout] = useState(false);
 
   const refresh = () => api.overview().then(setStats).catch(() => {});
@@ -67,7 +69,7 @@ export default function App() {
         }`}
       >
         <Icon size={16} />
-        {label}
+        {t(label)}
       </button>
     );
   };
@@ -90,7 +92,7 @@ export default function App() {
             </div>
             <div className="min-w-0 leading-tight">
               <h1 className="text-base font-bold tracking-tight">BIT</h1>
-              <p className="truncate text-[10px] text-neutral-400">AI 助手 · 可自我扩展</p>
+              <p className="truncate text-[10px] text-neutral-400">{t("app.tagline")}</p>
             </div>
           </div>
 
@@ -99,7 +101,7 @@ export default function App() {
             <NavItem k={PRIMARY} />
 
             <p className="mt-3 px-3.5 pb-1 text-[10px] font-semibold uppercase tracking-wider text-neutral-400">
-              能力
+              {t("nav.capabilities")}
             </p>
             {SECONDARY.map((k) => (
               <NavItem key={k} k={k} />
@@ -117,30 +119,37 @@ export default function App() {
               </span>
               <span className="text-neutral-300 dark:text-neutral-700">/</span>
               <span className="truncate text-sm text-neutral-500 dark:text-neutral-400">
-                {current.label}
+                {t(current.label)}
               </span>
             </div>
             <div className="flex items-center gap-1.5">
               <button
                 onClick={toggle}
-                title={isDark ? "切换到浅色" : "切换到深色"}
+                title={t(isDark ? "app.switchLight" : "app.switchDark")}
                 className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
               >
                 {isDark ? <IconSun size={17} /> : <IconMoon size={17} />}
               </button>
               <button
                 onClick={() => setTab("ai")}
-                title="AI 设置"
+                title={t("nav.ai")}
                 className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
               >
                 <IconSettings size={17} />
               </button>
               <button
                 onClick={() => setShowAbout(true)}
-                title="关于 BIT"
+                title={t("app.about")}
                 className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
               >
                 <IconInfo size={17} />
+              </button>
+              <button
+                onClick={toggleLang}
+                title={lang === "zh" ? "切换到 English" : "Switch to 中文"}
+                className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
+              >
+                <span className="text-xs font-semibold">{lang === "zh" ? "EN" : "中"}</span>
               </button>
             </div>
           </header>
@@ -165,16 +174,16 @@ export default function App() {
             <img src={logoUrl} alt="BIT" className="mx-auto mb-3 h-14 w-14 rounded-full" />
             <h2 className="text-lg font-bold">BIT</h2>
             <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              Agent Tool Hub · v0.1.0
+              Agent Tool Hub · v0.1.3
             </p>
             <p className="mt-3 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
-              可自我扩展的工具型助手：注册本机解释器，AI 只需写一段 JS/PY 即可成为工具。
+              {t("app.aboutDesc")}
             </p>
             <button
               onClick={() => setShowAbout(false)}
               className="pill pill-hover mx-auto mt-4"
             >
-              好的
+              {t("common.ok")}
             </button>
           </div>
         </div>

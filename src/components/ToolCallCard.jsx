@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { IconTool, IconCheck, IconX, IconChevronDown, IconChevronRight } from "./Icons.jsx";
+import { useLang } from "../i18n.js";
 
 // 对话内单个工具调用的可视化卡片：可折叠，显示工具名 / 参数 / 结果 / 成败
 export default function ToolCallCard({ call }) {
+  const { t } = useLang();
   const [open, setOpen] = useState(false);
   const ok = call.ok;
   const pretty = (v) => {
@@ -39,7 +41,7 @@ export default function ToolCallCard({ call }) {
           }`}
         >
           {ok ? <IconCheck size={10} /> : <IconX size={10} />}
-          {ok ? "成功" : "失败"}
+          {ok ? t("toolcard.success") : t("toolcard.fail")}
         </span>
       </button>
 
@@ -47,14 +49,14 @@ export default function ToolCallCard({ call }) {
         <div className="space-y-2 border-t border-neutral-200/70 px-3 py-2 dark:border-neutral-800/70">
           {hasParams && (
             <div>
-              <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-400">参数</div>
+              <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-400">{t("toolcard.params")}</div>
               <pre className="overflow-x-auto rounded-lg bg-white/70 p-2 font-mono text-[11px] leading-relaxed text-neutral-700 dark:bg-black/40 dark:text-neutral-300">
                 {pretty(call.params)}
               </pre>
             </div>
           )}
           <div>
-            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-400">结果</div>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-400">{t("toolcard.result")}</div>
             <pre className="overflow-x-auto rounded-lg bg-white/70 p-2 font-mono text-[11px] leading-relaxed text-neutral-700 dark:bg-black/40 dark:text-neutral-300">
               {pretty(call.result)}
             </pre>

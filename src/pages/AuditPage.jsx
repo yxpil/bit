@@ -1,17 +1,19 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
+import { useLang } from "../i18n.js";
 import { IconAudit, IconRefresh } from "../components/Icons.jsx";
 
 // 审计日志：所有工具调用 / 注册 / HTTP 访问 / Autopilot 动作
 export default function AuditPage() {
+  const { t } = useLang();
   const [entries, setEntries] = useState([]);
   const [filter, setFilter] = useState("");
 
   const reload = () => api.listAudit().then((r) => setEntries(r.entries || []));
   useEffect(() => {
     reload();
-    const t = setInterval(reload, 5000);
-    return () => clearInterval(t);
+    const timer = setInterval(reload, 5000);
+    return () => clearInterval(timer);
   }, []);
 
   const shown = entries.filter(
@@ -24,20 +26,20 @@ export default function AuditPage() {
     <div className="flex h-full flex-col gap-4">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-semibold">审计日志</h2>
+          <h2 className="text-lg font-semibold">{t("audit.title")}</h2>
           <p className="text-xs text-neutral-500">
-            记录全部敏感动作（注册 / 调用 / 远程访问 / 密钥轮换），每 5 秒自动刷新
+            {t("audit.subtitle")}
           </p>
         </div>
         <button onClick={reload} className="pill pill-outline pill-hover">
           <IconRefresh size={14} />
-          刷新
+          {t("common.refresh")}
         </button>
       </div>
 
       <input
         className="field"
-        placeholder="过滤：actor / action / target"
+        placeholder={t("audit.filterPlaceholder")}
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
       />
@@ -46,12 +48,12 @@ export default function AuditPage() {
         <table className="w-full text-left text-xs">
           <thead className="sticky top-0 bg-white border-b border-neutral-200">
             <tr className="text-neutral-500">
-              <th className="px-4 py-3 font-medium">时间</th>
-              <th className="px-4 py-3 font-medium">主体</th>
-              <th className="px-4 py-3 font-medium">动作</th>
-              <th className="px-4 py-3 font-medium">目标</th>
-              <th className="px-4 py-3 font-medium">详情</th>
-              <th className="px-4 py-3 font-medium">结果</th>
+              <th className="px-4 py-3 font-medium">{t("audit.time")}</th>
+              <th className="px-4 py-3 font-medium">{t("audit.actor")}</th>
+              <th className="px-4 py-3 font-medium">{t("audit.action")}</th>
+              <th className="px-4 py-3 font-medium">{t("audit.target")}</th>
+              <th className="px-4 py-3 font-medium">{t("audit.detail")}</th>
+              <th className="px-4 py-3 font-medium">{t("audit.result")}</th>
             </tr>
           </thead>
           <tbody>
@@ -74,7 +76,7 @@ export default function AuditPage() {
         {shown.length === 0 && (
           <div className="flex items-center justify-center gap-2 py-10 text-sm text-neutral-400">
             <IconAudit size={16} />
-            暂无审计记录
+            {t("audit.empty")}
           </div>
         )}
       </div>

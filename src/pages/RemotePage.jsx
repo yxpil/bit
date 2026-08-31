@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
+import { useLang } from "../i18n.js";
 import { IconGlobe, IconCheck, IconRefresh } from "../components/Icons.jsx";
 
 // 远程访问：端口/Client Key/访问密码管理，测试通过才可保存
 export default function RemotePage({ onStats }) {
+  const { t } = useLang();
   const [cfg, setCfg] = useState(null);
   const [host, setHost] = useState("");
   const [port, setPort] = useState("");
@@ -39,7 +41,9 @@ export default function RemotePage({ onStats }) {
       try {
         const p = await api.checkPort(host.trim() || "127.0.0.1", Number(port));
         if (!p.available) {
-          setTestState({ error: `端口冲突：${p.addr} ${p.reason || "已被占用"}，请更换端口` });
+          setTestState({
+            error: `${t("remote.portConflict")}${p.addr} ${p.reason || t("remote.portInUse")}${t("remote.portConflictFix")}`,
+          });
           return null;
         }
       } catch (e) {
@@ -62,7 +66,7 @@ export default function RemotePage({ onStats }) {
 
   const save = async () => {
     if (testState !== "pass" && changed) {
-      setError("请先通过连接测试再保存");
+      setError(t("remote.saveRequiresTest"));
       return;
     }
     setError("");
@@ -127,17 +131,17 @@ export default function RemotePage({ onStats }) {
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto">
       <div>
-        <h2 className="text-lg font-semibold">远程访问</h2>
+        <h2 className="text-lg font-semibold">{t("remote.title")}</h2>
         <p className="text-xs text-neutral-500">
-          双重认证：Client Key + 访问密码 · 配置版本 v{cfg.revision}（保存自动递增）
+          {t("remote.subtitle")}{cfg.revision}{t("remote.subtitleSuffix")}
         </p>
       </div>
 
       <div className="card flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <div>
-            <p className="font-medium">启用远程访问</p>
-            <p className="text-xs text-neutral-500">关闭后立即停止 HTTP 服务</p>
+            <p className="font-medium">{t("remote.enableTitle")}</p>
+            <p className="text-xs text-neutral-500">{t("remote.enableDesc")}</p>
           </div>
           {/* 小圆片开关 */}
           <button
@@ -159,28 +163,28 @@ export default function RemotePage({ onStats }) {
 
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="mb-1 block px-2 text-xs text-neutral-500">监听地址</label>
+            <label className="mb-1 block px-2 text-xs text-neutral-500">{t("remote.listenHost")}</label>
             <input className="field" value={host} onChange={(e) => { setHost(e.target.value); setTestState(null); }}
-              placeholder="0.0.0.0 或 127.0.0.1" />
+              placeholder={t("remote.hostPlaceholder")} />
           </div>
           <div>
-            <label className="mb-1 block px-2 text-xs text-neutral-500">端口</label>
+            <label className="mb-1 block px-2 text-xs text-neutral-500">{t("remote.port")}</label>
             <input className="field" value={port} onChange={(e) => { setPort(e.target.value); setTestState(null); }}
               placeholder="8600" />
           </div>
         </div>
 
         <div>
-          <label className="mb-1 block px-2 text-xs text-neutral-500">Client Key（自动生成，无需手填）</label>
+          <label className="mb-1 block px-2 text-xs text-neutral-500">{t("remote.clientKeyLabel")}</label>
           <div className="flex gap-2">
             <input className="field flex-1 font-mono" value={cfg.client_key} readOnly />
             <button onClick={() => copy(cfg.client_key, "key")} className="pill pill-outline pill-hover shrink-0">
               {copied === "key" ? <IconCheck size={14} /> : <IconGlobe size={14} />}
-              {copied === "key" ? "已复制" : "复制"}
+              {copied === "key" ? t("common.copied") : t("common.copy")}
             </button>
             <button onClick={rotateKey} className="pill pill-outline pill-hover shrink-0">
               <IconRefresh size={14} />
-              轮换
+              {t("remote.rotate")}
             </button>
           </div>
         </div>
@@ -189,9 +193,9 @@ export default function RemotePage({ onStats }) {
         <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4">
           <div className="mb-3 flex items-center justify-between">
             <div>
-              <p className="font-medium">访问密码（第二重认证）</p>
+              <p className="font-medium">{t("remote.pwdTitle")}</p>
               <p className="text-xs text-neutral-500">
-                请求需额外携带 X-Access-Password 头，8 位数字默认自动生成
+                {t("remote.pwdDesc")}
               </p>
             </div>
             {/* 密码启用小圆片开关 */}
@@ -217,15 +221,15 @@ export default function RemotePage({ onStats }) {
               readOnly
             />
             <button onClick={() => setShowPwd((v) => !v)} className="pill pill-outline pill-hover shrink-0">
-              {showPwd ? "隐藏" : "显示"}
+              {showPwd ? t("common.hide") : t("common.show")}
             </button>
             <button onClick={() => copy(pwd, "pwd")} className="pill pill-outline pill-hover shrink-0">
               {copied === "pwd" ? <IconCheck size={14} /> : <IconGlobe size={14} />}
-              {copied === "pwd" ? "已复制" : "复制"}
+              {copied === "pwd" ? t("common.copied") : t("common.copy")}
             </button>
             <button onClick={rotatePwd} className="pill pill-outline pill-hover shrink-0">
               <IconRefresh size={14} />
-              轮换
+              {t("remote.rotate")}
             </button>
           </div>
 
@@ -233,12 +237,12 @@ export default function RemotePage({ onStats }) {
             <input
               className="field flex-1"
               type={showPwd ? "text" : "password"}
-              placeholder="自定义新密码（4-64 位，留空则自动生成）"
+              placeholder={t("remote.pwdPlaceholder")}
               value={pwdInput}
               onChange={(e) => setPwdInput(e.target.value)}
             />
             <button onClick={savePwd} className="pill pill-hover shrink-0">
-              保存密码
+              {t("remote.savePwd")}
             </button>
           </div>
           {pwdMsg && <p className="mt-2 px-2 text-xs text-red-600">{pwdMsg}</p>}
@@ -247,7 +251,7 @@ export default function RemotePage({ onStats }) {
         {testState === "pass" && (
           <p className="flex items-center gap-2 rounded-full bg-neutral-100 px-4 py-2 text-xs">
             <IconCheck size={14} />
-            连接测试通过（含双重认证），服务运行于 http://{cfg.host}:{cfg.port}
+            {t("remote.testPass")}http://{cfg.host}:{cfg.port}
           </p>
         )}
         {testState?.error && (
@@ -258,60 +262,60 @@ export default function RemotePage({ onStats }) {
         <div className="flex justify-end gap-2">
           <button onClick={test} className="pill pill-outline pill-hover">
             <IconGlobe size={14} />
-            测试连接
+            {t("remote.test")}
           </button>
           <button onClick={save} disabled={!changed || (testState !== "pass" && changed)} className="pill pill-hover">
-            保存
+            {t("common.save")}
           </button>
         </div>
       </div>
 
       <div className="card">
-        <p className="mb-3 font-medium">OpenAI 格式接入（API Key 填 Client Key，无需访问密码）</p>
+        <p className="mb-3 font-medium">{t("remote.openaiTitle")}</p>
         <p className="mb-3 text-xs text-neutral-500">
-          任何支持 OpenAI 接口的客户端（Cherry Studio、LobeChat、沉浸式翻译等）均可将 BIT 作为模型服务接入，支持流式输出与图片（多模态透传）。
+          {t("remote.openaiDesc")}
         </p>
         <div className="mb-2 flex gap-2">
           <input className="field flex-1 font-mono" readOnly value={`http://${cfg.host}:${cfg.port}/v1`} />
           <button onClick={() => copy(`http://${cfg.host}:${cfg.port}/v1`, "baseurl")} className="pill pill-outline pill-hover shrink-0">
             {copied === "baseurl" ? <IconCheck size={14} /> : <IconGlobe size={14} />}
-            {copied === "baseurl" ? "已复制" : "复制"}
+            {copied === "baseurl" ? t("common.copied") : t("common.copy")}
           </button>
         </div>
-        <pre className="overflow-x-auto rounded-2xl bg-neutral-900 p-4 font-mono text-xs leading-relaxed text-neutral-100">{`# 查看可用模型
+        <pre className="overflow-x-auto rounded-2xl bg-neutral-900 p-4 font-mono text-xs leading-relaxed text-neutral-100">{`# ${t("remote.curlListModels")}
 curl http://${cfg.host}:${cfg.port}/v1/models \\
   -H "Authorization: Bearer ${cfg.client_key}"
 
-# 对话（加 "stream": true 即为流式 SSE）
+# ${t("remote.curlChat")}
 curl -X POST http://${cfg.host}:${cfg.port}/v1/chat/completions \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"bit","messages":[{"role":"user","content":"你好"}]}'`}</pre>
+  -d '{"model":"bit","messages":[{"role":"user","content":"${t("remote.curlChatContent")}"}]}'`}</pre>
       </div>
 
       <div className="card">
-        <p className="mb-3 font-medium">Agent 接入示例（双重认证）</p>
-        <pre className="overflow-x-auto rounded-2xl bg-neutral-900 p-4 font-mono text-xs leading-relaxed text-neutral-100">{`# 健康检查（无需认证）
+        <p className="mb-3 font-medium">{t("remote.agentTitle")}</p>
+        <pre className="overflow-x-auto rounded-2xl bg-neutral-900 p-4 font-mono text-xs leading-relaxed text-neutral-100">{`# ${t("remote.curlHealth")}
 curl http://${cfg.host}:${cfg.port}/api/health
 
-# 注册工具（Agent 自助，需 Key + 密码）
+# ${t("remote.curlRegister")}
 curl -X POST http://${cfg.host}:${cfg.port}/api/tools \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "X-Access-Password: ${pwd}" \\
   -H "Content-Type: application/json" \\
   -d '{"name":"my_tool","description":"...","url":"http://agent:9000/callback"}'
 
-# 调用工具
+# ${t("remote.curlInvoke")}
 curl -X POST http://${cfg.host}:${cfg.port}/api/tools/<id>/invoke \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "X-Access-Password: ${pwd}" \\
   -d '{"params":{}}'
 
-# AI 对话（含自写插件能力）
+# ${t("remote.curlAIChat")}
 curl -X POST http://${cfg.host}:${cfg.port}/api/chat \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "X-Access-Password: ${pwd}" \\
-  -d '{"message":"帮我写一个查天气的插件"}'`}</pre>
+  -d '{"message":"${t("remote.curlAIChatContent")}"}'`}</pre>
       </div>
     </div>
   );

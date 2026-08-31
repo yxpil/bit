@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import PillSwitch from "../components/PillSwitch.jsx";
+import { useLang } from "../i18n.js";
 import {
   IconPlus,
   IconTrash,
@@ -67,6 +68,7 @@ io.write('{"echo": ' .. s .. '}')`,
 
 // 工具中心：解释器注册 + 让 AI/用户写一段脚本变成工具 + 工具列表
 export default function ToolsPage({ onStats }) {
+  const { t } = useLang();
   const [tools, setTools] = useState([]);
   const [runtimes, setRuntimes] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
@@ -123,7 +125,7 @@ export default function ToolsPage({ onStats }) {
     try {
       return JSON.parse(testParams || "{}");
     } catch {
-      throw new Error("测试参数不是合法 JSON");
+      throw new Error(t("tools.badTestParams"));
     }
   };
 
@@ -142,8 +144,8 @@ export default function ToolsPage({ onStats }) {
 
   const save = async () => {
     setError("");
-    if (!name.trim()) return setError("请填写工具名称");
-    if (!runtime) return setError("请选择解释器");
+    if (!name.trim()) return setError(t("tools.errNameRequired"));
+    if (!runtime) return setError(t("tools.errRuntimeRequired"));
     try {
       await api.registerScriptTool(name, description, runtime, code);
       setName("");
@@ -198,15 +200,15 @@ export default function ToolsPage({ onStats }) {
   const kindTag = (kind) => {
     switch (kind?.kind) {
       case "builtin":
-        return { text: "内置", cls: "border-neutral-900 bg-neutral-900 text-white dark:border-white dark:bg-white dark:text-black" };
+        return { text: t("tools.kindBuiltin"), cls: "border-neutral-900 bg-neutral-900 text-white dark:border-white dark:bg-white dark:text-black" };
       case "remote":
-        return { text: "远程", cls: "" };
+        return { text: t("tools.kindRemote"), cls: "" };
       case "script":
-        return { text: "Rhai 插件", cls: "" };
+        return { text: t("tools.kindScript"), cls: "" };
       case "interpreter":
         return { text: kind.runtime, cls: "border-neutral-900 dark:border-white" };
       default:
-        return { text: "工具", cls: "" };
+        return { text: t("tools.kindTool"), cls: "" };
     }
   };
 
@@ -218,51 +220,51 @@ export default function ToolsPage({ onStats }) {
           <div className="flex items-center gap-2">
             <IconServer size={18} />
             <div>
-              <h2 className="text-sm font-semibold">本机解释器</h2>
+              <h2 className="text-sm font-semibold">{t("tools.runtimesTitle")}</h2>
               <p className="text-xs text-neutral-500 dark:text-neutral-400">
-                已注册的运行时，AI 只需写一段该语言代码即可成为工具
+                {t("tools.runtimesDesc")}
               </p>
             </div>
           </div>
           <div className="flex gap-2">
             <button onClick={refreshRt} className="pill pill-outline pill-hover" disabled={refreshing}>
               <IconRefresh size={14} />
-              {refreshing ? "探测中…" : "刷新探测"}
+              {refreshing ? t("tools.probing") : t("tools.refreshDetect")}
             </button>
             <button onClick={() => setShowAddRt((v) => !v)} className="pill pill-outline pill-hover">
               <IconPlus size={14} />
-              手动添加
+              {t("tools.addManual")}
             </button>
           </div>
         </div>
 
         {showAddRt && (
           <form onSubmit={addRuntime} className="mb-3 grid grid-cols-4 gap-2">
-            <input className="field" placeholder="id（如 node）" value={rtId} onChange={(e) => setRtId(e.target.value)} required />
-            <input className="field" placeholder="路径（可执行文件）" value={rtPath} onChange={(e) => setRtPath(e.target.value)} required />
-            <input className="field" placeholder="显示名（可选）" value={rtName} onChange={(e) => setRtName(e.target.value)} />
+            <input className="field" placeholder={t("tools.rtIdPlaceholder")} value={rtId} onChange={(e) => setRtId(e.target.value)} required />
+            <input className="field" placeholder={t("tools.rtPathPlaceholder")} value={rtPath} onChange={(e) => setRtPath(e.target.value)} required />
+            <input className="field" placeholder={t("tools.rtNamePlaceholder")} value={rtName} onChange={(e) => setRtName(e.target.value)} />
             <select className="field" value={rtLang} onChange={(e) => setRtLang(e.target.value)}>
               <option value="js">js</option>
               <option value="py">py</option>
               <option value="ts">ts</option>
               <option value="php">php</option>
               <option value="rb">rb</option>
-              <option value="pl">pl（Perl）</option>
+              <option value="pl">pl{t("tools.suffixPerl")}</option>
               <option value="lua">lua</option>
               <option value="r">r</option>
-              <option value="jl">jl（Julia）</option>
+              <option value="jl">jl{t("tools.suffixJulia")}</option>
               <option value="ps1">ps1</option>
-              <option value="java">java（编译）</option>
-              <option value="rs">rs（编译）</option>
-              <option value="go">go（编译）</option>
-              <option value="c">c（编译）</option>
-              <option value="cpp">cpp（编译）</option>
-              <option value="cs">cs（编译）</option>
-              <option value="kt">kt（编译）</option>
-              <option value="exe">exe（可执行）</option>
+              <option value="java">java{t("tools.suffixCompile")}</option>
+              <option value="rs">rs{t("tools.suffixCompile")}</option>
+              <option value="go">go{t("tools.suffixCompile")}</option>
+              <option value="c">c{t("tools.suffixCompile")}</option>
+              <option value="cpp">cpp{t("tools.suffixCompile")}</option>
+              <option value="cs">cs{t("tools.suffixCompile")}</option>
+              <option value="kt">kt{t("tools.suffixCompile")}</option>
+              <option value="exe">exe{t("tools.suffixExecutable")}</option>
             </select>
             <div className="col-span-4 flex justify-end">
-              <button type="submit" className="pill pill-hover">添加</button>
+              <button type="submit" className="pill pill-hover">{t("common.add")}</button>
             </div>
           </form>
         )}
@@ -280,9 +282,9 @@ export default function ToolsPage({ onStats }) {
                     <div className="flex items-center gap-2">
                       <span className="font-mono text-sm font-semibold">{r.id}</span>
                       <span className="chip">{r.lang}</span>
-                      {r.mode === "compile" && <span className="chip">编译型</span>}
-                      {r.mode === "exec" && <span className="chip">可执行</span>}
-                      {r.manual && <span className="chip">手动</span>}
+                      {r.mode === "compile" && <span className="chip">{t("tools.chipCompile")}</span>}
+                      {r.mode === "exec" && <span className="chip">{t("tools.chipExec")}</span>}
+                      {r.manual && <span className="chip">{t("tools.chipManual")}</span>}
                     </div>
                     <p className="truncate text-xs text-neutral-500 dark:text-neutral-400">
                       {r.version} · {r.path}
@@ -292,9 +294,9 @@ export default function ToolsPage({ onStats }) {
                 <PillSwitch
                   checked={on}
                   onChange={() => toggleRuntime(r)}
-                  title={on ? "已启用（点击暂停：AI 将无法用它执行代码）" : "已暂停（点击启用）"}
+                  title={on ? t("tools.rtEnabledTitle") : t("tools.pausedTitle")}
                 />
-                <button onClick={() => removeRuntime(r.id)} className="icon-btn shrink-0" title="移除">
+                <button onClick={() => removeRuntime(r.id)} className="icon-btn shrink-0" title={t("common.remove")}>
                   <IconTrash size={13} />
                 </button>
               </div>
@@ -302,7 +304,7 @@ export default function ToolsPage({ onStats }) {
           })}
           {runtimes.length === 0 && (
             <p className="py-4 text-center text-sm text-neutral-400">
-              未探测到解释器，点击「刷新探测」或手动添加
+              {t("tools.noRuntimes")}
             </p>
           )}
         </div>
@@ -313,9 +315,9 @@ export default function ToolsPage({ onStats }) {
         <div className="mb-3 flex items-center gap-2">
           <IconCode size={18} />
           <div>
-            <h2 className="text-sm font-semibold">写一段脚本，变成工具</h2>
+            <h2 className="text-sm font-semibold">{t("tools.scriptTitle")}</h2>
             <p className="text-xs text-neutral-500 dark:text-neutral-400">
-              约定：从 stdin 读参数 JSON，把结果打印到 stdout。先测试通过再保存
+              {t("tools.scriptDesc")}
             </p>
           </div>
         </div>
@@ -324,12 +326,12 @@ export default function ToolsPage({ onStats }) {
           <select className="field" value={runtime} onChange={(e) => onPickRuntime(e.target.value)}>
             {runtimes.map((r) => (
               <option key={r.id} value={r.id}>
-                {r.name}（{r.lang}）
+                {r.name}{t("tools.parenOpen")}{r.lang}{t("tools.parenClose")}
               </option>
             ))}
           </select>
-          <input className="field" placeholder="工具名称（唯一）" value={name} onChange={(e) => setName(e.target.value)} />
-          <input className="field" placeholder="工具描述" value={description} onChange={(e) => setDescription(e.target.value)} />
+          <input className="field" placeholder={t("tools.namePlaceholder")} value={name} onChange={(e) => setName(e.target.value)} />
+          <input className="field" placeholder={t("tools.descPlaceholder")} value={description} onChange={(e) => setDescription(e.target.value)} />
         </div>
 
         <textarea
@@ -342,7 +344,7 @@ export default function ToolsPage({ onStats }) {
         <div className="mt-2 grid grid-cols-3 gap-2">
           <input
             className="field col-span-3 font-mono"
-            placeholder="测试参数（JSON）"
+            placeholder={t("tools.testParamsPlaceholder")}
             value={testParams}
             onChange={(e) => setTestParams(e.target.value)}
           />
@@ -353,20 +355,20 @@ export default function ToolsPage({ onStats }) {
         <div className="mt-3 flex justify-end gap-2">
           <button onClick={test} className="pill pill-outline pill-hover" disabled={!runtime}>
             <IconPlay size={14} />
-            测试运行
+            {t("tools.testRun")}
           </button>
           <button onClick={save} className="pill pill-hover" disabled={!runtime}>
             <IconTool size={14} />
-            保存为工具
+            {t("tools.saveAsTool")}
           </button>
         </div>
 
         {result && (
           <div className="mt-3">
             <div className="mb-1.5 flex items-center gap-2">
-              <span className="text-xs font-semibold">运行结果</span>
+              <span className="text-xs font-semibold">{t("tools.runResult")}</span>
               <span className={`chip ${result.ok ? "border-neutral-900 bg-neutral-900 text-white dark:border-white dark:bg-white dark:text-black" : "text-red-600"}`}>
-                {result.loading ? "执行中…" : result.ok ? "成功" : "失败"}
+                {result.loading ? t("common.running") : result.ok ? t("common.success") : t("common.failed")}
               </span>
             </div>
             <textarea
@@ -382,45 +384,45 @@ export default function ToolsPage({ onStats }) {
       <section className="card">
         <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold">
           <IconTool size={18} />
-          已注册工具
+          {t("tools.registeredTitle")}
         </h2>
 
         {tools.length > 0 && (
           <div className="flex items-center gap-3 border-b border-neutral-200/70 px-4 pb-2 text-[11px] font-medium text-neutral-400 dark:border-neutral-800/70">
-            <span className="flex-1">名称</span>
-            <span className="w-16 text-center">启用</span>
-            <span className="w-8 text-center">操作</span>
+            <span className="flex-1">{t("tools.colName")}</span>
+            <span className="w-16 text-center">{t("tools.colEnabled")}</span>
+            <span className="w-8 text-center">{t("tools.colActions")}</span>
           </div>
         )}
 
         <div className="flex flex-col">
-          {tools.map((t) => {
-            const k = kindTag(t.kind);
-            const on = t.enabled ?? true;
+          {tools.map((tool) => {
+            const k = kindTag(tool.kind);
+            const on = tool.enabled ?? true;
             return (
               <div
-                key={t.id}
+                key={tool.id}
                 className="flex items-center gap-3 border-b border-neutral-200/50 px-4 py-3 last:border-0 dark:border-neutral-800/50"
               >
                 <div className={`min-w-0 flex-1 transition-opacity ${on ? "" : "opacity-45"}`}>
                   <div className="flex items-center gap-2">
-                    <span className="font-semibold">{t.name}</span>
+                    <span className="font-semibold">{tool.name}</span>
                     <span className={`chip ${k.cls}`}>{k.text}</span>
-                    <span className="chip">{t.created_by}</span>
+                    <span className="chip">{tool.created_by}</span>
                   </div>
                   <p className="mt-0.5 truncate text-xs text-neutral-500 dark:text-neutral-400">
-                    {t.description || "（无描述）"}
+                    {tool.description || t("tools.noDesc")}
                   </p>
                 </div>
                 <div className="flex w-16 justify-center">
                   <PillSwitch
                     checked={on}
-                    onChange={() => toggle(t)}
-                    title={on ? "已启用（点击暂停：AI 与远程将无法调用）" : "已暂停（点击启用）"}
+                    onChange={() => toggle(tool)}
+                    title={on ? t("tools.enabledTitle") : t("tools.pausedTitle")}
                   />
                 </div>
                 <div className="flex w-8 justify-center">
-                  <button onClick={() => remove(t.id)} className="icon-btn shrink-0" title="删除">
+                  <button onClick={() => remove(tool.id)} className="icon-btn shrink-0" title={t("common.delete")}>
                     <IconTrash size={13} />
                   </button>
                 </div>
@@ -428,7 +430,7 @@ export default function ToolsPage({ onStats }) {
             );
           })}
           {tools.length === 0 && (
-            <p className="py-6 text-center text-sm text-neutral-400">暂无工具</p>
+            <p className="py-6 text-center text-sm text-neutral-400">{t("tools.empty")}</p>
           )}
         </div>
       </section>

@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { IconPlus, IconSkill } from "../components/Icons.jsx";
+import { useLang } from "../i18n.js";
 
 // 技能（SKILL）：Autopilot 从总结记忆中自动提炼，也可手动沉淀
 export default function SkillsPage({ onStats }) {
+  const { t } = useLang();
   const [skills, setSkills] = useState([]);
   const [name, setName] = useState("");
   const [summary, setSummary] = useState("");
@@ -29,21 +31,21 @@ export default function SkillsPage({ onStats }) {
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto">
       <div>
-        <h2 className="text-lg font-semibold">技能 SKILL</h2>
+        <h2 className="text-lg font-semibold">{t("skills.title")}</h2>
         <p className="text-xs text-neutral-500">
-          AI 在对话中自己调用 skill（save/search）沉淀与检索 · 也可在此手动添加
+          {t("skills.desc")}
         </p>
       </div>
 
       <form onSubmit={add} className="card flex flex-col gap-3">
-        <input className="field" placeholder="技能名称" value={name}
+        <input className="field" placeholder={t("skills.namePlaceholder")} value={name}
           onChange={(e) => setName(e.target.value)} required />
-        <input className="field" placeholder="一句话说明" value={summary}
+        <input className="field" placeholder={t("skills.summaryPlaceholder")} value={summary}
           onChange={(e) => setSummary(e.target.value)} required />
         <div className="flex justify-end">
           <button className="pill pill-hover" disabled={!name.trim() || !summary.trim()}>
             <IconPlus size={15} />
-            添加
+            {t("common.add")}
           </button>
         </div>
       </form>
@@ -65,7 +67,7 @@ export default function SkillsPage({ onStats }) {
         {skills.length === 0 && (
           <div className="card flex items-center justify-center gap-2 py-10 text-sm text-neutral-400">
             <IconSkill size={16} />
-            暂无技能，AI 会在对话中自己沉淀
+            {t("skills.empty")}
           </div>
         )}
       </div>

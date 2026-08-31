@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { IconPlus, IconMemory } from "../components/Icons.jsx";
+import { useLang } from "../i18n.js";
 
 // 记忆：原始记忆 + Autopilot 自动生成的总结
 export default function MemoryPage({ onStats }) {
+  const { t } = useLang();
   const [memories, setMemories] = useState([]);
   const [content, setContent] = useState("");
   const [error, setError] = useState("");
@@ -29,22 +31,22 @@ export default function MemoryPage({ onStats }) {
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto">
       <div>
-        <h2 className="text-lg font-semibold">记忆</h2>
+        <h2 className="text-lg font-semibold">{t("memory.title")}</h2>
         <p className="text-xs text-neutral-500">
-          原始记忆由 AI 在对话中自己调用 add_memory 沉淀，也可在此手动添加
+          {t("memory.desc")}
         </p>
       </div>
 
       <form onSubmit={add} className="card flex gap-2">
         <input
           className="field flex-1"
-          placeholder="添加一条记忆…"
+          placeholder={t("memory.placeholder")}
           value={content}
           onChange={(e) => setContent(e.target.value)}
         />
         <button className="pill pill-hover" disabled={!content.trim()}>
           <IconPlus size={15} />
-          添加
+          {t("common.add")}
         </button>
       </form>
       {error && <p className="px-2 text-xs text-red-600">{error}</p>}
@@ -54,7 +56,7 @@ export default function MemoryPage({ onStats }) {
           <div key={m.id} className="card py-4">
             <div className="mb-1.5 flex items-center gap-2">
               <span className={`chip ${m.kind === "summary" ? "border-neutral-900 bg-neutral-900 text-white" : ""}`}>
-                {m.kind === "summary" ? "自动总结" : "原始"}
+                {m.kind === "summary" ? t("memory.chipSummary") : t("memory.chipRaw")}
               </span>
               <span className="text-xs text-neutral-400">
                 {m.ts} · {m.source}
@@ -66,7 +68,7 @@ export default function MemoryPage({ onStats }) {
         {memories.length === 0 && (
           <div className="card flex items-center justify-center gap-2 py-10 text-sm text-neutral-400">
             <IconMemory size={16} />
-            暂无记忆
+            {t("memory.empty")}
           </div>
         )}
       </div>

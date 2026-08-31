@@ -1,9 +1,11 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import logoUrl from "../assets/logo-64.png";
 import { IconMinus, IconSquare, IconX } from "./Icons.jsx";
+import { useLang } from "../i18n.js";
 
 // 自定义无边框标题栏（替代原生菜单栏）：左侧品牌，右侧窗口按钮，中段可拖动
 export default function TitleBar() {
+  const { t } = useLang();
   const win = () => getCurrentWindow();
   const minimize = () => win().minimize().catch(() => {});
   const toggleMax = () => win().toggleMaximize().catch(() => {});
@@ -29,21 +31,21 @@ export default function TitleBar() {
       {/* 窗口按钮 */}
       <button
         onClick={minimize}
-        aria-label="最小化"
+        aria-label={t("title.minimize")}
         className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
       >
         <IconMinus size={13} />
       </button>
       <button
         onClick={toggleMax}
-        aria-label="最大化"
+        aria-label={t("title.maximize")}
         className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
       >
         <IconSquare size={12} />
       </button>
       <button
         onClick={close}
-        aria-label="关闭"
+        aria-label={t("common.close")}
         className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-red-600 hover:text-white"
       >
         <IconX size={14} />

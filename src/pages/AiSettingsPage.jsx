@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
+import { useLang } from "../i18n.js";
 import PillSwitch from "../components/PillSwitch.jsx";
 import { IconPlus, IconTrash, IconSettings, IconCheck, IconX } from "../components/Icons.jsx";
 
@@ -15,6 +16,7 @@ const EMPTY = { id: null, name: "", protocol: "openai", base_url: "", api_key: "
 
 // AI 设置：可增删的多家提供方，用播放/暂停切换，每次仅一个激活
 export default function AiSettingsPage({ onStats, stats }) {
+  const { t } = useLang();
   const [providers, setProviders] = useState([]);
   const [form, setForm] = useState(EMPTY); // 新增 / 编辑用同一张表单
   const [error, setError] = useState("");
@@ -87,24 +89,24 @@ export default function AiSettingsPage({ onStats, stats }) {
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto">
       <div>
-        <h2 className="text-lg font-semibold">AI 设置</h2>
+        <h2 className="text-lg font-semibold">{t("ai.title")}</h2>
         <p className="text-xs text-neutral-500">
-          可同时接入多家（OpenAI / Gemini / Claude），用播放按钮激活其一 · 每次仅一个生效
+          {t("ai.subtitle")}
         </p>
       </div>
 
       {/* 运行总览 */}
       {stats && (
         <div className="card">
-          <p className="mb-3 text-xs font-medium text-neutral-900 dark:text-neutral-100">运行总览</p>
+          <p className="mb-3 text-xs font-medium text-neutral-900 dark:text-neutral-100">{t("ai.statsTitle")}</p>
           <div className="grid grid-cols-3 gap-3 sm:grid-cols-6">
             {[
-              ["工具", stats.tool_count],
-              ["记忆", stats.memory_count],
-              ["技能", stats.skill_count],
-              ["目标", stats.goal_count],
-              ["待办", stats.todo_count],
-              ["审计", stats.audit_count],
+              [t("ai.statTools"), stats.tool_count],
+              [t("ai.statMemory"), stats.memory_count],
+              [t("ai.statSkills"), stats.skill_count],
+              [t("ai.statGoals"), stats.goal_count],
+              [t("ai.statTodos"), stats.todo_count],
+              [t("ai.statAudit"), stats.audit_count],
             ].map(([label, n]) => (
               <div key={label} className="text-center">
                 <div className="text-xl font-bold tabular-nums">{n ?? 0}</div>
@@ -113,9 +115,9 @@ export default function AiSettingsPage({ onStats, stats }) {
             ))}
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-neutral-200/70 pt-3 dark:border-neutral-800/70">
-            <span className="chip">{stats.ai_configured ? "AI 已激活" : "无激活的 AI"}</span>
+            <span className="chip">{stats.ai_configured ? t("ai.aiActive") : t("ai.aiInactive")}</span>
             <span className={`chip ${stats.remote?.enabled ? "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" : ""}`}>
-              {stats.remote?.enabled ? `远程 ${stats.remote.addr}` : "远程关闭"}
+              {stats.remote?.enabled ? `${t("ai.remoteOn")}${stats.remote.addr}` : t("ai.remoteOff")}
             </span>
           </div>
         </div>
@@ -126,7 +128,7 @@ export default function AiSettingsPage({ onStats, stats }) {
         {providers.length === 0 && (
           <div className="card flex items-center justify-center gap-2 py-8 text-sm text-neutral-400">
             <IconSettings size={16} />
-            还没有 AI 提供方，在下方添加一个
+            {t("ai.emptyProviders")}
           </div>
         )}
         {providers.map((p) => (
@@ -139,7 +141,7 @@ export default function AiSettingsPage({ onStats, stats }) {
             <PillSwitch
               checked={p.active}
               onChange={(next) => toggleActive(p, next)}
-              title={p.active ? "暂停（停用此提供方）" : "播放（激活此提供方，其余自动暂停）"}
+              title={p.active ? t("ai.pauseTip") : t("ai.playTip")}
             />
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
@@ -147,12 +149,12 @@ export default function AiSettingsPage({ onStats, stats }) {
                 <span className="chip shrink-0">{protoLabel(p.protocol)}</span>
                 {p.active && (
                   <span className="chip shrink-0 border-emerald-500/50 text-emerald-600 dark:text-emerald-400">
-                    使用中
+                    {t("ai.inUse")}
                   </span>
                 )}
                 {!p.api_key && (
                   <span className="chip shrink-0 border-amber-500/50 text-amber-600 dark:text-amber-400">
-                    缺 Key
+                    {t("ai.missingKey")}
                   </span>
                 )}
               </div>
@@ -162,14 +164,14 @@ export default function AiSettingsPage({ onStats, stats }) {
             </div>
             <button
               onClick={() => startEdit(p)}
-              title="编辑"
+              title={t("common.edit")}
               className="rounded-full p-2 text-neutral-500 transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-800"
             >
               <IconSettings size={15} />
             </button>
             <button
               onClick={() => remove(p.id)}
-              title="删除"
+              title={t("common.delete")}
               className="rounded-full p-2 text-neutral-400 transition-colors hover:bg-red-50 hover:text-red-500 dark:hover:bg-red-950/40"
             >
               <IconTrash size={15} />
@@ -181,7 +183,7 @@ export default function AiSettingsPage({ onStats, stats }) {
       {/* 新增 / 编辑表单 */}
       <form onSubmit={submit} className="card flex flex-col gap-4">
         <div className="flex items-center justify-between">
-          <p className="text-sm font-medium">{editing ? "编辑提供方" : "添加提供方"}</p>
+          <p className="text-sm font-medium">{editing ? t("ai.editProvider") : t("ai.addProvider")}</p>
           {editing && (
             <button
               type="button"
@@ -189,13 +191,13 @@ export default function AiSettingsPage({ onStats, stats }) {
               className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-white"
             >
               <IconX size={13} />
-              取消编辑
+              {t("ai.cancelEdit")}
             </button>
           )}
         </div>
 
         <div>
-          <label className="mb-1 block px-2 text-xs text-neutral-500">协议</label>
+          <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.protocol")}</label>
           <div className="flex gap-2">
             {PROTOCOLS.map((proto) => (
               <button
@@ -215,12 +217,12 @@ export default function AiSettingsPage({ onStats, stats }) {
         </div>
 
         <div>
-          <label className="mb-1 block px-2 text-xs text-neutral-500">名称（可选）</label>
+          <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.nameLabel")}</label>
           <input
             className="field"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
-            placeholder={`如：我的 ${protoLabel(form.protocol)}`}
+            placeholder={`${t("ai.nameExample")}${protoLabel(form.protocol)}`}
           />
         </div>
 
@@ -241,12 +243,12 @@ export default function AiSettingsPage({ onStats, stats }) {
             type="password"
             value={form.api_key}
             onChange={(e) => setForm({ ...form, api_key: e.target.value })}
-            placeholder={form.protocol === "openai" ? "sk-…" : "填写该家的密钥"}
+            placeholder={form.protocol === "openai" ? "sk-…" : t("ai.keyPlaceholder")}
           />
         </div>
 
         <div>
-          <label className="mb-1 block px-2 text-xs text-neutral-500">模型</label>
+          <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.model")}</label>
           <input
             className="field font-mono"
             value={form.model}
@@ -260,28 +262,30 @@ export default function AiSettingsPage({ onStats, stats }) {
           {saved && (
             <span className="flex items-center gap-1 text-xs text-neutral-500">
               <IconCheck size={14} />
-              已保存
+              {t("common.saved")}
             </span>
           )}
           <button type="submit" className="pill pill-hover">
             {editing ? <IconCheck size={14} /> : <IconPlus size={14} />}
-            {editing ? "保存修改" : "添加"}
+            {editing ? t("ai.saveChanges") : t("common.add")}
           </button>
         </div>
       </form>
 
       {/* AI 自主能力说明 */}
       <div className="card text-xs leading-relaxed text-neutral-500">
-        <p className="mb-2 font-medium text-neutral-900 dark:text-neutral-100">AI 自主能力（对话中自动可用）</p>
+        <p className="mb-2 font-medium text-neutral-900 dark:text-neutral-100">{t("ai.autonomyTitle")}</p>
         <ul className="list-inside list-disc space-y-1">
-          <li>shell / write_file / edit — 执行命令、写文件、增量补丁改文件</li>
-          <li>plan — 自己制定计划，登记目标与分步待办</li>
-          <li>add_tool / run_script — 用本机解释器写一段代码，即刻执行或沉淀为常驻工具</li>
-          <li>skill（save / search） — 自己写技能、搜索已有技能；add_memory 沉淀记忆</li>
-          <li>调用任意已注册工具（内置 / 远程 / AI 自写脚本）</li>
+          <li>{t("ai.capTools")}</li>
+          <li>{t("ai.capPlan")}</li>
+          <li>{t("ai.capScript")}</li>
+          <li>{t("ai.capSkill")}</li>
+          <li>{t("ai.capInvoke")}</li>
         </ul>
         <p className="mt-3 border-t border-neutral-200/70 pt-2 text-neutral-500 dark:border-neutral-800/70">
-          记忆与技能的<b className="text-neutral-700 dark:text-neutral-300">总结/沉淀由 AI 在对话中自己调用工具完成</b>（add_memory、skill），无需手动开关。
+          {t("ai.memoryNote1")}
+          <b className="text-neutral-700 dark:text-neutral-300">{t("ai.memoryNote2")}</b>
+          {t("ai.memoryNote3")}
         </p>
       </div>
     </div>

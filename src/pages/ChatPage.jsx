@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
+import { useLang } from "../i18n.js";
 import {
   IconSend,
   IconTrash,
@@ -16,6 +17,7 @@ import Markdown from "../components/Markdown.jsx";
 
 // AI 对话：多会话分组 + 工具调用可视化
 export default function ChatPage({ onStats }) {
+  const { t } = useLang();
   const [sessions, setSessions] = useState([]);
   const [activeId, setActiveId] = useState("");
   const [messages, setMessages] = useState([]);
@@ -78,7 +80,7 @@ export default function ChatPage({ onStats }) {
         const dataUrl = await readAsDataURL(f);
         setImages((arr) => [...arr, { name: f.name, dataUrl }]);
       } catch {
-        setAttachErr(`图片读取失败：${f.name}`);
+        setAttachErr(t("chat.imageReadFailed") + f.name);
       }
     }
   };
@@ -95,7 +97,7 @@ export default function ChatPage({ onStats }) {
           const r = await api.extractFile(f.name, dataUrl);
           if (r?.text) setDocs((arr) => [...arr, { name: f.name, text: r.text }]);
         } catch (err) {
-          setAttachErr(`解析失败：${f.name} — ${err}`);
+          setAttachErr(t("chat.parseFailed") + `${f.name} — ${err}`);
         }
       }
     } finally {
@@ -122,7 +124,7 @@ export default function ChatPage({ onStats }) {
       setUrlText("");
       setUrlOpen(false);
     } catch (err) {
-      setAttachErr(`网页抓取失败：${err}`);
+      setAttachErr(t("chat.webFetchFailed") + err);
     } finally {
       setAttaching(false);
     }
@@ -207,7 +209,7 @@ export default function ChatPage({ onStats }) {
       .join("\n\n---\n\n");
     const composed = docBlocks
       ? `${docBlocks}${text ? `\n\n---\n\n${text}` : ""}`
-      : text || "（见附件图片）";
+      : text || t("chat.seeAttachedImages");
 
     // 图片以 dataURL base64 传给多模态模型
     const imgData = images.map((im) => im.dataUrl);
@@ -216,9 +218,9 @@ export default function ChatPage({ onStats }) {
     const bubble =
       (text || (hasAttachments ? "" : "")) +
       (hasAttachments
-        ? `${text ? "\n\n" : ""}📎 ${images.length ? `图片 ×${images.length}` : ""}${
-            images.length && docs.length ? "，" : ""
-          }${docs.length ? `文档/链接 ×${docs.length}` : ""}`
+        ? `${text ? "\n\n" : ""}📎 ${images.length ? t("chat.attachImages") + ` ×${images.length}` : ""}${
+            images.length && docs.length ? t("chat.attachSep") : ""
+          }${docs.length ? t("chat.attachDocs") + ` ×${docs.length}` : ""}`
         : "");
 
     setInput("");
@@ -269,7 +271,7 @@ export default function ChatPage({ onStats }) {
             break;
           case "error":
             if (activeRef.current === sid) {
-              setMessages((msgs) => [...msgs, { role: "assistant", content: `调用失败：${ev.error}` }]);
+              setMessages((msgs) => [...msgs, { role: "assistant", content: t("chat.callFailed") + ev.error }]);
             }
             endLive();
             break;
@@ -283,7 +285,7 @@ export default function ChatPage({ onStats }) {
       onStats?.();
     } catch (e) {
       if (activeRef.current === sid) {
-        setMessages((msgs) => [...msgs, { role: "assistant", content: `调用失败：${e}` }]);
+        setMessages((msgs) => [...msgs, { role: "assistant", content: t("chat.callFailed") + e }]);
       }
       endLive();
     } finally {
@@ -312,7 +314,7 @@ export default function ChatPage({ onStats }) {
       loadSessions();
       onStats?.();
     } catch (e) {
-      setAttachErr(`压缩失败：${e}`);
+      setAttachErr(t("chat.compressFailed") + e);
     } finally {
       setCompressing(false);
     }
@@ -326,11 +328,11 @@ export default function ChatPage({ onStats }) {
       <div className="flex w-52 shrink-0 flex-col gap-2">
         <button onClick={newSession} className="pill pill-hover w-full justify-center">
           <IconPlus size={15} />
-          新对话
+          {t("chat.newChat")}
         </button>
         <div className="card flex-1 space-y-1 overflow-y-auto p-2">
           {sessions.length === 0 && (
-            <div className="px-2 py-4 text-center text-xs text-neutral-400">暂无对话</div>
+            <div className="px-2 py-4 text-center text-xs text-neutral-400">{t("chat.noSessions")}</div>
           )}
           {sessions.map((s) => {
             const active = s.id === activeId;
@@ -347,7 +349,7 @@ export default function ChatPage({ onStats }) {
                 <IconChat size={14} className={`shrink-0 opacity-70 ${busyMap[s.id] ? "hidden" : ""}`} />
                 {busyMap[s.id] && (
                   <span
-                    title="执行中"
+                    title={t("chat.running")}
                     className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-emerald-500 ring-2 ring-emerald-500/30"
                   />
                 )}
@@ -366,7 +368,7 @@ export default function ChatPage({ onStats }) {
                   />
                 ) : (
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-[13px] font-medium">{s.title || "新对话"}</div>
+                    <div className="truncate text-[13px] font-medium">{s.title || t("chat.newChat")}</div>
                     {s.preview && (
                       <div
                         className={`truncate text-[10px] ${
@@ -381,7 +383,7 @@ export default function ChatPage({ onStats }) {
                 {renaming?.id !== s.id && (
                   <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                     <button
-                      title="重命名"
+                      title={t("chat.rename")}
                       onClick={(e) => {
                         e.stopPropagation();
                         setRenaming({ id: s.id, title: s.title || "" });
@@ -391,7 +393,7 @@ export default function ChatPage({ onStats }) {
                       <IconEdit size={12} />
                     </button>
                     <button
-                      title="删除"
+                      title={t("common.delete")}
                       onClick={(e) => deleteSession(s.id, e)}
                       className={`rounded p-1 ${active ? "hover:bg-white/20 dark:hover:bg-black/20" : "hover:bg-neutral-900/10 dark:hover:bg-white/10"}`}
                     >
@@ -410,28 +412,28 @@ export default function ChatPage({ onStats }) {
         <div className="flex items-center justify-between">
           <div className="flex min-w-0 items-center gap-2">
             <h2 className="truncate text-lg font-semibold">
-              {sessions.find((s) => s.id === activeId)?.title || "AI 对话"}
+              {sessions.find((s) => s.id === activeId)?.title || t("chat.defaultTitle")}
             </h2>
             {runningCount > 0 && (
               <span
-                title="可切到其他会话继续对话，任务在后台不中断"
+                title={t("chat.runningHint")}
                 className="flex shrink-0 items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400"
               >
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-                {runningCount} 个对话执行中
+                {runningCount} {t("chat.runningCount")}
               </span>
             )}
           </div>
           <button onClick={clearCurrent} disabled={busy} className="pill pill-outline pill-hover disabled:opacity-40">
             <IconTrash size={14} />
-            清空
+            {t("common.clear")}
           </button>
         </div>
 
         <div className="card flex-1 overflow-y-auto">
           {visibleMessages.length === 0 && !busy && (
             <div className="flex h-full items-center justify-center px-6 text-center text-sm text-neutral-400">
-              发送消息开始对话。AI 会自动记忆重要内容，并可通过工具调用完成任务，调用过程会在下方以卡片展示。
+              {t("chat.emptyHint")}
             </div>
           )}
           <div className="flex flex-col gap-3">
@@ -489,20 +491,20 @@ export default function ChatPage({ onStats }) {
             >
               <span>
                 {ctxPct >= 1
-                  ? "上下文较长，可能影响回复质量"
+                  ? t("chat.ctxTooLong")
                   : ctxPct >= 0.7
-                    ? "上下文占用较高"
-                    : "上下文"}{" "}
-                约 {fmtK(contextTokens)} / 128K tokens
+                    ? t("chat.ctxHigh")
+                    : t("chat.context")}{" "}
+                {t("chat.ctxApprox") + ` ${fmtK(contextTokens)} / 128K tokens`}
               </span>
               {(ctxPct >= 1 || compressing) && (
                 <button
                   onClick={compress}
                   disabled={compressing || busy}
-                  title="AI 总结全部历史为摘要，释放上下文空间"
+                  title={t("chat.compressTip")}
                   className="rounded-full bg-red-500/15 px-2.5 py-0.5 font-medium text-red-600 transition-colors hover:bg-red-500/25 disabled:opacity-40 dark:text-red-400"
                 >
-                  {compressing ? "压缩中…" : "压缩对话"}
+                  {compressing ? t("chat.compressing") : t("chat.compress")}
                 </button>
               )}
             </div>
@@ -539,7 +541,7 @@ export default function ChatPage({ onStats }) {
                   />
                   <button
                     onClick={() => removeImage(i)}
-                    title="移除"
+                    title={t("common.remove")}
                     className="absolute -right-1.5 -top-1.5 rounded-full bg-neutral-900 p-0.5 text-white opacity-0 shadow transition-opacity group-hover:opacity-100 dark:bg-white dark:text-black"
                   >
                     <IconX size={11} />
@@ -555,13 +557,13 @@ export default function ChatPage({ onStats }) {
                   <span className="max-w-[160px] truncate" title={doc.name}>
                     {doc.name}
                   </span>
-                  <button onClick={() => removeDoc(i)} title="移除" className="opacity-60 hover:opacity-100">
+                  <button onClick={() => removeDoc(i)} title={t("common.remove")} className="opacity-60 hover:opacity-100">
                     <IconX size={12} />
                   </button>
                 </div>
               ))}
               {attaching && (
-                <span className="text-xs text-neutral-400">解析中…</span>
+                <span className="text-xs text-neutral-400">{t("chat.parsing")}</span>
               )}
               {attachErr && (
                 <span className="text-xs text-red-500" title={attachErr}>
@@ -573,7 +575,7 @@ export default function ChatPage({ onStats }) {
                   onClick={clearAttachments}
                   className="ml-auto text-xs text-neutral-400 hover:text-red-500"
                 >
-                  清除全部
+                  {t("chat.clearAll")}
                 </button>
               )}
             </div>
@@ -591,7 +593,7 @@ export default function ChatPage({ onStats }) {
                   if (e.key === "Enter") addUrl();
                   if (e.key === "Escape") setUrlOpen(false);
                 }}
-                placeholder="粘贴网址，如 https://…"
+                placeholder={t("chat.urlPlaceholder")}
                 className="field min-w-0 flex-1"
               />
               <label className="flex shrink-0 items-center gap-1.5 text-xs text-neutral-600 dark:text-neutral-300">
@@ -600,18 +602,18 @@ export default function ChatPage({ onStats }) {
                   checked={urlParse}
                   onChange={(e) => setUrlParse(e.target.checked)}
                 />
-                解析正文
+                {t("chat.parseContent")}
               </label>
               <button
                 onClick={addUrl}
                 disabled={!urlText.trim() || attaching}
                 className="pill pill-hover shrink-0"
               >
-                添加
+                {t("common.add")}
               </button>
               <button
                 onClick={() => setUrlOpen(false)}
-                title="关闭"
+                title={t("common.close")}
                 className="shrink-0 rounded-full p-1.5 hover:bg-neutral-900/5 dark:hover:bg-white/10"
               >
                 <IconX size={14} />
@@ -624,7 +626,7 @@ export default function ChatPage({ onStats }) {
             <button
               onClick={() => imgInput.current?.click()}
               disabled={busy || !activeId}
-              title="上传图片（多模态）"
+              title={t("chat.uploadImages")}
               className="shrink-0 rounded-full p-2 text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-white/10 dark:hover:text-white"
             >
               <IconImage size={18} />
@@ -632,7 +634,7 @@ export default function ChatPage({ onStats }) {
             <button
               onClick={() => docInput.current?.click()}
               disabled={busy || !activeId}
-              title="上传文档（Excel/Word/CSV → 文本）"
+              title={t("chat.uploadDocs")}
               className="shrink-0 rounded-full p-2 text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-white/10 dark:hover:text-white"
             >
               <IconFile size={18} />
@@ -640,7 +642,7 @@ export default function ChatPage({ onStats }) {
             <button
               onClick={() => setUrlOpen((v) => !v)}
               disabled={busy || !activeId}
-              title="添加网址（可解析正文）"
+              title={t("chat.addUrl")}
               className={`shrink-0 rounded-full p-2 transition-colors disabled:opacity-40 ${
                 urlOpen
                   ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
@@ -655,10 +657,10 @@ export default function ChatPage({ onStats }) {
               value={input}
               placeholder={
                 !activeId
-                  ? "请先新建或选择一个对话"
+                  ? t("chat.selectFirst")
                   : busy
-                    ? "本对话执行中，可切换其他对话继续…"
-                    : "输入消息，Enter 发送"
+                    ? t("chat.busyPlaceholder")
+                    : t("chat.inputPlaceholder")
               }
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && send()}
@@ -670,7 +672,7 @@ export default function ChatPage({ onStats }) {
               className="pill pill-hover shrink-0"
             >
               <IconSend size={15} />
-              发送
+              {t("common.send")}
             </button>
           </div>
         </div>
