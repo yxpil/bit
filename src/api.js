@@ -59,6 +59,14 @@ export const api = {
   checkPort: (host, port) => invoke("check_port", { host, port }),
   // 手动压缩会话：AI 总结全部历史为一条摘要，返回新消息列表
   compressSession: (session_id) => invoke("compress_session", { sessionId: session_id || "" }),
+
+  // ── MCP（Model Context Protocol）接入 ──
+  mcpDiscover: (host, start, end) => invoke("mcp_discover", { host, start, end }),
+  mcpConnect: (url) => invoke("mcp_connect", { url }),
+  mcpList: () => invoke("mcp_list"),
+  mcpToggle: (id, enabled) => invoke("mcp_toggle", { id, enabled }),
+  mcpRemove: (id) => invoke("mcp_remove", { id }),
+  mcpImport: (id) => invoke("mcp_import", { id }),
   listSessions: () => invoke("list_sessions"),
   getSession: (session_id) => invoke("get_session", { sessionId: session_id || "" }),
   createSession: (title) => invoke("create_session", { title: title || "" }),

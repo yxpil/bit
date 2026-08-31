@@ -46,6 +46,7 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/tools/{id}/invoke", post(invoke_tool))
         .route("/api/chat", post(remote_chat))
         .route("/api/audit", get(list_audit))
+        .route("/mcp", post(mcp_endpoint))
         // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(openai_chat_completions))
@@ -57,6 +58,84 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true, "service": "BIT", "time": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string() }))
 }
 
+/// BIT 自身作为 MCP 服务器（Streamable HTTP / JSON-RPC 2.0）：
+/// 任何 MCP 客户端（Claude Desktop、Cherry Studio、BIT 自己的自动发现）都可接入 BIT 的全部启用工具。
+/// 认证：Bearer Client Key 或 ?key=（见 auth 中间件）。
+async fn mcp_endpoint(
+    State(ctx): State<Arc<Ctx>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let rpc_ok = |result: serde_json::Value| {
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    };
+    let rpc_err = |code: i64, msg: &str| {
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } })
+    };
+
+    match method {
+        "initialize" => Json(rpc_ok(json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "BIT", "version": env!("CARGO_PKG_VERSION") }
+        })))
+        .into_response(),
+        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+        "tools/list" => {
+            let tools = ctx.tools.lock().unwrap();
+            let list: Vec<serde_json::Value> = tools
+                .iter()
+                .filter(|t| t.enabled)
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.parameters,
+                    })
+                })
+                .collect();
+            Json(rpc_ok(json!({ "tools": list }))).into_response()
+        }
+        "tools/call" => {
+            let name = body
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = body
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or(json!({}));
+            let found = {
+                let tools = ctx.tools.lock().unwrap();
+                tools
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| (t.id.clone(), t.enabled))
+            };
+            match found {
+                None => Json(rpc_err(-32602, "tool not found")).into_response(),
+                Some((_, false)) => Json(rpc_err(-32000, "tool is paused")).into_response(),
+                Some((tid, _)) => match crate::registry::invoke(&ctx, &tid, args, "mcp-client").await {
+                    Ok(v) => Json(rpc_ok(json!({
+                        "content": [{ "type": "text", "text": v.to_string() }],
+                        "isError": false
+                    })))
+                    .into_response(),
+                    Err(e) => Json(rpc_ok(json!({
+                        "content": [{ "type": "text", "text": e }],
+                        "isError": true
+                    })))
+                    .into_response(),
+                },
+            }
+        }
+        "" => (StatusCode::BAD_REQUEST, Json(rpc_err(-32600, "missing method"))).into_response(),
+        _ => Json(rpc_err(-32601, "method not found")).into_response(),
+    }
+}
+
 /// 双重认证：Bearer Client Key + X-Access-Password 访问密码，含 HTTP 请求审计。
 /// OpenAI 兼容端点（/v1/）例外：OpenAI 客户端无法携带自定义头，仅校验 Client Key。
 async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response {
@@ -65,6 +144,8 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
         return next.run(req).await;
     }
     let openai_endpoint = path.starts_with("/v1/");
+    // MCP 端点：仅校验 Client Key（Bearer 或 ?key= 查询参数），与 /v1 同级
+    let mcp_endpoint = path == "/mcp";
 
     let cfg = ctx.config.lock().unwrap().clone();
     let provided = req
@@ -74,8 +155,14 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
         .to_string();
+    // 兼容 ?key= 查询参数（自动发现/无 header 能力的客户端）
+    let qkey = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("key=")))
+        .unwrap_or("");
 
-    if provided != cfg.client_key {
+    if provided != cfg.client_key && qkey != cfg.client_key {
         crate::audit::record(
             &ctx,
             &actor_of(&provided),
@@ -91,8 +178,8 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
             .into_response();
     }
 
-    // 第二重：访问密码校验（OpenAI 兼容端点跳过）
-    if !openai_endpoint {
+    // 第二重：访问密码校验（OpenAI 兼容端点与 MCP 端点跳过）
+    if !openai_endpoint && !mcp_endpoint {
         let provided_pwd = req
             .headers()
             .get("x-access-password")

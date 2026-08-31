@@ -275,6 +275,9 @@ export default function RemotePage({ onStats }) {
         <p className="mb-3 text-xs text-neutral-500">
           {t("remote.openaiDesc")}
         </p>
+        <p className="mb-3 rounded-xl bg-neutral-100 px-3 py-2 text-xs text-neutral-500 dark:bg-neutral-900">
+          {t("remote.mcpNote")}
+        </p>
         <div className="mb-2 flex gap-2">
           <input className="field flex-1 font-mono" readOnly value={`http://${cfg.host}:${cfg.port}/v1`} />
           <button onClick={() => copy(`http://${cfg.host}:${cfg.port}/v1`, "baseurl")} className="pill pill-outline pill-hover shrink-0">

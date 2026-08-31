@@ -10,6 +10,7 @@ mod config;
 mod extract;
 mod goal;
 mod http_api;
+mod mcp;
 mod memory;
 mod registry;
 mod runtime;
@@ -86,6 +87,12 @@ fn main() {
             commands::fetch_webpage,
             commands::check_port,
             commands::compress_session,
+            commands::mcp_discover,
+            commands::mcp_connect,
+            commands::mcp_list,
+            commands::mcp_toggle,
+            commands::mcp_remove,
+            commands::mcp_import,
             commands::list_sessions,
             commands::get_session,
             commands::create_session,

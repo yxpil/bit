@@ -578,6 +578,130 @@ pub async fn check_port(host: String, port: u16) -> Result<serde_json::Value, St
     }
 }
 
+/// ── MCP（Model Context Protocol）接入 ──
+
+/// 自动发现：扫描本机端口范围，识别运行中的 MCP 服务器（Streamable HTTP）
+#[tauri::command]
+pub async fn mcp_discover(host: String, start: u16, end: u16) -> Result<serde_json::Value, String> {
+    let found = crate::mcp::discover(&host, start, end).await?;
+    Ok(json!({ "servers": found, "scanned": (end as u32 - start as u32 + 1) }))
+}
+
+/// 手动接入：对任意 URL 做 MCP 握手，成功则保存并返回服务器信息
+#[tauri::command]
+pub async fn mcp_connect(state: State<'_, Arc<Ctx>>, url: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Err("请填写 MCP 服务器 URL".into());
+    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let (name, version, protocol, session) = crate::mcp::initialize(&http, &url).await?;
+    let server = crate::mcp::McpServer {
+        id: format!("mcp-{}", uuid::Uuid::new_v4().simple()),
+        name: name.clone(),
+        url: url.clone(),
+        version,
+        protocol,
+        session,
+        enabled: true,
+        connected_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    };
+    // 同一 URL 只保留一条
+    let id = server.id.clone();
+    {
+        let mut list = ctx.mcp.lock().unwrap();
+        list.retain(|s| s.url != url);
+        list.push(server.clone());
+    }
+    ctx.save_mcp();
+    crate::audit::record(&ctx, "local-app", "mcp.connect", &name, json!({ "url": url }), true);
+    Ok(json!({ "server": server, "id": id }))
+}
+
+/// 已接入服务器列表
+#[tauri::command]
+pub async fn mcp_list(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let list = ctx.mcp.lock().unwrap().clone();
+    Ok(json!({ "servers": list }))
+}
+
+/// 暂停 / 继续某个 MCP 服务器（暂停后其全部工具拒绝调用）
+#[tauri::command]
+pub async fn mcp_toggle(state: State<'_, Arc<Ctx>>, id: String, enabled: bool) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let name = {
+        let mut list = ctx.mcp.lock().unwrap();
+        let s = list.iter_mut().find(|s| s.id == id).ok_or("MCP 服务器不存在")?;
+        s.enabled = enabled;
+        s.name.clone()
+    };
+    ctx.save_mcp();
+    crate::audit::record(&ctx, "local-app", if enabled { "mcp.enable" } else { "mcp.disable" }, &name, json!({ "enabled": enabled }), true);
+    Ok(json!({ "id": id, "enabled": enabled }))
+}
+
+/// 移除接入（其导入的工具同步移除）
+#[tauri::command]
+pub async fn mcp_remove(state: State<'_, Arc<Ctx>>, id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let removed = {
+        let mut list = ctx.mcp.lock().unwrap();
+        let before = list.len();
+        list.retain(|s| s.id != id);
+        list.len() != before
+    };
+    if !removed {
+        return Err("MCP 服务器不存在".into());
+    }
+    // 同步移除该服务器导入的工具
+    {
+        let mut tools = ctx.tools.lock().unwrap();
+        tools.retain(|t| match &t.kind {
+            crate::registry::ToolKind::Mcp { server_id, .. } => server_id != &id,
+            _ => true,
+        });
+    }
+    ctx.save_mcp();
+    ctx.save_tools();
+    crate::audit::record(&ctx, "local-app", "mcp.remove", &id, json!({}), true);
+    Ok(json!({ "removed": id }))
+}
+
+/// 重新拉取某服务器的工具清单并导入注册中心（同名跳过）
+#[tauri::command]
+pub async fn mcp_import(state: State<'_, Arc<Ctx>>, id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let server = crate::mcp::find(&ctx, &id).ok_or("MCP 服务器不存在")?;
+    let tools = crate::mcp::list_tools(&server).await?;
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    for t in &tools {
+        let ok = crate::registry::register(
+            &ctx,
+            &t.name,
+            &format!("{}（MCP · {}）", t.description, server.name),
+            if t.input_schema.is_null() || !t.input_schema.is_object() {
+                json!({"type": "object", "properties": {}, "additionalProperties": true})
+            } else {
+                t.input_schema.clone()
+            },
+            crate::registry::ToolKind::Mcp { server_id: id.clone(), tool: t.name.clone() },
+            "mcp",
+        );
+        match ok {
+            Ok(_) => imported += 1,
+            Err(_) => skipped += 1,
+        }
+    }
+    crate::audit::record(&ctx, "local-app", "mcp.import", &server.name, json!({ "imported": imported, "skipped": skipped }), true);
+    Ok(json!({ "imported": imported, "skipped": skipped, "total": tools.len() }))
+}
+
 /// 手动压缩会话：用 AI 把全部历史总结为一条摘要（system 消息），释放上下文空间。
 /// 摘要写入会话后返回新消息列表；压缩不影响会话本身，可继续对话。
 #[tauri::command]

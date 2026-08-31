@@ -6,6 +6,7 @@ use std::sync::Arc;
 /// - Remote: Agent 注册的回调端点，BIT 调用该 URL 执行
 /// - Script: AI 自己编写、自己注册的 Rhai 插件脚本
 /// - Interpreter: 用本机解释器（node / python / …）执行的脚本工具
+/// - Mcp: 从 MCP（Model Context Protocol）服务器导入的工具，经 JSON-RPC 调用
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolKind {
@@ -13,6 +14,7 @@ pub enum ToolKind {
     Remote { url: String },
     Script { code: String },
     Interpreter { runtime: String, code: String },
+    Mcp { server_id: String, tool: String },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -261,6 +263,18 @@ pub async fn invoke(
             } else {
                 Ok(value)
             }
+        }
+        ToolKind::Mcp { server_id, tool } => {
+            // 服务器级暂停/继续：暂停后该服务器全部工具拒绝调用
+            let server = crate::mcp::find(ctx, server_id)
+                .ok_or_else(|| format!("MCP 服务器 `{server_id}` 未接入"))?;
+            if !server.enabled {
+                return Err(format!(
+                    "MCP 服务器 `{}` 已暂停，请先在「工具」页启用",
+                    server.name
+                ));
+            }
+            crate::mcp::call_tool(&server, tool, params.clone()).await
         }
         ToolKind::Script { code } => {
             // 在阻塞线程池中执行 Rhai 沙盒脚本，整体限时 30 秒

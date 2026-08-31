@@ -46,7 +46,14 @@ export default function ChatPage({ onStats }) {
   const runningCount = Object.keys(busyMap).length;
 
   // 上下文用量估算（粗略：中英混合约 2 字符/token），仅用于预警，不阻断对话
-  const CONTEXT_LIMIT = 128 * 1024; // 128K tokens
+  // 阈值默认 128K，用户可点击用量条上的数字自行设置（localStorage 持久化）
+  const [ctxLimitK, setCtxLimitK] = useState(() => {
+    const v = parseInt(localStorage.getItem("bit.ctxLimitK"));
+    return Number.isFinite(v) && v >= 4 && v <= 2000 ? v : 128;
+  });
+  const [limitEdit, setLimitEdit] = useState(false);
+  const [limitInput, setLimitInput] = useState("");
+  const CONTEXT_LIMIT = ctxLimitK * 1024;
   const [compressing, setCompressing] = useState(false);
   const estimateTokens = (text) => Math.ceil((text || "").length / 2);
   const contextTokens = (() => {
@@ -57,6 +64,14 @@ export default function ChatPage({ onStats }) {
   })();
   const ctxPct = contextTokens / CONTEXT_LIMIT;
   const fmtK = (n) => (n >= 1024 ? `${(n / 1024).toFixed(1)}K` : String(n));
+  const saveLimit = () => {
+    setLimitEdit(false);
+    const v = parseInt(limitInput);
+    if (Number.isFinite(v) && v >= 4 && v <= 2000 && v !== ctxLimitK) {
+      setCtxLimitK(v);
+      localStorage.setItem("bit.ctxLimitK", String(v));
+    }
+  };
 
   useEffect(() => {
     activeRef.current = activeId;
@@ -495,7 +510,35 @@ export default function ChatPage({ onStats }) {
                   : ctxPct >= 0.7
                     ? t("chat.ctxHigh")
                     : t("chat.context")}{" "}
-                {t("chat.ctxApprox") + ` ${fmtK(contextTokens)} / 128K tokens`}
+                {t("chat.ctxApprox") + ` ${fmtK(contextTokens)} / `}
+                {limitEdit ? (
+                  <input
+                    autoFocus
+                    type="number"
+                    min={4}
+                    max={2000}
+                    value={limitInput}
+                    onChange={(e) => setLimitInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") saveLimit();
+                      if (e.key === "Escape") setLimitEdit(false);
+                    }}
+                    onBlur={saveLimit}
+                    className="w-14 rounded-md bg-transparent px-1 text-center outline-none ring-1 ring-current/40"
+                  />
+                ) : (
+                  <button
+                    onClick={() => {
+                      setLimitInput(String(ctxLimitK));
+                      setLimitEdit(true);
+                    }}
+                    title={t("chat.ctxLimitTitle")}
+                    className="underline decoration-dotted underline-offset-2 hover:opacity-70"
+                  >
+                    {ctxLimitK}K
+                  </button>
+                )}{" "}
+                tokens
               </span>
               {(ctxPct >= 1 || compressing) && (
                 <button

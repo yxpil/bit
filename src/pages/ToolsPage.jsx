@@ -11,6 +11,7 @@ import {
   IconTerminal,
   IconCode,
   IconRefresh,
+  IconGlobe,
 } from "../components/Icons.jsx";
 
 // 语言默认脚手架：读 stdin 的 JSON，把结果写 stdout
@@ -89,10 +90,21 @@ export default function ToolsPage({ onStats }) {
   const [rtPath, setRtPath] = useState("");
   const [rtLang, setRtLang] = useState("js");
 
+  // MCP 服务器：自动发现 + 接入 + 暂停/继续
+  const [mcpServers, setMcpServers] = useState([]);
+  const [mcpFound, setMcpFound] = useState(null);
+  const [mcpHost, setMcpHost] = useState("127.0.0.1");
+  const [mcpStart, setMcpStart] = useState("8000");
+  const [mcpEnd, setMcpEnd] = useState("8100");
+  const [mcpUrl, setMcpUrl] = useState("");
+  const [mcpBusy, setMcpBusy] = useState(false);
+  const [mcpMsg, setMcpMsg] = useState("");
+
   const reload = async () => {
-    const [t, r] = await Promise.all([api.listTools(), api.listRuntimes()]);
+    const [t, r, m] = await Promise.all([api.listTools(), api.listRuntimes(), api.mcpList()]);
     setTools(t.tools || []);
     setRuntimes(r.runtimes || []);
+    setMcpServers(m.servers || []);
     if (!runtime && r.runtimes?.length) setRuntime(r.runtimes[0].id);
   };
   useEffect(() => {
@@ -197,6 +209,66 @@ export default function ToolsPage({ onStats }) {
     await reload();
   };
 
+  // ── MCP：扫描 / 接入 / 开关 / 导入 / 移除 ──
+  const scanMcp = async () => {
+    setMcpBusy(true);
+    setMcpMsg("");
+    setMcpFound(null);
+    try {
+      const r = await api.mcpDiscover(mcpHost.trim() || "127.0.0.1", parseInt(mcpStart) || 8000, parseInt(mcpEnd) || 8100);
+      setMcpFound(r.servers || []);
+    } catch (e) {
+      setMcpMsg(String(e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  // 接入 = MCP 握手保存 + 立即导入工具清单到注册中心
+  const connectMcp = async (url) => {
+    setMcpBusy(true);
+    setMcpMsg("");
+    try {
+      const r = await api.mcpConnect(url);
+      const imp = await api.mcpImport(r.id);
+      setMcpMsg(`${r.server.name}: ${t("tools.mcpImported")} ${imp.imported} · ${t("tools.mcpSkipped")} ${imp.skipped}`);
+      setMcpUrl("");
+      setMcpFound(null);
+      await reload();
+      onStats?.();
+    } catch (e) {
+      setMcpMsg(String(e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const toggleMcp = async (s) => {
+    await api.mcpToggle(s.id, !(s.enabled ?? true));
+    await reload();
+  };
+
+  const removeMcp = async (id) => {
+    await api.mcpRemove(id);
+    await reload();
+    onStats?.();
+  };
+
+  const reimportMcp = async (s) => {
+    setMcpBusy(true);
+    setMcpMsg("");
+    try {
+      const imp = await api.mcpImport(s.id);
+      setMcpMsg(`${s.name}: ${t("tools.mcpImported")} ${imp.imported} · ${t("tools.mcpSkipped")} ${imp.skipped}`);
+      await reload();
+      onStats?.();
+    } catch (e) {
+      setMcpMsg(String(e));
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
   const kindTag = (kind) => {
     switch (kind?.kind) {
       case "builtin":
@@ -207,6 +279,8 @@ export default function ToolsPage({ onStats }) {
         return { text: t("tools.kindScript"), cls: "" };
       case "interpreter":
         return { text: kind.runtime, cls: "border-neutral-900 dark:border-white" };
+      case "mcp":
+        return { text: "MCP", cls: "" };
       default:
         return { text: t("tools.kindTool"), cls: "" };
     }
@@ -306,6 +380,107 @@ export default function ToolsPage({ onStats }) {
             <p className="py-4 text-center text-sm text-neutral-400">
               {t("tools.noRuntimes")}
             </p>
+          )}
+        </div>
+      </section>
+
+      {/* ── MCP 服务器：自动发现 + 接入 ── */}
+      <section className="card">
+        <div className="mb-3 flex items-center gap-2">
+          <IconGlobe size={18} />
+          <div>
+            <h2 className="text-sm font-semibold">{t("tools.mcpTitle")}</h2>
+            <p className="text-xs text-neutral-500 dark:text-neutral-400">
+              {t("tools.mcpDesc")}
+            </p>
+          </div>
+        </div>
+
+        {/* 扫描行：host + 端口范围 + 手动 URL */}
+        <div className="mb-3 grid grid-cols-6 gap-2">
+          <input className="field font-mono" title="Host" value={mcpHost} onChange={(e) => setMcpHost(e.target.value)} />
+          <input className="field font-mono" placeholder={t("tools.mcpFrom")} value={mcpStart} onChange={(e) => setMcpStart(e.target.value)} inputMode="numeric" />
+          <input className="field font-mono" placeholder={t("tools.mcpTo")} value={mcpEnd} onChange={(e) => setMcpEnd(e.target.value)} inputMode="numeric" />
+          <button onClick={scanMcp} className="pill pill-outline pill-hover" disabled={mcpBusy}>
+            <IconRefresh size={14} />
+            {mcpBusy ? t("tools.mcpScanning") : t("tools.mcpScan")}
+          </button>
+          <input
+            className="field col-span-2 font-mono"
+            placeholder={t("tools.mcpManualUrl")}
+            value={mcpUrl}
+            onChange={(e) => setMcpUrl(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && mcpUrl.trim() && connectMcp(mcpUrl.trim())}
+          />
+        </div>
+
+        {mcpMsg && <p className="mb-2 px-2 text-xs text-neutral-500 dark:text-neutral-400">{mcpMsg}</p>}
+
+        {/* 扫描结果 */}
+        {mcpFound && mcpFound.length > 0 && (
+          <div className="mb-3 flex flex-col gap-2">
+            {mcpFound.map((d) => (
+              <div key={d.url} className="flex items-center gap-3 rounded-2xl border border-dashed border-neutral-300 px-4 py-2.5 dark:border-neutral-700">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-neutral-100 dark:bg-neutral-900">
+                  <IconGlobe size={16} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold">{d.name}</span>
+                    <span className="chip">{d.version || "MCP"}</span>
+                  </div>
+                  <p className="truncate font-mono text-xs text-neutral-500 dark:text-neutral-400">{d.url}</p>
+                </div>
+                <button onClick={() => connectMcp(d.url)} className="pill pill-hover" disabled={mcpBusy}>
+                  <IconPlus size={14} />
+                  {t("tools.mcpConnect")}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        {mcpFound && mcpFound.length === 0 && (
+          <p className="mb-3 px-2 text-xs text-neutral-400">{t("tools.mcpNone")}</p>
+        )}
+
+        {/* 已接入列表：圆片开关（暂停/继续）+ 重新导入 + 移除 */}
+        <div className="flex flex-col gap-2">
+          {mcpServers.map((s) => {
+            const on = s.enabled ?? true;
+            const toolCount = tools.filter(
+              (tl) => tl.kind?.kind === "mcp" && tl.kind?.server_id === s.id
+            ).length;
+            return (
+              <div key={s.id} className="flex items-center gap-3 rounded-2xl border border-neutral-200/70 px-4 py-2.5 dark:border-neutral-800/70">
+                <div className={`flex min-w-0 flex-1 items-center gap-3 transition-opacity ${on ? "" : "opacity-45"}`}>
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-neutral-100 dark:bg-neutral-900">
+                    <IconGlobe size={16} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold">{s.name}</span>
+                      <span className="chip">MCP</span>
+                      <span className="chip">{toolCount} {t("tools.mcpTools")}</span>
+                    </div>
+                    <p className="truncate font-mono text-xs text-neutral-500 dark:text-neutral-400">{s.url}</p>
+                  </div>
+                </div>
+                <button onClick={() => reimportMcp(s)} className="icon-btn shrink-0" title={t("tools.mcpImport")} disabled={mcpBusy}>
+                  <IconRefresh size={13} />
+                </button>
+                <PillSwitch
+                  checked={on}
+                  onChange={() => toggleMcp(s)}
+                  title={on ? t("tools.mcpEnabledTitle") : t("tools.pausedTitle")}
+                />
+                <button onClick={() => removeMcp(s.id)} className="icon-btn shrink-0" title={t("common.remove")}>
+                  <IconTrash size={13} />
+                </button>
+              </div>
+            );
+          })}
+          {mcpServers.length === 0 && (
+            <p className="py-4 text-center text-sm text-neutral-400">{t("tools.mcpEmpty")}</p>
           )}
         </div>
       </section>

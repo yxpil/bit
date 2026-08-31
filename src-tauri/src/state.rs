@@ -26,6 +26,8 @@ pub struct Ctx {
     pub goals: Mutex<Vec<Goal>>,
     pub todos: Mutex<Vec<Todo>>,
     pub sessions: Mutex<SessionStore>,
+    /// 已接入的 MCP 服务器（Streamable HTTP）
+    pub mcp: Mutex<Vec<crate::mcp::McpServer>>,
     /// 小圆片播放/暂停状态（true = 播放，自动总结进行中）
     pub autopilot_running: AtomicBool,
     pub server_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -54,6 +56,8 @@ impl Ctx {
         let goals: Vec<Goal> = read_json(&data_dir.join("goals.json")).unwrap_or_default();
         let todos: Vec<Todo> = read_json(&data_dir.join("todos.json")).unwrap_or_default();
         let sessions = SessionStore::load(&data_dir);
+        let mcp: Vec<crate::mcp::McpServer> =
+            read_json(&data_dir.join("mcp_servers.json")).unwrap_or_default();
 
         // 内置工具随版本演进：始终以当前出厂的内置工具为准，
         // 移除历史遗留的内置项，保留用户 / AI 自建的工具，再把最新内置放到最前。
@@ -113,6 +117,7 @@ impl Ctx {
             goals: Mutex::new(goals),
             todos: Mutex::new(todos),
             sessions: Mutex::new(sessions),
+            mcp: Mutex::new(mcp),
             autopilot_running: AtomicBool::new(false),
             server_task: Mutex::new(None),
         })
@@ -152,6 +157,14 @@ impl Ctx {
         let _ = fs::write(
             self.data_dir.join("sessions.json"),
             serde_json::to_string(&*store).unwrap(),
+        );
+    }
+
+    pub fn save_mcp(&self) {
+        let mcp = self.mcp.lock().unwrap();
+        let _ = fs::write(
+            self.data_dir.join("mcp_servers.json"),
+            serde_json::to_string_pretty(&*mcp).unwrap(),
         );
     }
 }
