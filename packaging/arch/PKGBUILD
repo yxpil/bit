@@ -1,0 +1,49 @@
+# Maintainer: yxpil <hi@yxpil.com>
+# BIT 的 Arch Linux 安装包：基于官方 Release 的 AppImage（内置全部运行时依赖）
+# 用法：makepkg -si
+
+pkgname=bit-bin
+pkgver=0.3.1
+pkgrel=1
+pkgdesc="BIT - 可以自我扩展的 AI 助手（AppImage 封装）"
+arch=('x86_64')
+url="https://github.com/yxpil/bit"
+license=('Apache-2.0')
+depends=('fuse2')  # AppImage 运行时需要
+provides=('bit')
+conflicts=('bit')
+source=("BIT_${pkgver}_amd64.AppImage::${url}/releases/download/v${pkgver}/BIT_${pkgver}_amd64.AppImage")
+sha256sums=('SKIP')
+
+package() {
+  cd "${srcdir}"
+
+  install -Dm755 "BIT_${pkgver}_amd64.AppImage" "${pkgdir}/opt/bit/BIT.AppImage"
+  ln -sf /opt/bit/BIT.AppImage "${pkgdir}/usr/bin/bit"
+
+  # 提取应用图标（--appimage-extract 不需要 FUSE）
+  chmod +x "BIT_${pkgver}_amd64.AppImage"
+  ./"BIT_${pkgver}_amd64.AppImage" --appimage-extract > /dev/null 2>&1 || true
+  local icon
+  icon=$(find squashfs-root -name '*.png' -path '*128*' | head -1)
+  if [ -z "$icon" ]; then
+    icon=$(find squashfs-root -name '*.png' | head -1)
+  fi
+  if [ -n "$icon" ]; then
+    install -Dm644 "$icon" "${pkgdir}/usr/share/icons/hicolor/128x128/apps/bit.png"
+  fi
+  rm -rf squashfs-root
+
+  # 桌面入口
+  install -Dm644 /dev/null "${pkgdir}/usr/share/applications/bit.desktop"
+  cat > "${pkgdir}/usr/share/applications/bit.desktop" <<EOF
+[Desktop Entry]
+Name=BIT
+Comment=可以自我扩展的 AI 助手
+Exec=/opt/bit/BIT.AppImage
+Icon=bit
+Terminal=false
+Type=Application
+Categories=Utility;Development;
+EOF
+}
