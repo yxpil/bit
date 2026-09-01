@@ -55,6 +55,19 @@ function respondMsg(res, payload, sse, messages) {
 }
 
 const server = http.createServer((req, res) => {
+  // GET /v1/models：模拟 OpenAI 兼容模型列表（供 list_provider_models 集成测试）
+  if (req.method === "GET" && req.url.startsWith("/v1/models")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(
+      JSON.stringify({
+        object: "list",
+        data: [
+          { id: "mock-model-a", object: "model", owned_by: "mock" },
+          { id: "mock-model-b", object: "model", owned_by: "mock" },
+        ],
+      })
+    );
+  }
   if (req.method !== "POST") {
     res.writeHead(404);
     return res.end();

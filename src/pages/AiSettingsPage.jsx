@@ -6,25 +6,26 @@ import { IconPlus, IconTrash, IconSettings, IconCheck, IconX } from "../componen
 
 // 支持的协议：原生对接各家 API
 const PROTOCOLS = [
-  { id: "openai", label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
-  { id: "gemini", label: "Gemini", base: "https://generativelanguage.googleapis.com", model: "gemini-1.5-flash" },
-  { id: "claude", label: "Claude", base: "https://api.anthropic.com", model: "claude-3-5-sonnet-latest" },
+  { id: "openai", label: "OpenAI", base: "https://api.openai.com/v1", model: "gpt-5.6-sol" },
+  { id: "gemini", label: "Gemini", base: "https://generativelanguage.googleapis.com", model: "gemini-3.7-flash" },
+  { id: "claude", label: "Claude", base: "https://api.anthropic.com", model: "claude-sonnet-5" },
 ];
 const protoLabel = (id) => PROTOCOLS.find((p) => p.id === id)?.label || id;
 
-// 主流模型预设：点选自动填充协议 / Base URL / 模型名（OpenAI 兼容的国内外主流端全覆盖）
+// 主流模型预设：点选自动填充协议 / Base URL / 模型名（各家用其官方最新旗舰，也可点「从 API 获取」拉全量列表）
 const PRESETS = [
-  { name: "OpenAI GPT-4o", protocol: "openai", base: "https://api.openai.com/v1", model: "gpt-4o" },
+  { name: "OpenAI GPT-5.6", protocol: "openai", base: "https://api.openai.com/v1", model: "gpt-5.6-sol" },
   { name: "DeepSeek", protocol: "openai", base: "https://api.deepseek.com/v1", model: "deepseek-chat" },
-  { name: "Kimi 月之暗面", protocol: "openai", base: "https://api.moonshot.cn/v1", model: "kimi-k2-0905-preview" },
+  { name: "Kimi K3", protocol: "openai", base: "https://api.moonshot.cn/v1", model: "kimi-k3" },
   { name: "通义千问 Qwen", protocol: "openai", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-max" },
-  { name: "智谱 GLM", protocol: "openai", base: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.6" },
-  { name: "xAI Grok", protocol: "openai", base: "https://api.x.ai/v1", model: "grok-4" },
+  { name: "智谱 GLM-5.3", protocol: "openai", base: "https://open.bigmodel.cn/api/paas/v4", model: "glm-5.3" },
+  { name: "xAI Grok 4.6", protocol: "openai", base: "https://api.x.ai/v1", model: "grok-4.6" },
   { name: "OpenRouter", protocol: "openai", base: "https://openrouter.ai/api/v1", model: "openrouter/auto" },
   { name: "硅基流动", protocol: "openai", base: "https://api.siliconflow.cn/v1", model: "deepseek-ai/DeepSeek-V3" },
-  { name: "Ollama（本地）", protocol: "openai", base: "http://127.0.0.1:11434/v1", model: "qwen2.5" },
-  { name: "Google Gemini", protocol: "gemini", base: "https://generativelanguage.googleapis.com", model: "gemini-2.5-flash" },
-  { name: "Anthropic Claude", protocol: "claude", base: "https://api.anthropic.com", model: "claude-sonnet-4-5" },
+  { name: "Ollama（本地）", protocol: "openai", base: "http://127.0.0.1:11434/v1", model: "qwen3" },
+  { name: "Google Gemini", protocol: "gemini", base: "https://generativelanguage.googleapis.com", model: "gemini-3.7-flash" },
+  { name: "Claude Sonnet 5", protocol: "claude", base: "https://api.anthropic.com", model: "claude-sonnet-5" },
+  { name: "Claude Fable 5", protocol: "claude", base: "https://api.anthropic.com", model: "claude-fable-5" },
 ];
 
 const EMPTY = { id: null, name: "", protocol: "openai", base_url: "", api_key: "", model: "" };
@@ -39,6 +40,10 @@ export default function AiSettingsPage({ onStats, stats }) {
   // 模型采样参数：temperature null=默认；reasoning_effort ""=默认 / low / medium / high
   const [params, setParams] = useState({ temperature: null, reasoning_effort: "" });
   const [paramsSaved, setParamsSaved] = useState(false);
+  // 从提供方 API 拉取的模型列表（点击模型名直接填充）
+  const [remoteModels, setRemoteModels] = useState(null);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [fetchModelsErr, setFetchModelsErr] = useState("");
 
   const load = () =>
     api.listProviders().then((r) => setProviders(r.providers || [])).catch(() => {});
@@ -84,7 +89,24 @@ export default function AiSettingsPage({ onStats, stats }) {
       base_url: preset.base,
       model: preset.model,
     }));
+    setRemoteModels(null);
+    setFetchModelsErr("");
     setError("");
+  };
+
+  // 从提供方 API 拉取可用模型列表（需先填 Base URL 与 API Key）
+  const fetchModels = async () => {
+    setFetchingModels(true);
+    setFetchModelsErr("");
+    try {
+      const list = await api.listProviderModels(form.protocol, form.base_url, form.api_key);
+      setRemoteModels(list);
+    } catch (err) {
+      setRemoteModels(null);
+      setFetchModelsErr(String(err));
+    } finally {
+      setFetchingModels(false);
+    }
   };
 
   const submit = async (e) => {
@@ -115,6 +137,8 @@ export default function AiSettingsPage({ onStats, stats }) {
       api_key: p.api_key,
       model: p.model,
     });
+    setRemoteModels(null);
+    setFetchModelsErr("");
     setError("");
   };
 
@@ -400,13 +424,46 @@ export default function AiSettingsPage({ onStats, stats }) {
         </div>
 
         <div>
-          <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.model")}</label>
+          <div className="mb-1 flex items-center justify-between px-2">
+            <label className="text-xs text-neutral-500">{t("ai.model")}</label>
+            <button
+              type="button"
+              onClick={fetchModels}
+              disabled={fetchingModels || !form.base_url.trim()}
+              className="text-xs text-neutral-500 transition-colors hover:text-neutral-900 disabled:opacity-40 dark:hover:text-white"
+              title={t("ai.fetchModelsTip")}
+            >
+              {fetchingModels ? t("ai.fetchingModels") : t("ai.fetchModels")}
+            </button>
+          </div>
           <input
             className="field font-mono"
             value={form.model}
             onChange={(e) => setForm({ ...form, model: e.target.value })}
             placeholder={PROTOCOLS.find((p) => p.id === form.protocol)?.model}
           />
+          {fetchModelsErr && (
+            <p className="mt-1 px-2 text-[11px] text-red-600">{fetchModelsErr}</p>
+          )}
+          {Array.isArray(remoteModels) && remoteModels.length > 0 && (
+            <div className="mt-2 max-h-40 overflow-y-auto rounded-xl border border-neutral-200/80 dark:border-neutral-800">
+              {remoteModels.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setForm((f) => ({ ...f, model: m }))}
+                  className={`block w-full px-3 py-1.5 text-left font-mono text-[11px] transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
+                    form.model === m ? "text-neutral-900 dark:text-white" : "text-neutral-500"
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
+          {Array.isArray(remoteModels) && remoteModels.length === 0 && (
+            <p className="mt-1 px-2 text-[11px] text-neutral-400">{t("ai.noModels")}</p>
+          )}
         </div>
 
         {error && <p className="px-2 text-xs text-red-600">{error}</p>}

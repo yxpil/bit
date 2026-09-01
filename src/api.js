@@ -36,6 +36,9 @@ export const api = {
   getAiParams: () => invoke("get_ai_params"),
   setAiParams: (temperature, reasoning_effort) =>
     invoke("set_ai_params", { temperature, reasoningEffort: reasoning_effort }),
+  // 从提供方 API 拉取可用模型列表（OpenAI /models、Gemini /v1beta/models、Claude /v1/models）
+  listProviderModels: (protocol, base_url, api_key) =>
+    invoke("list_provider_models", { protocol, baseUrl: base_url, apiKey: api_key }),
   chat: (session_id, message, images) =>
     invoke("chat", { sessionId: session_id, message, images: images || null }),
   // 流式对话：过程通过 Tauri 事件 event_name 推送增量，onEvent 收到 {type, ...} payload。

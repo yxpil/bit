@@ -687,6 +687,86 @@ pub fn set_ai_params(
     Ok(json!({ "ok": true }))
 }
 
+/// 从提供方 API 拉取可用模型列表：
+/// - openai 兼容：GET {base}/models（Bearer Key）
+/// - gemini：GET {base}/v1beta/models?key=（返回 name 去 "models/" 前缀）
+/// - claude：GET {base}/v1/models（x-api-key + anthropic-version）
+#[tauri::command]
+pub async fn list_provider_models(
+    protocol: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return Err("Base URL 不能为空".into());
+    }
+    let url = match protocol.as_str() {
+        "gemini" => format!("{base}/v1beta/models?pageSize=200&key={api_key}"),
+        "claude" => format!("{base}/v1/models?limit=1000"),
+        _ => format!("{base}/models"),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(&url);
+    match protocol.as_str() {
+        "gemini" => {} // Key 已在查询参数中
+        "claude" => {
+            req = req
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01");
+        }
+        _ => {
+            if !api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {api_key}"));
+            }
+        }
+    }
+    let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("响应解析失败: {e}"))?;
+    if !status.is_success() {
+        let msg = body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+    let mut models: Vec<String> = match protocol.as_str() {
+        "gemini" => body
+            .get("models")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        m.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.trim_start_matches("models/").to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        m.get("id").and_then(|n| n.as_str()).map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    models.sort();
+    Ok(models)
+}
+
 /// AI 接收信息预览：当前会话实际发给模型的 system prompt / 消息 / 工具清单
 #[tauri::command]
 pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
@@ -1275,4 +1355,26 @@ pub async fn run_autopilot_now(state: State<'_, Arc<Ctx>>) -> Result<serde_json:
         let _ = crate::autopilot::tick_public(&ctx2).await;
     });
     Ok(json!({ "triggered": true }))
+}
+
+#[cfg(test)]
+mod tests {
+    /// 外部集成测试：连接独立运行的 mock AI（e2e/mock-ai.cjs，默认 127.0.0.1:9901），
+    /// 走真实 TCP 验证 OpenAI 兼容 /models 拉取逻辑。
+    /// 仅在设置 BIT_FAKE_OPENAI_URL 环境变量时运行：
+    ///   BIT_FAKE_OPENAI_URL=http://127.0.0.1:9901/v1 cargo test list_models_from_fake_openai
+    #[tokio::test]
+    async fn test_list_models_from_fake_openai() {
+        let Ok(base) = std::env::var("BIT_FAKE_OPENAI_URL") else {
+            eprintln!("跳过：未设置 BIT_FAKE_OPENAI_URL");
+            return;
+        };
+        let models = super::list_provider_models("openai".into(), base, String::new())
+            .await
+            .unwrap();
+        assert!(
+            models.contains(&"mock-model-a".to_string()) && models.contains(&"mock-model-b".to_string()),
+            "应返回 mock 的模型列表: {models:?}"
+        );
+    }
 }
