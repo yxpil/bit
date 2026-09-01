@@ -73,6 +73,28 @@ fn persist(ctx: &Arc<crate::state::Ctx>) {
     );
 }
 
+/// 批量删除记忆，返回实际删除条数
+pub fn delete_memories(ctx: &Arc<crate::state::Ctx>, ids: &[String]) -> usize {
+    let mut mem = ctx.memories.lock().unwrap();
+    let before = mem.len();
+    mem.retain(|m| !ids.contains(&m.id));
+    let removed = before - mem.len();
+    drop(mem);
+    persist(ctx);
+    removed
+}
+
+/// 批量删除技能，返回实际删除条数
+pub fn delete_skills(ctx: &Arc<crate::state::Ctx>, ids: &[String]) -> usize {
+    let mut skills = ctx.skills.lock().unwrap();
+    let before = skills.len();
+    skills.retain(|s| !ids.contains(&s.id));
+    let removed = before - skills.len();
+    drop(skills);
+    persist(ctx);
+    removed
+}
+
 /// 清除原始记忆，写入一条总结记忆（由 AI 生成摘要）
 pub fn compress_memories(ctx: &Arc<crate::state::Ctx>, raw_ids: &[String], summary: &str) -> usize {
     let mut mem = ctx.memories.lock().unwrap();

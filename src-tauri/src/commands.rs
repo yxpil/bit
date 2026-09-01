@@ -1076,6 +1076,28 @@ pub fn add_memory(state: State<'_, Arc<Ctx>>, content: String) -> Result<serde_j
     Ok(json!({ "memory": m }))
 }
 
+/// 批量删除记忆（单条删除传一个元素的数组即可）
+#[tauri::command]
+pub fn delete_memories(
+    state: State<'_, Arc<Ctx>>,
+    ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    if ids.is_empty() {
+        return Err("未选择要删除的记忆".into());
+    }
+    let removed = crate::memory::delete_memories(&ctx, &ids);
+    crate::audit::record(
+        &ctx,
+        "local-user",
+        "memory.delete",
+        "memories",
+        json!({ "count": removed }),
+        true,
+    );
+    Ok(json!({ "removed": removed }))
+}
+
 #[tauri::command]
 pub fn list_skills(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
@@ -1097,6 +1119,28 @@ pub fn add_skill(
     let s = crate::memory::add_skill(&ctx, &name, &summary, "user");
     crate::audit::record(&ctx, "local-user", "skill.add", &name, json!({}), true);
     Ok(json!({ "skill": s }))
+}
+
+/// 批量删除技能（单条删除传一个元素的数组即可）
+#[tauri::command]
+pub fn delete_skills(
+    state: State<'_, Arc<Ctx>>,
+    ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    if ids.is_empty() {
+        return Err("未选择要删除的技能".into());
+    }
+    let removed = crate::memory::delete_skills(&ctx, &ids);
+    crate::audit::record(
+        &ctx,
+        "local-user",
+        "skill.delete",
+        "skills",
+        json!({ "count": removed }),
+        true,
+    );
+    Ok(json!({ "removed": removed }))
 }
 
 /// 小圆片播放/暂停：控制 SKILL 与记忆的自动总结循环
