@@ -330,6 +330,7 @@ pub async fn chat_turn(
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
     let mut round = 0usize;
+    let mut auto_continues = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
@@ -364,8 +365,8 @@ pub async fn chat_turn(
                     });
                 }
 
-                // 存一条带工具调用可视化的 assistant 消息（content 去掉裸 JSON，仅留说明文字）
-                let visible = strip_tool_json(&reply);
+                // 存一条带工具调用可视化的 assistant 消息（content 去掉思考块与裸 JSON，仅留说明文字）
+                let visible = strip_tool_json(&strip_think_blocks(&reply));
                 let mut msg = ChatMessage::assistant(visible);
                 msg.tool_calls = records.clone();
                 {
@@ -392,11 +393,34 @@ pub async fn chat_turn(
                 convo.push(ChatMessage::user(feedback));
             }
             _ => {
-                // 纯文本回复：存入会话并结束
+                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」
+                if auto_continues < MAX_AUTO_CONTINUE && looks_truncated(&reply) {
+                    auto_continues += 1;
+                    let visible = strip_tool_json(&strip_think_blocks(&reply));
+                    if !visible.is_empty() {
+                        let mut store = ctx.sessions.lock().unwrap();
+                        if let Some(sess) = store.get_mut(&target) {
+                            sess.messages.push(ChatMessage::assistant(visible));
+                            sess.touch();
+                            if sess.messages.len() > CHAT_MAX {
+                                let drop_n = sess.messages.len() - CHAT_MAX;
+                                sess.messages.drain(0..drop_n);
+                            }
+                        }
+                        drop(store);
+                        crate::session::persist(ctx);
+                    }
+                    convo.push(ChatMessage::assistant(reply.clone()));
+                    convo.push(ChatMessage::user(CONTINUE_PROMPT));
+                    continue;
+                }
+                // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
+                let visible = strip_tool_json(&strip_think_blocks(&reply));
+                let visible = if visible.is_empty() { reply.clone() } else { visible };
                 {
                     let mut store = ctx.sessions.lock().unwrap();
                     if let Some(sess) = store.get_mut(&target) {
-                        sess.messages.push(ChatMessage::assistant(reply.clone()));
+                        sess.messages.push(ChatMessage::assistant(visible));
                         sess.touch();
                         if sess.messages.len() > CHAT_MAX {
                             let drop_n = sess.messages.len() - CHAT_MAX;
@@ -477,6 +501,7 @@ pub async fn chat_turn_stream(
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
     let mut round = 0usize;
+    let mut auto_continues = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
@@ -544,7 +569,7 @@ pub async fn chat_turn_stream(
                     });
                 }
 
-                let visible = strip_tool_json(&reply);
+                let visible = strip_tool_json(&strip_think_blocks(&reply));
                 let mut msg = ChatMessage::assistant(visible.clone());
                 msg.tool_calls = records.clone();
                 {
@@ -573,10 +598,36 @@ pub async fn chat_turn_stream(
                 convo.push(ChatMessage::user(feedback));
             }
             _ => {
+                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」
+                if auto_continues < MAX_AUTO_CONTINUE && looks_truncated(&reply) {
+                    auto_continues += 1;
+                    let visible = strip_tool_json(&strip_think_blocks(&reply));
+                    if !visible.is_empty() {
+                        let mut store = ctx.sessions.lock().unwrap();
+                        if let Some(sess) = store.get_mut(&target) {
+                            sess.messages.push(ChatMessage::assistant(visible.clone()));
+                            sess.touch();
+                            if sess.messages.len() > CHAT_MAX {
+                                let drop_n = sess.messages.len() - CHAT_MAX;
+                                sess.messages.drain(0..drop_n);
+                            }
+                        }
+                        drop(store);
+                        crate::session::persist(ctx);
+                    }
+                    // 通知前端：本轮是不完整回复 → 用清洗后的片段替换原始流式文本
+                    emit(json!({ "type": "continue", "visible": visible }));
+                    convo.push(ChatMessage::assistant(reply.clone()));
+                    convo.push(ChatMessage::user(CONTINUE_PROMPT));
+                    continue;
+                }
+                // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
+                let visible = strip_tool_json(&strip_think_blocks(&reply));
+                let visible = if visible.is_empty() { reply.clone() } else { visible };
                 {
                     let mut store = ctx.sessions.lock().unwrap();
                     if let Some(sess) = store.get_mut(&target) {
-                        sess.messages.push(ChatMessage::assistant(reply.clone()));
+                        sess.messages.push(ChatMessage::assistant(visible));
                         sess.touch();
                         if sess.messages.len() > CHAT_MAX {
                             let drop_n = sess.messages.len() - CHAT_MAX;
@@ -682,6 +733,71 @@ fn strip_tool_json(reply: &str) -> String {
 fn looks_like_tool_calls(calls: &[serde_json::Value]) -> bool {
     calls.iter().all(|c| c.get("tool").and_then(|v| v.as_str()).is_some())
 }
+
+/// 自动续发上限：模型连续输出不完整回复时，最多自动替用户补发多少次「继续」
+const MAX_AUTO_CONTINUE: usize = 8;
+
+/// 去掉模型输出里混入的思考块：成对的 <think>...</think>、未闭合的 <think> 残尾、游离的 </think>
+pub fn strip_think_blocks(reply: &str) -> String {
+    let mut out = String::new();
+    let mut rest = reply;
+    loop {
+        match (rest.find("<think>"), rest.find("</think>")) {
+            (Some(o), close) => {
+                // </think> 出现在 <think> 之前：游离闭合标记，仅删标记本身
+                if close.map_or(false, |c| c < o) {
+                    let c = close.unwrap();
+                    out.push_str(&rest[..c]);
+                    rest = &rest[c + "</think>".len()..];
+                } else {
+                    out.push_str(&rest[..o]);
+                    let after = &rest[o + "<think>".len()..];
+                    rest = match after.find("</think>") {
+                        Some(c) => &after[c + "</think>".len()..],
+                        // 未闭合的思考残尾：整体丢弃
+                        None => "",
+                    };
+                }
+            }
+            (None, Some(c)) => {
+                out.push_str(&rest[..c]);
+                rest = &rest[c + "</think>".len()..];
+            }
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 判断回复是否「话没说完就被截断」——此时不结束回合，自动替用户补发「继续」。
+/// 覆盖：空回复、纯思考残渣、<think> 未闭合、以冒号/省略号收尾、代码围栏未闭合
+fn looks_truncated(reply: &str) -> bool {
+    let t = reply.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if strip_think_blocks(t).trim().is_empty() {
+        return true;
+    }
+    if t.matches("<think>").count() > t.matches("</think>").count() {
+        return true;
+    }
+    if let Some(last) = t.chars().last() {
+        if matches!(last, ':' | '：' | '…') || t.ends_with("...") {
+            return true;
+        }
+    }
+    if t.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1 {
+        return true;
+    }
+    false
+}
+
+/// 自动续发时补给模型的消息
+const CONTINUE_PROMPT: &str = "继续（你上一条回复似乎未输出完整：若要调用工具请按协议单独一行输出 JSON 数组，若已完成请直接给出最终答案）";
 
 /// 扫描文本中所有平衡的 {...} JSON 对象，返回（解析值, 起始字节, 结束字节）。
 /// 只保留含字符串字段 "tool" 的对象——部分模型不按数组协议输出，而是每行一个
@@ -853,6 +969,45 @@ mod tests {
     #[test]
     fn test_strip_keeps_plain_text() {
         let reply = "这是普通回答，没有任何工具调用。";
-        assert_eq!(strip_tool_json(reply), reply);
+        assert_eq!(strip_tool_json(&strip_think_blocks(reply)), reply);
+    }
+
+    #[test]
+    fn test_strip_think_paired() {
+        let reply = "<think>推理过程</think>最终答案";
+        assert_eq!(strip_think_blocks(reply), "最终答案");
+    }
+
+    /// 截图中的真实案例：游离 </think> + 成对 <think>，去掉后没有正文 → 视为截断
+    #[test]
+    fn test_think_residue_is_truncated() {
+        let reply = "</think> </think> <think>让我检查回收站的内容，看看还有什么残留。 </think>";
+        assert!(looks_truncated(reply));
+        assert_eq!(strip_think_blocks(reply).trim(), "");
+    }
+
+    #[test]
+    fn test_unclosed_think_is_truncated() {
+        assert!(looks_truncated("<think>推理到一半"));
+        assert!(!looks_truncated("<think>推理</think>做完了。"));
+    }
+
+    #[test]
+    fn test_trailing_colon_is_truncated() {
+        assert!(looks_truncated("让我先检查回收站里具体还有什么，然后针对性清理："));
+        assert!(looks_truncated("让我尝试其他方法..."));
+        assert!(!looks_truncated("清理完成，共删除 12 个文件。"));
+    }
+
+    #[test]
+    fn test_unclosed_code_fence_is_truncated() {
+        assert!(looks_truncated("代码如下：\n```python\nprint(1)"));
+        assert!(!looks_truncated("代码如下：\n```python\nprint(1)\n```\n完成。"));
+    }
+
+    #[test]
+    fn test_empty_reply_is_truncated() {
+        assert!(looks_truncated(""));
+        assert!(looks_truncated("   \n  "));
     }
 }

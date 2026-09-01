@@ -334,6 +334,10 @@ export default function ChatPage({ onStats, visible }) {
               },
             }));
             break;
+          case "continue":
+            // 后端检测到回复被截断，自动续发「继续」：用清洗后的片段替换原始流式文本
+            setLiveMap((m) => ({ ...m, [sid]: { text: ev.visible || "", cards: m[sid]?.cards || [] } }));
+            break;
           case "final":
             // 仅当用户还停留在这个会话时刷新消息列表；后台会话结果已落库
             if (activeRef.current === sid && ev.messages) setMessages(ev.messages);
