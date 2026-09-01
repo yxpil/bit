@@ -23,7 +23,22 @@ import {
   IconSun,
   IconMoon,
   IconInfo,
+  IconPlus,
+  IconShirt,
 } from "./components/Icons.jsx";
+
+// 调色盘预设：null = 恢复默认黑白
+const ACCENT_PRESETS = [
+  { color: null, label: "default" },
+  { color: "#e11d48", label: "rose" },
+  { color: "#ea580c", label: "orange" },
+  { color: "#f59e0b", label: "amber" },
+  { color: "#16a34a", label: "green" },
+  { color: "#0891b2", label: "cyan" },
+  { color: "#2563eb", label: "blue" },
+  { color: "#7c3aed", label: "violet" },
+  { color: "#db2777", label: "pink" },
+];
 
 // 页面登记表：key -> { label, icon, page }（label 为 i18n key，渲染处 t(label)）
 const PAGES = {
@@ -44,9 +59,11 @@ const SECONDARY = ["tools", "memory", "skills", "audit", "remote", "ai"];
 export default function App() {
   const [tab, setTab] = useState("chat");
   const [stats, setStats] = useState(null);
-  const { isDark, toggle } = useTheme();
+  const { isDark, toggle, accent, setAccent } = useTheme();
   const { t, lang, toggleLang } = useLang();
   const [showAbout, setShowAbout] = useState(false);
+  const [showPalette, setShowPalette] = useState(false);
+  const [customColor, setCustomColor] = useState("#2563eb");
   const [appVersion, setAppVersion] = useState("");
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
@@ -60,7 +77,7 @@ export default function App() {
   const current = PAGES[tab] || PAGES[PRIMARY];
   const Page = current.page;
 
-  // 图标导航项：只显示图标（悬停显示名称），把宽度留给内容区
+  // 图标导航项：圆形小圆片（悬停显示名称），把宽度留给内容区
   const NavItem = ({ k }) => {
     const { label, icon: Icon } = PAGES[k];
     const active = tab === k;
@@ -68,9 +85,9 @@ export default function App() {
       <button
         onClick={() => setTab(k)}
         title={t(label)}
-        className={`flex w-full items-center justify-center rounded-xl py-2.5 transition-all duration-200 ${
+        className={`mx-auto flex h-10 w-10 items-center justify-center rounded-full transition-all duration-200 hover:scale-105 active:scale-95 ${
           active
-            ? "bg-neutral-900 text-white shadow-sm dark:bg-white dark:text-black"
+            ? "accent-solid shadow-sm"
             : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/5 dark:hover:text-white"
         }`}
       >
@@ -78,6 +95,20 @@ export default function App() {
       </button>
     );
   };
+
+  // 新对话小加号：位于图标栏顶部对话按钮下方，点击切到对话页并新建
+  const NewChatBtn = () => (
+    <button
+      onClick={() => {
+        setTab(PRIMARY);
+        window.dispatchEvent(new CustomEvent("bit-new-session"));
+      }}
+      title={t("chat.newChat")}
+      className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-dashed border-neutral-300 text-neutral-500 transition-colors hover:border-neutral-900 hover:text-neutral-900 dark:border-neutral-700 dark:hover:border-white dark:hover:text-white"
+    >
+      <IconPlus size={16} />
+    </button>
+  );
 
   // 栏底圆形小按钮（主题 / 语言 / 关于）
   const RailBtn = ({ onClick, title, children }) => (
@@ -95,28 +126,23 @@ export default function App() {
       <TitleBar />
 
       <div className="flex min-h-0 flex-1">
-        {/* 图标侧栏：只有一列图标，主体空间留给对话 */}
-        <aside className="flex w-14 shrink-0 flex-col items-center gap-1 border-r border-neutral-200/70 bg-white/60 py-3 backdrop-blur-md dark:border-neutral-800/70 dark:bg-black/40">
-          {/* 品牌 */}
-          <button
-            onClick={() => setTab(PRIMARY)}
-            title="BIT"
-            className="mb-2 flex h-9 w-9 items-center justify-center rounded-full bg-neutral-900 shadow-md transition-transform duration-300 ease-out hover:-rotate-6 hover:scale-105 dark:bg-white"
-          >
-            <img src={logoUrl} alt="BIT" className="h-5 w-5 rounded-full bg-white dark:bg-black" />
-          </button>
-
+        {/* 图标侧栏：无分隔线，与窗口背景融为一体 */}
+        <aside className="flex w-14 shrink-0 flex-col items-center gap-1 py-3">
           {/* 导航：对话主功能置顶，其余分组 */}
-          <nav className="flex w-full flex-1 flex-col gap-1 px-1.5">
+          <nav className="flex w-full flex-1 flex-col gap-1 px-1.5 pt-1">
             <NavItem k={PRIMARY} />
+            <NewChatBtn />
             <div className="mx-auto my-2 h-px w-6 bg-neutral-200 dark:bg-neutral-800" />
             {SECONDARY.map((k) => (
               <NavItem key={k} k={k} />
             ))}
           </nav>
 
-          {/* 栏底：主题 / 语言 / 关于 */}
-          <div className="flex w-full flex-col gap-0.5 px-1.5">
+          {/* 栏底：换主题色 / 明暗 / 语言 / 关于 */}
+          <div className="relative flex w-full flex-col gap-0.5 px-1.5">
+            <RailBtn onClick={() => setShowPalette((v) => !v)} title={t("theme.accent")}>
+              <IconShirt size={17} />
+            </RailBtn>
             <RailBtn onClick={toggle} title={t(isDark ? "app.switchLight" : "app.switchDark")}>
               {isDark ? <IconSun size={17} /> : <IconMoon size={17} />}
             </RailBtn>
@@ -143,6 +169,49 @@ export default function App() {
           ))}
         </main>
       </div>
+
+      {/* 调色盘弹层：预设 + 自定义取色器，点击外部关闭 */}
+      {showPalette && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setShowPalette(false)} />
+          <div className="anim-rise card fixed bottom-14 left-16 z-50 w-60 p-4">
+            <p className="mb-3 text-xs font-semibold text-neutral-500 dark:text-neutral-400">
+              {t("theme.accent")}
+            </p>
+            <div className="mb-3 flex flex-wrap gap-2">
+              {ACCENT_PRESETS.map(({ color, label }) => (
+                <button
+                  key={label}
+                  title={color ? label : t("theme.reset")}
+                  onClick={() => setAccent(color || "")}
+                  className={`h-7 w-7 rounded-full border-2 transition-transform duration-200 hover:scale-110 ${
+                    (accent || "") === (color || "") && (accent || label) === (color || label)
+                      ? "scale-110 border-neutral-900 dark:border-white"
+                      : "border-transparent"
+                  }`}
+                  style={{
+                    background:
+                      color ||
+                      "conic-gradient(#ef4444,#f59e0b,#22c55e,#06b6d4,#6366f1,#d946ef,#ef4444)",
+                  }}
+                />
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="color"
+                value={customColor}
+                onChange={(e) => {
+                  setCustomColor(e.target.value);
+                  setAccent(e.target.value);
+                }}
+                className="h-8 w-12 cursor-pointer rounded-lg border border-neutral-200 bg-transparent p-0.5 dark:border-neutral-700"
+              />
+              <span className="text-xs text-neutral-400">{t("theme.custom")}</span>
+            </div>
+          </div>
+        </>
+      )}
 
       {/* 关于弹窗 */}
       {showAbout && (

@@ -148,6 +148,20 @@ export default function ChatPage({ onStats, visible }) {
     }
   };
 
+  // 页眉仪表盘数据广播（版本/内存由页眉自取）
+  useEffect(() => {
+    window.dispatchEvent(
+      new CustomEvent("bit-dash", {
+        detail: {
+          sessions: sessions.length,
+          tokens: contextTokens,
+          limitK: ctxLimitK,
+          running: runningCount > 0,
+        },
+      }),
+    );
+  }, [sessions.length, contextTokens, ctxLimitK, runningCount]);
+
   useEffect(() => {
     activeRef.current = activeId;
   }, [activeId]);
@@ -274,6 +288,13 @@ export default function ChatPage({ onStats, visible }) {
       setMessages([]);
     }
   };
+
+  // 图标栏「+」小加号 → 新建会话（跨组件事件）
+  useEffect(() => {
+    const h = () => newSession();
+    window.addEventListener("bit-new-session", h);
+    return () => window.removeEventListener("bit-new-session", h);
+  }, []);
 
   const deleteSession = async (id, e) => {
     e?.stopPropagation();
@@ -485,13 +506,6 @@ export default function ChatPage({ onStats, visible }) {
     }
   };
 
-  const clearCurrent = async () => {
-    if (!activeId || busyMap[activeId]) return;
-    await api.clearSession(activeId).catch(() => {});
-    setMessages([]);
-    loadSessions();
-  };
-
   // 手动压缩：AI 把全部历史总结为摘要，释放上下文空间（不阻断会话本身）
   const compress = async () => {
     if (!activeId || compressing || busyMap[activeId]) return;
@@ -518,25 +532,8 @@ export default function ChatPage({ onStats, visible }) {
           <div className="card px-6 py-4 text-sm font-medium">{t("chat.dropHint")}</div>
         </div>
       )}
-      {/* 会话侧栏：无卡片盒，纯列表 */}
+      {/* 会话侧栏：纯文字列表（仪表盘已上移页眉） */}
       <div className="flex w-52 shrink-0 flex-col gap-2">
-        <div className="flex items-center gap-1.5">
-          <button
-            onClick={newSession}
-            className="pill pill-outline pill-hover flex flex-1 justify-center py-1.5 text-[13px]"
-          >
-            <IconPlus size={14} />
-            {t("chat.newChat")}
-          </button>
-          <button
-            onClick={clearCurrent}
-            disabled={busy}
-            title={t("common.clear")}
-            className="shrink-0 rounded-full p-2 text-neutral-400 transition-colors hover:bg-red-500/10 hover:text-red-500 disabled:opacity-40"
-          >
-            <IconTrash size={15} />
-          </button>
-        </div>
         <div className="flex-1 space-y-0.5 overflow-y-auto">
           {sessions.length === 0 && (
             <div className="px-2 py-4 text-center text-xs text-neutral-400">{t("chat.noSessions")}</div>
@@ -547,9 +544,9 @@ export default function ChatPage({ onStats, visible }) {
               <div
                 key={s.id}
                 onClick={() => selectSession(s.id)}
-                className={`group flex cursor-pointer items-center gap-2 rounded-xl px-2.5 py-2 transition-colors ${
+                className={`anim-rise group flex cursor-pointer items-center gap-2 rounded-xl px-2.5 py-2 transition-all duration-200 hover:translate-x-0.5 ${
                   active
-                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    ? "accent-solid"
                     : "text-neutral-600 hover:bg-neutral-900/5 dark:text-neutral-300 dark:hover:bg-white/5"
                 }`}
               >
@@ -804,7 +801,7 @@ export default function ChatPage({ onStats, visible }) {
                   <button
                     onClick={() => removeImage(i)}
                     title={t("common.remove")}
-                    className="absolute -right-1.5 -top-1.5 rounded-full bg-neutral-900 p-0.5 text-white opacity-0 shadow transition-opacity group-hover:opacity-100 dark:bg-white dark:text-black"
+                    className="accent-solid absolute -right-1.5 -top-1.5 rounded-full p-0.5 opacity-0 shadow transition-opacity group-hover:opacity-100"
                   >
                     <IconX size={11} />
                   </button>
@@ -934,7 +931,7 @@ export default function ChatPage({ onStats, visible }) {
                 title={t("chat.attach")}
                 className={`shrink-0 rounded-full p-2 transition-colors disabled:opacity-40 ${
                   attachMenu
-                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    ? "accent-solid"
                     : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
                 }`}
               >
@@ -988,8 +985,12 @@ export default function ChatPage({ onStats, visible }) {
               }
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                // isComposing：中文输入法选词回车不发送
-                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                // Enter 直接换行便于拼接长消息；Ctrl+Enter / Shift+Enter 发送；中文输入法选词回车不发送
+                if (
+                  e.key === "Enter" &&
+                  (e.ctrlKey || e.shiftKey || e.metaKey) &&
+                  !e.nativeEvent.isComposing
+                ) {
                   e.preventDefault();
                   send();
                 }
@@ -1008,10 +1009,10 @@ export default function ChatPage({ onStats, visible }) {
             <button
               onClick={send}
               disabled={(!input.trim() && !hasAttachments) || !activeId}
-              title={busy ? t("chat.enqueue") : t("common.send")}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-white shadow-sm transition-colors hover:bg-neutral-700 disabled:opacity-40 dark:bg-white dark:text-black dark:hover:bg-neutral-200"
+              title={t("common.send")}
+              className="accent-solid flex h-10 w-10 shrink-0 items-center justify-center rounded-full shadow-sm transition-all duration-200 hover:brightness-110 active:scale-95 disabled:opacity-40"
             >
-              {busy ? <IconQueue size={16} /> : <IconSend size={16} />}
+              <IconSend size={16} />
             </button>
           </div>
         </div>
@@ -1098,7 +1099,7 @@ function MessageBubble({ message }) {
 
   if (isUser) {
     return (
-      <div className="ml-auto max-w-[80%] whitespace-pre-wrap rounded-3xl rounded-br-lg bg-neutral-900 px-4 py-2.5 text-sm leading-relaxed text-white dark:bg-white dark:text-black">
+      <div className="accent-solid ml-auto max-w-[80%] whitespace-pre-wrap rounded-3xl rounded-br-lg px-4 py-2.5 text-sm leading-relaxed">
         {message.content}
       </div>
     );

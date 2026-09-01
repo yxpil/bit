@@ -81,6 +81,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::mem_usage,
             commands::get_overview,
             commands::list_tools,
             commands::register_tool,

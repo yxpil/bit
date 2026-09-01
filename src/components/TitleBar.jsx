@@ -1,9 +1,14 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import logoUrl from "../assets/logo-64.png";
 import { IconMinus, IconSquare, IconX } from "./Icons.jsx";
 import { useLang } from "../i18n.js";
 
-// 自定义无边框标题栏（替代原生菜单栏）：左侧品牌，右侧窗口按钮，中段可拖动
+const fmtK = (n) => (n >= 1024 ? `${(n / 1024).toFixed(1)}K` : String(n));
+
+// 自定义无边框标题栏：与窗口按钮同高的页眉仪表盘（版本/会话/Token/内存），
+// 数据不侵占内容区；中段可拖动，右侧窗口按钮
 export default function TitleBar() {
   const { t } = useLang();
   const win = () => getCurrentWindow();
@@ -12,17 +17,70 @@ export default function TitleBar() {
   // 关闭走 CloseRequested → 隐藏到托盘（后端已拦截），此处直接调用即可
   const close = () => win().close().catch(() => {});
 
+  const [ver, setVer] = useState("");
+  const [dash, setDash] = useState({ sessions: 0, tokens: 0, limitK: 128 });
+  const [memMB, setMemMB] = useState(null);
+
+  useEffect(() => {
+    getVersion().then(setVer).catch(() => {});
+  }, []);
+
+  // ChatPage 广播会话数与当前上下文 Token
+  useEffect(() => {
+    const h = (e) => setDash(e.detail || {});
+    window.addEventListener("bit-dash", h);
+    return () => window.removeEventListener("bit-dash", h);
+  }, []);
+
+  // 本进程内存占用，3 秒轮询
+  useEffect(() => {
+    let stop = false;
+    const poll = async () => {
+      try {
+        const b = await invoke("mem_usage");
+        if (!stop) setMemMB(Math.round(b / 1048576));
+      } catch {
+        /* 忽略：命令不可用时隐藏该项 */
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 3000);
+    return () => {
+      stop = true;
+      clearInterval(timer);
+    };
+  }, []);
+
   return (
     <div
       data-tauri-drag-region
-      className="flex h-9 shrink-0 select-none items-center gap-2 border-b border-neutral-200/70 bg-white/80 px-3 backdrop-blur-md dark:border-neutral-800/70 dark:bg-black/50"
+      className="flex h-9 shrink-0 select-none items-center gap-1 px-3"
     >
-      {/* 品牌区（也可拖动） */}
-      <div data-tauri-drag-region className="flex items-center gap-2">
-        <img src={logoUrl} alt="BIT" className="h-4 w-4 rounded-full" />
-        <span className="text-xs font-semibold tracking-wide text-neutral-700 dark:text-neutral-300">
-          BIT
+      {/* 页眉仪表盘（可拖动） */}
+      <div
+        data-tauri-drag-region
+        className="anim-rise flex items-center gap-2 text-[11px] text-neutral-400 dark:text-neutral-500"
+      >
+        <span
+          className={`h-2 w-2 rounded-full ${
+            dash.running ? "animate-pulse bg-amber-400" : "bg-emerald-500"
+          }`}
+        />
+        {ver && <span className="font-semibold">v{ver}</span>}
+        <span className="opacity-50">·</span>
+        <span>
+          {dash.sessions} {t("chat.unitSessions")}
         </span>
+        <span className="opacity-50">·</span>
+        <span>
+          {fmtK(dash.tokens)} / {dash.limitK}K tok
+        </span>
+        {memMB !== null && (
+          <>
+            <span className="opacity-50">·</span>
+            <span>{memMB} MB</span>
+          </>
+        )}
       </div>
 
       {/* 弹性拖动区 */}

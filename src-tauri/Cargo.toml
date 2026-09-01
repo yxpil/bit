@@ -1,6 +1,6 @@
 [package]
 name = "bit"
-version = "0.2.20"
+version = "0.3.0"
 description = "BIT - Agent Tool Hub with audit and remote access"
 edition = "2021"
 
@@ -28,3 +28,5 @@ scraper = "0.20"
 base64 = "0.22"
 zip = "2"
 quick-xml = "0.36"
+# 页眉仪表盘：本进程内存占用查询
+sysinfo = "0.33"

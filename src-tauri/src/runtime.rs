@@ -79,7 +79,11 @@ fn candidates() -> Vec<(&'static str, &'static str, &'static str, &'static str, 
 fn probe(cmd: &str, version_arg: &str) -> Option<(String, String)> {
     // 版本探测参数可能含空格（powershell），拆分处理
     let args: Vec<&str> = version_arg.split(' ').filter(|s| !s.is_empty()).collect();
-    let output = Command::new(cmd).args(&args).output().ok()?;
+    // 启动时批量探测，必须隐藏子进程控制台窗口（否则启动瞬间黑窗闪烁）
+    let mut c = Command::new(cmd);
+    c.args(&args);
+    crate::registry::no_window(&mut c);
+    let output = c.output().ok()?;
     if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
         return None;
     }

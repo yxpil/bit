@@ -24,6 +24,15 @@
   #root {
     height: 100%;
   }
+  /* 主题强调色：默认黑白胶囊；用户在调色盘选择后经内联样式覆盖 */
+  :root {
+    --accent: #171717;
+    --accent-fg: #ffffff;
+  }
+  .dark {
+    --accent: #f5f5f5;
+    --accent-fg: #171717;
+  }
   body {
     @apply bg-neutral-100 text-neutral-900 antialiased;
     font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
@@ -60,15 +69,23 @@
 
 /* 胶囊小圆片通用样式 */
 @layer components {
-  /* 实心主按钮：亮色黑底白字 / 暗色白底黑字 */
+  /* 实心主按钮：跟随主题强调色（默认亮色黑 / 暗色白） */
   .pill {
-    @apply inline-flex items-center gap-2 rounded-full border border-neutral-900
-      bg-neutral-900 px-4 py-1.5 text-sm font-medium text-white
-      transition-all duration-200 select-none;
+    @apply inline-flex items-center gap-2 rounded-full border
+      px-4 py-1.5 text-sm font-medium transition-all duration-200 select-none;
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
     box-shadow: var(--shadow-pill);
   }
-  .dark .pill {
-    @apply border-white bg-white text-black;
+  .pill:hover {
+    filter: brightness(1.1);
+  }
+  /* 强调色实心面（导航选中 / 发送按钮 / 会话选中 / 开关选中） */
+  .accent-solid {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
   }
   /* 描边按钮 */
   .pill-outline {
@@ -116,11 +133,26 @@
   }
   /* 圆形图标按钮（列表操作 / 标题栏） */
   .icon-btn {
-    @apply flex h-7 w-7 items-center justify-center rounded-full
+    @apply flex h-9 w-9 items-center justify-center rounded-full
       bg-neutral-100 text-neutral-600 transition-colors
       hover:bg-neutral-200 hover:text-neutral-900;
   }
   .dark .icon-btn {
     @apply bg-neutral-900 text-neutral-300 hover:bg-neutral-800 hover:text-white;
   }
+}
+
+/* 入场动画：轻微上浮 + 淡入（页眉仪表盘、会话行、工具卡片） */
+@keyframes bit-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.anim-rise {
+  animation: bit-rise 0.28s var(--ease-pill) both;
 }

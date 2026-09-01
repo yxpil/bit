@@ -17,7 +17,7 @@ export default function PillSwitch({ checked, onChange, disabled, size = "md", t
       onClick={() => !disabled && onChange?.(!checked)}
       className={`flex ${box} shrink-0 items-center justify-center rounded-full transition-all duration-200 ${
         checked
-          ? "bg-neutral-900 text-white hover:bg-neutral-700 dark:bg-white dark:text-black dark:hover:bg-neutral-200"
+          ? "accent-solid hover:brightness-110"
           : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
       } ${disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer"}`}
     >

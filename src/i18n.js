@@ -91,6 +91,11 @@ const dict = {
     "chat.attachDocs": "文档/链接",
     "chat.callFailed": "调用失败：",
     "chat.compressFailed": "压缩失败：",
+    "chat.unitSessions": "个会话",
+    // 主题
+    "theme.accent": "主题色",
+    "theme.custom": "自定义颜色",
+    "theme.reset": "恢复默认",
     "chat.newChat": "新对话",
     "chat.noSessions": "暂无对话",
     "chat.running": "执行中",
@@ -137,7 +142,7 @@ const dict = {
     "chat.attach": "添加附件",
     "chat.selectFirst": "请先新建或选择一个对话",
     "chat.busyPlaceholder": "本对话执行中，可切换其他对话继续…",
-    "chat.inputPlaceholder": "输入消息，Enter 发送",
+    "chat.inputPlaceholder": "输入消息，Enter 换行，Ctrl+Enter 发送",
     "chat.dropHint": "松开鼠标，插入文件 / 文件夹链接",
     // 工具页
     "tools.badTestParams": "测试参数不是合法 JSON",
@@ -361,6 +366,11 @@ const dict = {
     "chat.attachDocs": "Docs/Links",
     "chat.callFailed": "Call failed: ",
     "chat.compressFailed": "Failed to compress: ",
+    "chat.unitSessions": "sessions",
+    // Theme
+    "theme.accent": "Accent color",
+    "theme.custom": "Custom color",
+    "theme.reset": "Default",
     "chat.newChat": "New chat",
     "chat.noSessions": "No conversations yet",
     "chat.running": "Running",
@@ -407,7 +417,7 @@ const dict = {
     "chat.attach": "Add attachment",
     "chat.selectFirst": "Create or select a conversation first",
     "chat.busyPlaceholder": "This conversation is running — switch to another to continue…",
-    "chat.inputPlaceholder": "Type a message — Enter to send, Shift+Enter for newline",
+    "chat.inputPlaceholder": "Type a message — Enter for newline, Ctrl+Enter to send",
     "chat.dropHint": "Release to insert file / folder links",
     // Tools page
     "tools.badTestParams": "Test parameters are not valid JSON",

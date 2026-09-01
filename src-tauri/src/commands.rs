@@ -11,6 +11,16 @@ fn ctx<'a>(state: State<'a, Arc<Ctx>>) -> Arc<Ctx> {
 
 // ---------- 概览 ----------
 
+/// 本进程内存占用（字节）：页眉仪表盘展示，前端每 3 秒轮询
+#[tauri::command]
+pub fn mem_usage() -> u64 {
+    use sysinfo::{ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).map(|p| p.memory()).unwrap_or(0)
+}
+
 #[tauri::command]
 pub fn get_overview(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);

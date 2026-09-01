@@ -90,12 +90,10 @@ fn run_compiled(
             let src = work.join("main.rs");
             let bin = work.join(if cfg!(windows) { "main.exe" } else { "main" });
             std::fs::write(&src, code).map_err(|e| format!("写入源码失败: {e}"))?;
-            let compile = Command::new(&rt.path) // rustc
-                .arg(&src)
-                .arg("-O")
-                .arg("-o")
-                .arg(&bin)
-                .output();
+            let mut compile = Command::new(&rt.path); // rustc
+            compile.arg(&src).arg("-O").arg("-o").arg(&bin);
+            crate::registry::no_window(&mut compile);
+            let compile = compile.output();
             match compile {
                 Ok(o) if o.status.success() => {
                     let cmd = Command::new(&bin);
@@ -171,6 +169,8 @@ fn spawn_with_stdin(
     mut cmd: Command,
     params: &serde_json::Value,
 ) -> Result<std::process::Output, String> {
+    // 所有脚本工具子进程统一隐藏控制台窗口，避免执行时黑窗闪烁
+    crate::registry::no_window(&mut cmd);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
