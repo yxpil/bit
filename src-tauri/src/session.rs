@@ -92,6 +92,21 @@ impl SessionStore {
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
+
+    /// 找到会话；不存在则用指定 id 新建（远程 API 客户端可直接开启指定会话）
+    pub fn get_or_create_mut(&mut self, id: &str) -> &mut Session {
+        if self.get_mut(id).is_none() {
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            self.sessions.push(Session {
+                id: id.to_string(),
+                title: "新对话".into(),
+                created: now.clone(),
+                updated: now,
+                messages: Vec::new(),
+            });
+        }
+        self.get_mut(id).expect("会话已创建")
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> {

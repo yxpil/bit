@@ -12,25 +12,45 @@ function pickLastUser(messages) {
 }
 
 function toolResultCount(messages) {
-  return messages.filter((m) => m.role === "user" && String(m.content || "").startsWith("工具调用结果")).length;
+  // 文本协议：user 消息以「工具调用结果」开头；原生 function calling：role="tool" 消息
+  return messages.filter(
+    (m) =>
+      (m.role === "user" && String(m.content || "").startsWith("工具调用结果")) ||
+      m.role === "tool"
+  ).length;
 }
 
-// 从工具反馈 JSON 里提取指定工具的 result 文本（用于在最终回复中回显断言特征）
+// 从工具反馈里提取结果文本（用于在最终回复中回显断言特征）
 function feedbackText(messages) {
+  const lastTool = [...messages].reverse().find((m) => m.role === "tool");
+  if (lastTool) return String(lastTool.content || "");
   const last = [...messages].reverse().find((m) => m.role === "user" && String(m.content || "").startsWith("工具调用结果"));
   return last ? String(last.content) : "";
 }
 
-function respond(res, payload, sse) {
+// 模拟 token 用量：输入随历史增长；工具反馈轮之后命中缓存（前缀一致）→ cached_tokens 约 80%
+function usageFor(messages) {
+  const chars = messages.reduce((n, m) => n + String(m.content || "").length, 0);
+  const prompt = Math.max(120, Math.floor(chars / 4));
+  const cached = toolResultCount(messages) > 0 ? Math.floor(prompt * 0.8) : 0;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: 42,
+    prompt_tokens_details: { cached_tokens: cached },
+  };
+}
+
+function respondMsg(res, payload, sse, messages) {
+  const usage = usageFor(messages || []);
   if (sse) {
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const chunk = { id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: payload } }] };
+    const chunk = { id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: payload } }], usage };
     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     res.write("data: [DONE]\n\n");
     res.end();
   } else {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: payload } }] }));
+    res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: payload } }], usage }));
   }
 }
 
@@ -50,13 +70,15 @@ const server = http.createServer((req, res) => {
       return res.end("{}");
     }
     const messages = parsed.messages || [];
+    // 带上本次请求历史，便于模拟用量统计
+    const respond = (r, p, s) => respondMsg(r, p, s, messages);
     const sse = !!parsed.stream;
     const last = pickLastUser(messages);
     const rounds = toolResultCount(messages);
     const fb = feedbackText(messages);
     // 场景标记可能出现在任意轮的用户消息里，用全历史匹配
     const all = messages.map((m) => String(m.content || "")).join("\n");
-    const isFeedback = last.startsWith("工具调用结果");
+    const isFeedback = rounds > 0;
 
     // ── 工具反馈轮：按场景与轮次决定继续调用还是给最终答案 ──
     if (isFeedback) {
@@ -94,8 +116,13 @@ const server = http.createServer((req, res) => {
         return respond(res, "E2E-FINAL-ADDTOOL failed: 新工具调用无有效结果", sse);
       }
 
-      // 其余场景（shell / markup / multi / plan）一轮工具即完成
-      const echo = (fb.match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "";
+      // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）
+      const stdouts = messages
+        .filter((m) => m.role === "tool")
+        .map((m) => (String(m.content || "").match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "")
+        .filter(Boolean)
+        .join(" ");
+      const echo = stdouts || (fb.match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "";
       return respond(res, `E2E-FINAL-OK stdout=「${echo}」`, sse);
     }
 
@@ -142,7 +169,7 @@ const server = http.createServer((req, res) => {
     if (last.includes("E2E-CMD-PLAN"))
       return respond(
         res,
-        '记录一个待办：\n[{"tool":"plan","params":{"title":"E2E 待办","items":[{"text":"验证 plan 工具","done":false}]}}]',
+        '记录一个待办：\n[{"tool":"plan","params":{"goal":"E2E 待办","steps":["验证 plan 工具"]}}]',
         sse
       );
 

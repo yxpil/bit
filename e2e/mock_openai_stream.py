@@ -71,11 +71,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
+    def _usage(self, body):
+        """模拟用量：输入随历史增长，历史超过 2 条视为多轮 → 命中缓存 80%"""
+        msgs = body.get("messages") or []
+        prompt = max(120, sum(len(str(m.get("content") or "")) for m in msgs) // 4)
+        cached = int(prompt * 0.8) if len(msgs) > 2 else 0
+        return {"prompt_tokens": prompt, "completion_tokens": 36,
+                "prompt_tokens_details": {"cached_tokens": cached}}
+
     def _send_plain(self, body):
         payload = json.dumps(
             {"id": "mock", "object": "chat.completion", "model": body.get("model", "mock"),
              "choices": [{"index": 0, "finish_reason": "stop",
-                          "message": {"role": "assistant", "content": REPLY}}]},
+                          "message": {"role": "assistant", "content": REPLY}}],
+             "usage": self._usage(body)},
             ensure_ascii=False).encode()
         self._reply_headers("application/json")
         self.wfile.write(f"Content-Length: {len(payload)}\r\n\r\n".encode())
@@ -96,7 +105,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(sse({"id": "mock", "object": "chat.completion.chunk",
                                   "model": body.get("model", "mock"),
                                   "choices": [{"index": 0, "finish_reason": "stop",
-                                               "delta": {}}]}))
+                                               "delta": {}}],
+                                  "usage": self._usage(body)}))
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

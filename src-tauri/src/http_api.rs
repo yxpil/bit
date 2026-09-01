@@ -359,6 +359,11 @@ async fn remote_chat(
             .into_response();
     }
 
+    // 远程指定的会话不存在时自动创建（外部客户端可直接开启新会话）
+    if !session_id.is_empty() {
+        ctx.sessions.lock().unwrap().get_or_create_mut(&session_id);
+    }
+
     match crate::agent::chat_turn(&ctx, &session_id, &message, Vec::new()).await {
         Ok(messages) => {
             let last = messages
@@ -515,8 +520,22 @@ async fn openai_chat_completions(
             .await;
 
             match result {
-                Ok(_) => {
+                Ok((_, usage)) => {
                     send_chunk(json!({}), Some("stop"));
+                    // usage chunk（OpenAI 规范：choices 为空数组，客户端据此统计 token）
+                    let _ = tx.send(Ok(Event::default().data(
+                        json!({
+                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": usage.prompt_tokens,
+                                "completion_tokens": usage.completion_tokens,
+                                "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+                                "prompt_tokens_details": { "cached_tokens": usage.cache_read_tokens }
+                            }
+                        })
+                        .to_string(),
+                    )));
                     let _ = tx.send(Ok(Event::default().data("[DONE]")));
                     crate::audit::record(&ctx2, &actor2, "chat.openai", "/v1/chat/completions", json!({ "stream": true, "ok": true }), true);
                 }
