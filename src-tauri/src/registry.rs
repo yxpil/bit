@@ -128,6 +128,21 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "add_tool",
         ),
+        // 5.5 子智能体：派生独立会话执行子任务
+        mk(
+            "builtin.sub_agent",
+            "sub_agent",
+            "派生子智能体：新建一个独立会话并把完整任务发过去，子智能体拥有你的全部工具，会自主多轮执行（含读写文件、执行命令）直到给出最终答案。适合把独立的大任务（调研、批量整理、写大文件、并行分支）交给子任务完成，本工具会阻塞等待并返回子智能体的最终结论。task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "给子智能体的完整任务描述（自包含：背景 + 目标 + 验收标准）" },
+                    "title": { "type": "string", "description": "子会话标题（可选，默认「子任务」）" }
+                },
+                "required": ["task"]
+            }),
+            "sub_agent",
+        ),
         // 6. SKILL：写入 / 搜索技能
         mk(
             "builtin.skill",
@@ -473,7 +488,63 @@ async fn builtin_invoke(
             std::fs::write(path, &updated).map_err(|e| format!("写回失败: {e}"))?;
             Ok(serde_json::json!({ "path": path, "replaced": if replace_all { count } else { 1 } }))
         }
-        // ── 5. 给自己增加工具 ──
+        // ── 5. 子智能体：开新会话独立完成任务 ──
+        "sub_agent" => {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SUBAGENT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+            struct DecGuard;
+            impl Drop for DecGuard {
+                fn drop(&mut self) {
+                    SUBAGENT_DEPTH.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            // 嵌套上限 3 层，防止子智能体再派生子智能体无限递归
+            let depth = SUBAGENT_DEPTH.fetch_add(1, Ordering::SeqCst);
+            let _guard = DecGuard;
+            if depth >= 3 {
+                return Err("子智能体嵌套过深（最多 3 层），请在当前会话直接完成任务".into());
+            }
+            let task = params.get("task").and_then(|v| v.as_str()).ok_or("缺少参数 task")?.to_string();
+            if task.trim().is_empty() {
+                return Err("task 不能为空".into());
+            }
+            let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("子任务").to_string();
+            // 新建独立会话（用户可在侧栏看到全过程）
+            let sess = crate::session::Session::new(&title);
+            let sid = sess.id.clone();
+            ctx.sessions.lock().unwrap().sessions.push(sess);
+            crate::session::persist(ctx);
+            {
+                use tauri::Emitter;
+                let _ = ctx.app.emit("sessions-updated", &sid);
+            }
+            // 阻塞执行子任务：完整复用 agent 循环（工具、审批、自动续发全部生效）
+            // Box::pin：builtin_invoke → chat_turn → execute_tool_call → builtin_invoke 递归，需手动打断无限大小
+            let run = Box::pin(crate::agent::chat_turn(ctx, &sid, &task, Vec::new()));
+            const SUB_TIMEOUT_SECS: u64 = 15 * 60;
+            match tokio::time::timeout(std::time::Duration::from_secs(SUB_TIMEOUT_SECS), run).await {
+                Err(_) => Err(format!(
+                    "子任务超时（15 分钟）。子会话 {sid} 已保留中途进展，可继续等待或查看该会话"
+                )),
+                Ok(Err(e)) => Err(format!("子任务失败: {e}（子会话 {sid} 已保留过程记录）")),
+                Ok(Ok(msgs)) => {
+                    use tauri::Emitter;
+                    let _ = ctx.app.emit("sessions-updated", &sid);
+                    let final_answer = msgs
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+                        .map(|m| m.content.clone())
+                        .unwrap_or_default();
+                    Ok(serde_json::json!({
+                        "session_id": sid,
+                        "final_answer": safe_trunc(&final_answer, 4000),
+                        "note": "子会话已保留全部执行过程，可再次对其派发追问"
+                    }))
+                }
+            }
+        }
+        // ── 6. 给自己增加工具 ──
         "add_tool" => {
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let desc = params.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string();

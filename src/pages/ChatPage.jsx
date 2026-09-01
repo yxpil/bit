@@ -94,6 +94,18 @@ export default function ChatPage({ onStats, visible }) {
     return () => uns.forEach((u) => u.then((f) => f()));
   }, []);
 
+  // 后台会话变动（如子智能体新建会话 / 完成任务）：自动刷新侧栏与当前会话内容
+  useEffect(() => {
+    const un = listen("sessions-updated", (e) => {
+      loadSessions();
+      if (typeof e.payload === "string" && e.payload && e.payload === activeId) {
+        loadMessages(activeId);
+      }
+    });
+    return () => un.then((f) => f());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
+
   // 派生：当前会话状态与全局运行数
   const busy = !!busyMap[activeId]; // 当前会话是否执行中
   const live = liveMap[activeId] || null;

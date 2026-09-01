@@ -705,13 +705,14 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>) -> String {
         多个调用必须放在同一个数组里：[{{...}},{{...}}]。不需要动手时正常用自然语言回答即可。\n\
         单个工具调用示例：[{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]\n\
         \n\
-        ## 六个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
+        ## 七个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
         - 工具1 · shell：执行命令行（Windows PowerShell 语法，路径用 C:\\ 形式）。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
         - 工具2 · write_file：写入/覆盖文件（文档编辑）。参数 {{\"path\":string,\"content\":string}}\n\
         - 工具3 · plan：制定计划，登记目标与分步待办。参数 {{\"goal\":string,\"steps\":[string]}}\n\
         - 工具4 · edit：增量补丁改文件，精确替换。参数 {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(可选)}}\n\
         - 工具5 · add_tool：给自己增加工具——用本机某解释器把一段代码沉淀为常驻工具。参数 {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}\n\
         - 工具6 · skill：技能库读写。写入技能 {{\"action\":\"save\",\"name\":string,\"summary\":string}}（同名覆盖）；搜索技能 {{\"action\":\"search\",\"query\":string}}（query 留空返回全部）\n\
+        - 工具7 · sub_agent：派生子智能体——新建独立会话执行自包含的大任务（调研/批量整理/写大文件），阻塞等待并返回其最终结论，子会话保留在侧栏可查看全过程。参数 {{\"task\":string,\"title\":string(可选)}}。注意 task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全\n\
         写 SKILL、搜 SKILL 都用【工具6 · skill】：save 是自己写一条技能，search 是搜索已有技能。示例：\n\
         - 写 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"批量重命名\",\"summary\":\"用 shell 遍历目录并 mv 重命名文件的步骤…\"}}}}]\n\
         - 搜 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"重命名\"}}}}]\n\
