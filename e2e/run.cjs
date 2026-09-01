@@ -119,6 +119,45 @@ function record(name, ok, detail) {
     record("T8 openai-sse-stream", okSSE, `code=${r.code} body=${r.sse.slice(0, 100)}`);
   } catch (e) { record("T8 openai-sse-stream", false, e.message); }
 
+  // T9 AI 自建工具全流程：add_tool 注册 node 脚本 → 立即调用新工具 → 结果回传
+  try {
+    const r = await chat("e2e-t9", "E2E-CMD-ADDTOOL go");
+    record("T9 add-tool-roundtrip", /E2E-FINAL-ADDTOOL doubled=42/.test(r.reply || ""), `reply=${(r.reply || "").slice(0, 100)}`);
+  } catch (e) { record("T9 add-tool-roundtrip", false, e.message); }
+
+  // T10 新工具已进入工具清单（后续对话 AI 可见可用），并直接调用验证执行正确性
+  try {
+    const q = await new Promise((resolve, reject) => {
+      const req = http.request(
+        { host: BASE, port: PORT, path: "/api/tools", method: "GET",
+          headers: { Authorization: `Bearer ${KEY}`, "X-Access-Password": "56247930" }, timeout: 15000, agent },
+        (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve(JSON.parse(b))); }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    const t = (q.tools || []).find((x) => x.name === "e2e-doubler");
+    if (!t) {
+      record("T10 new-tool-in-manifest", false, "e2e-doubler 未出现在工具清单");
+    } else {
+      const inv = JSON.parse(JSON.stringify({ params: { a: 100 } }));
+      const r = await new Promise((resolve, reject) => {
+        const data = JSON.stringify(inv);
+        const req = http.request(
+          { host: BASE, port: PORT, path: `/api/tools/${t.id}/invoke`, method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "X-Access-Password": "56247930", "Content-Length": Buffer.byteLength(data) },
+            timeout: 60000, agent },
+          (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b })); }
+        );
+        req.on("error", reject);
+        req.write(data);
+        req.end();
+      });
+      const ok = r.code === 200 && r.body.includes('"doubled":200');
+      record("T10 new-tool-in-manifest", ok, `code=${r.code} body=${r.body.slice(0, 100)}`);
+    }
+  } catch (e) { record("T10 new-tool-in-manifest", false, e.message); }
+
   const pass = results.filter((x) => x.ok).length;
   console.log(`\n==== ${pass}/${results.length} passed ====`);
   process.exit(pass === results.length ? 0 : 1);

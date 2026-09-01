@@ -85,6 +85,15 @@ const server = http.createServer((req, res) => {
         return respond(res, "E2E-FINAL-SKILL: 技能保存与搜索完成", sse);
       }
 
+      // E2E-CMD-ADDTOOL: 轮0 AI 自建工具（add_tool 注册 node 脚本）→ 轮1 立即调用新工具 → 轮2 最终
+      if (all.includes("E2E-CMD-ADDTOOL")) {
+        if (rounds === 1)
+          return respond(res, '工具注册成功，立即调用它：[{"tool":"e2e-doubler","params":{"a":21}}]', sse);
+        const doubled = (fb.match(/"doubled"\s*:\s*(\d+)/) || [])[1];
+        if (doubled !== undefined) return respond(res, `E2E-FINAL-ADDTOOL doubled=${doubled}`, sse);
+        return respond(res, "E2E-FINAL-ADDTOOL failed: 新工具调用无有效结果", sse);
+      }
+
       // 其余场景（shell / markup / multi / plan）一轮工具即完成
       const echo = (fb.match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "";
       return respond(res, `E2E-FINAL-OK stdout=「${echo}」`, sse);
@@ -93,6 +102,24 @@ const server = http.createServer((req, res) => {
     // ── 用户轮：按场景标记返回工具调用（含 BIT 文本协议的各种变体） ──
     if (last.includes("E2E-CMD-SHELL"))
       return respond(res, '好的，我来执行命令。\n[{"tool":"shell","params":{"command":"echo e2e-shell-ok"}}]', sse);
+
+    // AI 自我扩展：注册一个 node 脚本工具（读 stdin 的 params，输出 JSON）
+    if (last.includes("E2E-CMD-ADDTOOL")) {
+      const code =
+        "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const p=JSON.parse(d||'{}');console.log(JSON.stringify({doubled:(p.a||0)*2}))});";
+      const calls = JSON.stringify([
+        {
+          tool: "add_tool",
+          params: {
+            name: "e2e-doubler",
+            description: "E2E 测试：把数字翻倍",
+            runtime: "node",
+            code,
+          },
+        },
+      ]);
+      return respond(res, `我来给自己创建一个翻倍工具。\n${calls}`, sse);
+    }
 
     if (last.includes("E2E-CMD-MARKUP"))
       // v0.1.9 兼容场景：自创标记 + 裸对象（非数组）
