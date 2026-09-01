@@ -328,6 +328,23 @@ pub fn safe_trunc(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Windows 下隐藏子进程控制台窗口（CREATE_NO_WINDOW），避免启动探测/工具执行时黑窗闪烁
+#[cfg(windows)]
+pub fn no_window(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000);
+}
+#[cfg(not(windows))]
+pub fn no_window(_cmd: &mut std::process::Command) {}
+
+/// 同 no_window，用于 tokio 进程
+#[cfg(windows)]
+pub fn no_window_tokio(cmd: &mut tokio::process::Command) {
+    cmd.creation_flags(0x0800_0000);
+}
+#[cfg(not(windows))]
+pub fn no_window_tokio(_cmd: &mut tokio::process::Command) {}
+
 /// 五个出厂内置工具的真实实现
 async fn builtin_invoke(
     ctx: &Arc<crate::state::Ctx>,
@@ -363,6 +380,7 @@ async fn builtin_invoke(
                 if let Some(dir) = &cwd {
                     cmd.current_dir(dir);
                 }
+                no_window_tokio(&mut cmd);
                 // 超时后 future 被 drop，kill_on_drop 确保子进程被终止而不是变孤儿继续跑
                 cmd.kill_on_drop(true);
                 cmd.output().await

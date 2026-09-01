@@ -100,7 +100,10 @@ fn which(cmd: &str) -> Option<String> {
     let finder = "where";
     #[cfg(not(windows))]
     let finder = "which";
-    let out = Command::new(finder).arg(cmd).output().ok()?;
+    let mut c = Command::new(finder);
+    c.arg(cmd);
+    crate::registry::no_window(&mut c);
+    let out = c.output().ok()?;
     if !out.status.success() {
         return None;
     }

@@ -123,12 +123,14 @@ fn run_compiled(
             let src = work.join(format!("main.{ext}"));
             let bin = work.join(if cfg!(windows) { "main.exe" } else { "main" });
             std::fs::write(&src, code).map_err(|e| format!("写入源码失败: {e}"))?;
-            let compile = Command::new(&rt.path) // gcc / g++
+            let mut compile = Command::new(&rt.path); // gcc / g++
+            compile
                 .arg(&src)
                 .arg("-O2")
                 .arg("-o")
-                .arg(&bin)
-                .output();
+                .arg(&bin);
+            crate::registry::no_window(&mut compile);
+            let compile = compile.output();
             match compile {
                 Ok(o) if o.status.success() => {
                     let cmd = Command::new(&bin);
