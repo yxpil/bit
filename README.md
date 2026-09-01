@@ -62,4 +62,4 @@ installer/bit.iss  Inno Setup 打包脚本
 
 ## 许可
 
-暂未指定（保留所有权利）。
+[Apache License 2.0](LICENSE)
