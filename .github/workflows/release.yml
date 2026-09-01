@@ -26,7 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          # 手动补发时检出 main（包含最新兼容性修复），tag 推送时检出对应 tag
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -58,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
