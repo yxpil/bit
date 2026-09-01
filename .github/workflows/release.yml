@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要构建并上传资产的 tag（如 v0.3.1）"
+        description: "要构建并上传资产的 tag（如 v0.4.0）"
         required: true
-        default: "v0.3.1"
+        default: "v0.4.0"
       include_macos:
         description: "是否同时构建 macOS 包"
         type: boolean
@@ -21,7 +21,21 @@ permissions:
   contents: write
 
 jobs:
+  # 确保目标 tag 的 Release 已存在（gh release upload 不支持自动创建）
+  ensure-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        run: echo "tag=${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - run: gh api repos/$GITHUB_REPOSITORY/releases/tags/$TAG >/dev/null 2>&1 || gh release create "$TAG" --title "BIT $TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+
   linux:
+    needs: ensure-release
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +67,7 @@ jobs:
             --clobber --repo "$GITHUB_REPOSITORY"
 
   linux-arm:
+    needs: ensure-release
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -82,7 +97,36 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage \
             --clobber --repo "$GITHUB_REPOSITORY"
 
+  windows:
+    # Windows x64：MSI + NSIS 双格式（WiX 对 x64 支持完善）
+    needs: ensure-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 构建
+        run: |
+          npm ci
+          npx tauri build
+      - name: 上传到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ needs.ensure-release.outputs.tag }}"
+          gh release upload "$TAG" \
+            src-tauri/target/release/bundle/msi/*.msi \
+            src-tauri/target/release/bundle/nsis/*-setup.exe \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
   windows-arm:
+    needs: ensure-release
     # Windows ARM64（Surface / 骁龙 X 笔记本）：MSI 的 WiX 工具链对 ARM64 支持差，用 NSIS
     runs-on: windows-11-arm
     steps:
@@ -104,12 +148,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          TAG="${{ needs.ensure-release.outputs.tag }}"
           gh release upload "$TAG" \
             src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   macos:
+    needs: ensure-release
     if: github.event_name == 'push' || inputs.include_macos
     runs-on: macos-14
     steps:
