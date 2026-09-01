@@ -241,8 +241,8 @@ async fn read_sse<H: FnMut(&str) -> bool>(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        let short = if text.len() > 400 { text[..400].to_string() } else { text };
-        return Err(format!("HTTP {status}: {short}"));
+        // 错误体常含中文，必须按字符边界截断
+        return Err(format!("HTTP {status}: {}", crate::registry::safe_trunc(&text, 400)));
     }
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();

@@ -359,6 +359,16 @@ mod tests {
     }
 
     #[test]
+    fn test_safe_trunc_shared() {
+        // registry::safe_trunc：ASCII 不受影响、中文不 panic、短串原样返回
+        assert_eq!(crate::registry::safe_trunc("hello", 10), "hello");
+        assert_eq!(crate::registry::safe_trunc("hello", 5), "hello");
+        let cn = crate::registry::safe_trunc("中文输出测试", 7);
+        assert!(cn.ends_with('…'));
+        assert_eq!(cn.chars().count(), 3); // 2 个汉字 + 省略号
+    }
+
+    #[test]
     fn test_parse_body_json() {
         let r = parse_body("application/json", r#"{"jsonrpc":"2.0","id":1,"result":{"ok":1}}"#).unwrap();
         assert_eq!(r.result.unwrap()["ok"], 1);

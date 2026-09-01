@@ -162,6 +162,14 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
         .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("key=")))
         .unwrap_or("");
 
+    // Client Key 为空 = 未配置密钥，一律拒绝（否则空 key 请求会绕过鉴权）
+    if cfg.client_key.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "BIT 尚未配置 Client Key，远程访问已禁用" })),
+        )
+            .into_response();
+    }
     if provided != cfg.client_key && qkey != cfg.client_key {
         crate::audit::record(
             &ctx,

@@ -315,6 +315,19 @@ pub async fn invoke(
     result
 }
 
+/// 安全截断：回退到 UTF-8 字符边界，避免多字节字符（中文输出）字节切片 panic。
+/// 供 registry / script_runtime / ai 等模块截断命令输出与错误信息共用
+pub fn safe_trunc(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// 五个出厂内置工具的真实实现
 async fn builtin_invoke(
     ctx: &Arc<crate::state::Ctx>,
@@ -331,31 +344,38 @@ async fn builtin_invoke(
                 .ok_or("缺少参数 command")?
                 .to_string();
             let cwd = params.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let handle = tauri::async_runtime::spawn_blocking(move || {
+            let handle = tauri::async_runtime::spawn(async move {
                 let mut cmd = if cfg!(windows) {
-                    let mut c = std::process::Command::new("powershell");
-                    c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+                    // 强制 PowerShell 以 UTF-8 输出，避免中文被 GBK 编码成乱码
+                    let mut c = tokio::process::Command::new("powershell");
+                    c.args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        &format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}"),
+                    ]);
                     c
                 } else {
-                    let mut c = std::process::Command::new("sh");
+                    let mut c = tokio::process::Command::new("sh");
                     c.args(["-c", &command]);
                     c
                 };
                 if let Some(dir) = &cwd {
                     cmd.current_dir(dir);
                 }
-                cmd.output()
+                // 超时后 future 被 drop，kill_on_drop 确保子进程被终止而不是变孤儿继续跑
+                cmd.kill_on_drop(true);
+                cmd.output().await
             });
             let out = match tokio::time::timeout(std::time::Duration::from_secs(60), handle).await {
                 Ok(res) => res.map_err(|e| format!("命令任务失败: {e}"))?,
                 Err(_) => return Err("命令执行超时（60 秒）".into()),
             };
             let out = out.map_err(|e| format!("启动命令失败: {e}"))?;
-            let trunc = |s: String| if s.len() > 6000 { s[..6000].to_string() } else { s };
             Ok(serde_json::json!({
                 "code": out.status.code(),
-                "stdout": trunc(String::from_utf8_lossy(&out.stdout).to_string()),
-                "stderr": trunc(String::from_utf8_lossy(&out.stderr).to_string()),
+                "stdout": safe_trunc(&String::from_utf8_lossy(&out.stdout), 6000),
+                "stderr": safe_trunc(&String::from_utf8_lossy(&out.stderr), 6000),
             }))
         }
         // ── 2. 文档编辑（写 / 覆盖）──

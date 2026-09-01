@@ -136,8 +136,7 @@ fn run_compiled(
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr);
-                    let err = if err.len() > 4000 { err[..4000].to_string() } else { err.to_string() };
-                    Err(format!("编译失败:\n{err}"))
+                    Err(format!("编译失败:\n{}", crate::registry::safe_trunc(&err, 4000)))
                 }
                 Err(e) => Err(format!("启动编译器失败: {e}")),
             }
@@ -189,11 +188,11 @@ fn finalize(out: Result<std::process::Output, String>) -> Result<serde_json::Val
 
     if !output.status.success() {
         let msg = if stderr.is_empty() { stdout } else { stderr };
-        let msg = if msg.len() > 4000 { msg[..4000].to_string() } else { msg };
+        let msg = crate::registry::safe_trunc(&msg, 4000);
         return Err(format!("执行失败（退出码 {:?}）: {msg}", output.status.code()));
     }
 
-    let out = if stdout.len() > 8000 { stdout[..8000].to_string() } else { stdout };
+    let out = crate::registry::safe_trunc(&stdout, 8000);
     match serde_json::from_str::<serde_json::Value>(&out) {
         Ok(v) => Ok(v),
         Err(_) => Ok(serde_json::json!({ "stdout": out })),
