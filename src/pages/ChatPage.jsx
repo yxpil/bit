@@ -518,13 +518,26 @@ export default function ChatPage({ onStats, visible }) {
           <div className="card px-6 py-4 text-sm font-medium">{t("chat.dropHint")}</div>
         </div>
       )}
-      {/* 会话侧栏 */}
+      {/* 会话侧栏：无卡片盒，纯列表 */}
       <div className="flex w-52 shrink-0 flex-col gap-2">
-        <button onClick={newSession} className="pill pill-hover w-full justify-center py-1.5 text-[13px]">
-          <IconPlus size={15} />
-          {t("chat.newChat")}
-        </button>
-        <div className="card flex-1 space-y-1 overflow-y-auto p-2">
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={newSession}
+            className="pill pill-outline pill-hover flex flex-1 justify-center py-1.5 text-[13px]"
+          >
+            <IconPlus size={14} />
+            {t("chat.newChat")}
+          </button>
+          <button
+            onClick={clearCurrent}
+            disabled={busy}
+            title={t("common.clear")}
+            className="shrink-0 rounded-full p-2 text-neutral-400 transition-colors hover:bg-red-500/10 hover:text-red-500 disabled:opacity-40"
+          >
+            <IconTrash size={15} />
+          </button>
+        </div>
+        <div className="flex-1 space-y-0.5 overflow-y-auto">
           {sessions.length === 0 && (
             <div className="px-2 py-4 text-center text-xs text-neutral-400">{t("chat.noSessions")}</div>
           )}
@@ -561,17 +574,11 @@ export default function ChatPage({ onStats, visible }) {
                     className="min-w-0 flex-1 rounded bg-white/20 px-1 text-[13px] outline-none dark:bg-black/20"
                   />
                 ) : (
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[13px] font-medium">{s.title || t("chat.newChat")}</div>
-                    {s.preview && (
-                      <div
-                        className={`truncate text-[10px] ${
-                          active ? "text-white/60 dark:text-black/50" : "text-neutral-400"
-                        }`}
-                      >
-                        {s.preview}
-                      </div>
-                    )}
+                  <div
+                    className="min-w-0 flex-1 truncate text-[13px] font-medium"
+                    title={s.preview || s.title}
+                  >
+                    {s.title || t("chat.newChat")}
                   </div>
                 )}
                 {renaming?.id !== s.id && (
@@ -601,29 +608,8 @@ export default function ChatPage({ onStats, visible }) {
         </div>
       </div>
 
-      {/* 对话主区 */}
+      {/* 对话主区：无标题行，主体完全留给消息 */}
       <div className="flex min-w-0 flex-1 flex-col gap-3">
-        <div className="flex items-center justify-between">
-          <div className="flex min-w-0 items-center gap-2">
-            <h2 className="truncate text-lg font-semibold">
-              {sessions.find((s) => s.id === activeId)?.title || t("chat.defaultTitle")}
-            </h2>
-            {runningCount > 0 && (
-              <span
-                title={t("chat.runningHint")}
-                className="flex shrink-0 items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-600 dark:text-emerald-400"
-              >
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-                {runningCount} {t("chat.runningCount")}
-              </span>
-            )}
-          </div>
-          <button onClick={clearCurrent} disabled={busy} className="pill pill-outline pill-hover disabled:opacity-40">
-            <IconTrash size={14} />
-            {t("common.clear")}
-          </button>
-        </div>
-
         <div className="card flex-1 overflow-y-auto">
           {visibleMessages.length === 0 && !busy && (
             <div className="flex h-full items-center justify-center px-6 text-center text-sm text-neutral-400">
