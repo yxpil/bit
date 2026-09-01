@@ -117,7 +117,7 @@ async fn mcp_endpoint(
             match found {
                 None => Json(rpc_err(-32602, "tool not found")).into_response(),
                 Some((_, false)) => Json(rpc_err(-32000, "tool is paused")).into_response(),
-                Some((tid, _)) => match crate::registry::invoke(&ctx, &tid, args, "mcp-client").await {
+                Some((tid, _)) => match crate::registry::invoke(&ctx, &tid, args, "mcp-client", None).await {
                     Ok(v) => Json(rpc_ok(json!({
                         "content": [{ "type": "text", "text": v.to_string() }],
                         "isError": false
@@ -321,7 +321,7 @@ async fn invoke_tool(
         .unwrap_or_else(|| "agent:unknown".into());
 
     let params = body.get("params").cloned().unwrap_or(json!({}));
-    match crate::registry::invoke(&ctx, &id, params, &actor).await {
+    match crate::registry::invoke(&ctx, &id, params, &actor, None).await {
         Ok(result) => Json(json!({ "result": result })).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

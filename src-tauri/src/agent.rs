@@ -15,11 +15,11 @@ fn register_interrupt(ctx: &Arc<Ctx>, target: &str) -> Arc<AtomicBool> {
     flag
 }
 
-fn clear_interrupt(ctx: &Arc<Ctx>, target: &str) {
+pub fn clear_interrupt(ctx: &Arc<Ctx>, target: &str) {
     ctx.interrupts.lock().unwrap().remove(target);
 }
 
-fn interrupted(ctx: &Arc<Ctx>, target: &str) -> bool {
+pub fn interrupted(ctx: &Arc<Ctx>, target: &str) -> bool {
     ctx.interrupts
         .lock()
         .unwrap()
@@ -274,7 +274,7 @@ pub async fn execute_tool_call(
                     .cloned()
                     .ok_or_else(|| format!("工具 `{other}` 不存在"))?
             };
-            crate::registry::invoke(ctx, &tool.id, params.clone(), "ai-self").await
+            crate::registry::invoke(ctx, &tool.id, params.clone(), "ai-self", session_id).await
         }
     }
 }
@@ -295,8 +295,8 @@ pub async fn chat_turn(
         } else {
             store.get_mut(session_id).ok_or("会话不存在")?
         };
-        // 首条用户消息用于自动命名会话
-        if sess.messages.iter().all(|m| m.role != "user") {
+        // 首条用户消息用于自动命名会话（仅当仍是默认标题：不覆盖 sub_agent 传入的标题与用户手动改名）
+        if sess.title.trim().is_empty() || sess.title == "新对话" {
             let title: String = user_input.chars().take(20).collect();
             sess.title = title.replace('\n', " ");
         }
@@ -467,7 +467,8 @@ pub async fn chat_turn_stream(
         } else {
             store.get_mut(session_id).ok_or("会话不存在")?
         };
-        if sess.messages.iter().all(|m| m.role != "user") {
+        // 首条用户消息用于自动命名会话（仅当仍是默认标题：不覆盖 sub_agent 传入的标题与用户手动改名）
+        if sess.title.trim().is_empty() || sess.title == "新对话" {
             let title: String = user_input.chars().take(20).collect();
             sess.title = title.replace('\n', " ");
         }

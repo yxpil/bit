@@ -91,7 +91,7 @@ pub async fn invoke_tool(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    crate::registry::invoke(&ctx, &id, params, "local-user").await
+    crate::registry::invoke(&ctx, &id, params, "local-user", None).await
 }
 
 // 注册脚本工具：把一段 JS/PY 代码沉淀为常驻工具，由本机解释器执行

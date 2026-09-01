@@ -234,11 +234,13 @@ pub fn set_enabled(ctx: &Arc<crate::state::Ctx>, id: &str, enabled: bool) -> Res
 }
 
 /// 执行工具：内置实现或转发到 Agent 回调端点
+/// `session`：发起调用的会话 id（用于长任务感知主会话中断，可为 None）
 pub async fn invoke(
     ctx: &Arc<crate::state::Ctx>,
     id: &str,
     params: serde_json::Value,
     actor: &str,
+    session: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let tool = {
         let tools = ctx.tools.lock().unwrap();
@@ -254,7 +256,7 @@ pub async fn invoke(
     }
 
     let result = match &tool.kind {
-        ToolKind::Builtin { handler } => builtin_invoke(ctx, handler, &params, actor).await,
+        ToolKind::Builtin { handler } => builtin_invoke(ctx, handler, &params, actor, session).await,
         ToolKind::Remote { url } => {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -366,6 +368,7 @@ async fn builtin_invoke(
     handler: &str,
     params: &serde_json::Value,
     actor: &str,
+    session: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     match handler {
         // ── 1. 命令行 ──
@@ -518,31 +521,64 @@ async fn builtin_invoke(
                 use tauri::Emitter;
                 let _ = ctx.app.emit("sessions-updated", &sid);
             }
-            // 阻塞执行子任务：完整复用 agent 循环（工具、审批、自动续发全部生效）
+            // 阻塞执行子任务：完整复用 agent 循环（工具、审批、自动续发全部生效）。
             // Box::pin：builtin_invoke → chat_turn → execute_tool_call → builtin_invoke 递归，需手动打断无限大小
-            let run = Box::pin(crate::agent::chat_turn(ctx, &sid, &task, Vec::new()));
+            let mut run = Box::pin(crate::agent::chat_turn(ctx, &sid, &task, Vec::new()));
             const SUB_TIMEOUT_SECS: u64 = 15 * 60;
-            match tokio::time::timeout(std::time::Duration::from_secs(SUB_TIMEOUT_SECS), run).await {
-                Err(_) => Err(format!(
-                    "子任务超时（15 分钟）。子会话 {sid} 已保留中途进展，可继续等待或查看该会话"
-                )),
-                Ok(Err(e)) => Err(format!("子任务失败: {e}（子会话 {sid} 已保留过程记录）")),
-                Ok(Ok(msgs)) => {
-                    use tauri::Emitter;
-                    let _ = ctx.app.emit("sessions-updated", &sid);
-                    let final_answer = msgs
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
-                        .map(|m| m.content.clone())
-                        .unwrap_or_default();
-                    Ok(serde_json::json!({
-                        "session_id": sid,
-                        "final_answer": safe_trunc(&final_answer, 4000),
-                        "note": "子会话已保留全部执行过程，可再次对其派发追问"
-                    }))
+            let mut sleep = tokio::time::sleep(std::time::Duration::from_secs(SUB_TIMEOUT_SECS));
+            // 主会话点「停止」时立刻取消子任务，而不是干等子任务跑完
+            let parent = session.map(|s| s.to_string());
+            let mut watch = async {
+                loop {
+                    if parent
+                        .as_deref()
+                        .map(|p| crate::agent::interrupted(ctx, p))
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 }
+            };
+            // Sleep 与 async block 均非 Unpin，select! 里用 &mut 前需固定
+            tokio::pin!(sleep, watch);
+            let outcome = loop {
+                tokio::select! {
+                    _ = &mut sleep => {
+                        break Err(format!(
+                            "子任务超时（15 分钟）。子会话 {sid} 已保留中途进展，可继续等待或查看该会话"
+                        ));
+                    }
+                    res = &mut run => {
+                        break match res {
+                            Ok(msgs) => {
+                                let final_answer = msgs
+                                    .iter()
+                                    .rev()
+                                    .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
+                                    .map(|m| m.content.clone())
+                                    .unwrap_or_default();
+                                Ok(serde_json::json!({
+                                    "session_id": sid,
+                                    "final_answer": safe_trunc(&final_answer, 4000),
+                                    "note": "子会话已保留全部执行过程，可再次对其派发追问"
+                                }))
+                            }
+                            Err(e) => Err(format!("子任务失败: {e}（子会话 {sid} 已保留过程记录）")),
+                        };
+                    }
+                    _ = &mut watch => {
+                        // 同时清掉子会话自己的中断标记，避免下次对话误报「已中断」
+                        crate::agent::clear_interrupt(ctx, &sid);
+                        break Err(format!("主会话已中断，子任务已停止（子会话 {sid} 已保留进展）"));
+                    }
+                }
+            };
+            {
+                use tauri::Emitter;
+                let _ = ctx.app.emit("sessions-updated", &sid);
             }
+            outcome
         }
         // ── 6. 给自己增加工具 ──
         "add_tool" => {
