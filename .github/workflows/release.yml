@@ -114,11 +114,17 @@ jobs:
         run: |
           npm ci
           npx tauri build
-      - name: 打包便携版（免安装 exe）
+      - name: 打包便携版（BIT.exe + WebView2Loader.dll）
         shell: pwsh
         env:
           TAG: ${{ needs.ensure-release.outputs.tag }}
-        run: Compress-Archive -Path src-tauri/target/release/BIT.exe -DestinationPath "BIT_$($env:TAG.TrimStart('v'))_x64-portable.zip"
+        run: |
+          # WebView2Loader.dll 是 Tauri 动态链接的运行时依赖，缺失将无法启动
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+          Copy-Item src-tauri/target/release/BIT.exe portable/
+          Copy-Item src-tauri/target/release/WebView2Loader.dll portable/
+          Get-ChildItem portable
+          Compress-Archive -Path portable/* -DestinationPath "BIT_$($env:TAG.TrimStart('v'))_x64-portable.zip" -Force
       - name: 上传到 Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
