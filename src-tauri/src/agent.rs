@@ -337,7 +337,7 @@ pub async fn chat_turn(
         let round_images: &[String] = if round == 0 { &images } else { &[] };
         let reply = ai::chat_with_images(ctx, &convo, round_images).await?;
 
-        match crate::autopilot::parse_json_array(&reply) {
+        match parse_tool_calls(&reply) {
             Some(calls) if !calls.is_empty() && looks_like_tool_calls(&calls) => {
                 // 执行工具，收集可视化记录
                 let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
@@ -633,7 +633,7 @@ fn strip_tool_json(reply: &str) -> String {
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         return String::new();
     }
-    // 先按字节区间删除散落的 {"tool":...} 对象
+    // 先按字节区间删除散落的 {"tool":...} 对象；若对象外层的数组因此变空，连 [] 一起删
     let spans = find_tool_objects(reply);
     let base = if spans.is_empty() {
         reply.to_string()
@@ -641,8 +641,18 @@ fn strip_tool_json(reply: &str) -> String {
         let mut out = String::new();
         let mut last = 0;
         for (_, s, e) in &spans {
-            out.push_str(&reply[last..*s]);
-            last = *e;
+            let mut start = *s;
+            let mut end = *e;
+            let before = reply[..start].trim_end();
+            let after = reply[end..].trim_start();
+            if before.ends_with('[') && after.starts_with(']') {
+                start = before.len() - 1;
+                end = reply.len() - after.len() + 1;
+            }
+            if start >= last {
+                out.push_str(&reply[last..start]);
+                last = last.max(end);
+            }
         }
         out.push_str(&reply[last..]);
         out
