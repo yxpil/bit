@@ -568,4 +568,47 @@ mod tests {
         let http = client().unwrap();
         assert!(initialize(&http, &url).await.is_err(), "HTML 服务不应通过 MCP 握手");
     }
+
+    /// 外部集成测试：连接独立运行的假 MCP 服务器（fake_mcp_server.py），
+    /// 走真实 TCP 验证 initialize → tools/list → tools/call 全链路。
+    /// 仅在设置 BIT_FAKE_MCP_URL 环境变量时运行：
+    ///   BIT_FAKE_MCP_URL=http://127.0.0.1:9801/mcp cargo test external_fake_mcp
+    #[tokio::test]
+    async fn test_external_fake_mcp() {
+        let Ok(url) = std::env::var("BIT_FAKE_MCP_URL") else {
+            eprintln!("跳过：未设置 BIT_FAKE_MCP_URL");
+            return;
+        };
+        let http = client().unwrap();
+
+        // 1. 握手
+        let (name, version, protocol, session) = initialize(&http, &url).await.unwrap();
+        assert_eq!(name, "Fake MCP Toolkit", "serverInfo.name 应来自假服务器");
+        assert_eq!(version, "0.1.0");
+        assert_eq!(protocol, "2025-03-26");
+        assert!(!session.is_empty(), "应取得 Mcp-Session-Id");
+
+        let server = McpServer {
+            id: "ext".into(),
+            name,
+            url,
+            version,
+            protocol,
+            session,
+            enabled: true,
+            connected_at: "now".into(),
+        };
+
+        // 2. 工具清单（SSE 响应路径），3 个工具
+        let tools = list_tools(&server).await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["echo", "add", "now"], "工具清单应完整: {names:?}");
+
+        // 3. 调用工具：echo 回显 + add 真实计算
+        let echo = call_tool(&server, "echo", json!({ "message": "你好 BIT" })).await.unwrap();
+        assert_eq!(echo["text"], "ECHO<你好 BIT>");
+
+        let sum = call_tool(&server, "add", json!({ "a": 20, "b": 22 })).await.unwrap();
+        assert_eq!(sum["text"], "SUM=42");
+    }
 }
