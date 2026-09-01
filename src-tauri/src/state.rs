@@ -92,24 +92,9 @@ impl Ctx {
         // 同时沿用旧列表里的启用状态，并保留用户手动添加的项。
         let cached: Vec<Runtime> =
             read_json(&data_dir.join("runtimes.json")).unwrap_or_default();
-        let prev_enabled: std::collections::HashMap<String, bool> =
-            cached.iter().map(|r| (r.id.clone(), r.enabled)).collect();
-        let manual: Vec<Runtime> = cached.iter().filter(|r| r.manual).cloned().collect();
-        let mut runtimes = crate::runtime::detect();
-        for r in runtimes.iter_mut() {
-            if let Some(&en) = prev_enabled.get(&r.id) {
-                r.enabled = en;
-            }
-        }
-        for m in manual {
-            if !runtimes.iter().any(|r| r.id == m.id) {
-                runtimes.push(m);
-            }
-        }
-        let _ = fs::write(
-            data_dir.join("runtimes.json"),
-            serde_json::to_string_pretty(&runtimes).unwrap(),
-        );
+        // 解释器列表：启动时直接用缓存（探测在后台进行，不阻塞窗口显示），
+        // 后台 refresh_runtimes() 完成后更新状态并通知前端
+        let runtimes: Vec<Runtime> = cached;
 
         Arc::new(Ctx {
             app,
@@ -136,6 +121,35 @@ impl Ctx {
     pub fn save_config(&self) {
         let cfg = self.config.lock().unwrap();
         cfg.save(&self.data_dir);
+    }
+
+    /// 后台重新探测本机解释器（保留启用状态与手动添加项）。
+    /// 返回列表是否发生变化（由调用方决定是否通知前端）。
+    pub fn refresh_runtimes(&self) -> bool {
+        let cached: Vec<Runtime> =
+            read_json(&self.data_dir.join("runtimes.json")).unwrap_or_default();
+        let prev_enabled: std::collections::HashMap<String, bool> =
+            cached.iter().map(|r| (r.id.clone(), r.enabled)).collect();
+        let manual: Vec<Runtime> = cached.iter().filter(|r| r.manual).cloned().collect();
+        let mut runtimes = crate::runtime::detect();
+        for r in runtimes.iter_mut() {
+            if let Some(&en) = prev_enabled.get(&r.id) {
+                r.enabled = en;
+            }
+        }
+        for m in manual {
+            if !runtimes.iter().any(|r| r.id == m.id) {
+                runtimes.push(m);
+            }
+        }
+        let changed = serde_json::to_string(&runtimes).unwrap()
+            != serde_json::to_string(&cached).unwrap();
+        let _ = fs::write(
+            self.data_dir.join("runtimes.json"),
+            serde_json::to_string_pretty(&runtimes).unwrap(),
+        );
+        *self.runtimes.lock().unwrap() = runtimes;
+        changed
     }
 
     pub fn save_ai_config(&self) {

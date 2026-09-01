@@ -30,6 +30,16 @@ fn main() {
             audit::record(&ctx, "local-app", "app.start", "BIT", serde_json::json!({}), true);
             app.manage(ctx.clone());
 
+            // 解释器探测移到后台：不阻塞窗口显示（修复启动慢/白屏）
+            let rt_ctx = ctx.clone();
+            let rt_app = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if rt_ctx.refresh_runtimes() {
+                    use tauri::Emitter;
+                    let _ = rt_app.emit("runtimes-updated", ());
+                }
+            });
+
             // 系统托盘（关闭窗口后程序驻留后台）
             tray::create(app.handle(), &ctx)?;
 

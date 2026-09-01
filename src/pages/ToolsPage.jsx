@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api } from "../api.js";
 import PillSwitch from "../components/PillSwitch.jsx";
 import { useLang } from "../i18n.js";
@@ -109,6 +110,9 @@ export default function ToolsPage({ onStats }) {
   };
   useEffect(() => {
     reload();
+    // 启动时解释器在后台探测，完成后刷新列表
+    const un = listen("runtimes-updated", () => reload());
+    return () => un.then((f) => f());
   }, []);
 
   const refreshRt = async () => {
