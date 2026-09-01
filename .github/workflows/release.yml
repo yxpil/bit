@@ -8,6 +8,11 @@ on:
         description: "要构建并上传资产的 tag（如 v0.3.1）"
         required: true
         default: "v0.3.1"
+      include_macos:
+        description: "是否同时构建 macOS 包"
+        type: boolean
+        required: false
+        default: true
   push:
     tags:
       - "v*"
@@ -47,6 +52,7 @@ jobs:
             --clobber --repo "$GITHUB_REPOSITORY"
 
   macos:
+    if: github.event_name == 'push' || inputs.include_macos
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
