@@ -6,8 +6,8 @@
 #define MyAppVersion "0.3.0"
 #define MyAppPublisher "BIT"
 #define MyAppExeName "bit.exe"
-; release 二进制目录（相对本 .iss 文件所在的 installer\ 目录）
-#define ReleaseDir "..\src-tauri\target\release"
+; release 二进制目录（统一取 C:\bit-build 的构建产物，工作仓库不参与打包）
+#define ReleaseDir "C:\bit-build\src-tauri\target\release"
 
 [Setup]
 AppId={{9E2B7C4A-3F1D-4A6E-9B8C-BIT0000HUB01}
@@ -20,7 +20,7 @@ DisableProgramGroupPage=yes
 ; 输出到项目根的 installer\Output 目录
 OutputDir=Output
 OutputBaseFilename=BIT-Setup-{#MyAppVersion}
-SetupIconFile={#ReleaseDir}\..\..\icons\icon.ico
+SetupIconFile=C:\bit-build\src-tauri\icons\icon.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
