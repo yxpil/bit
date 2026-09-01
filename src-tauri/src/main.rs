@@ -24,6 +24,7 @@ use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let ctx = state::Ctx::load(app.handle().clone());
             audit::record(&ctx, "local-app", "app.start", "BIT", serde_json::json!({}), true);

@@ -203,9 +203,14 @@ export default function ChatPage({ onStats }) {
     if (activeId) loadMessages(activeId);
   }, [activeId]);
 
+  // 滚动跟随：页面隐藏时 display:none，scrollIntoView 静默失败，故隐藏期间用瞬时模式；
+  // 切回对话页时立即校正一次滚动位置，恢复流式动画区的可见性
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth" });
+    bottom.current?.scrollIntoView({ behavior: visible ? "smooth" : "auto" });
   }, [messages, busy, live]);
+  useEffect(() => {
+    if (visible) requestAnimationFrame(() => bottom.current?.scrollIntoView());
+  }, [visible]);
 
   const selectSession = async (id) => {
     // 多会话并发：切换不受执行状态限制

@@ -516,15 +516,50 @@ pub fn set_provider_active(
     Ok(json!({ "active": active }))
 }
 
+/// 任务完成后，若主窗口不可见（最小化/关闭到托盘），发系统通知提醒用户
+fn notify_done(app: &tauri::AppHandle, ctx: &Arc<Ctx>, session_id: &str, messages: &[crate::ai::ChatMessage]) {
+    let visible = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(true);
+    if visible {
+        return;
+    }
+    let title = ctx
+        .sessions
+        .lock()
+        .unwrap()
+        .sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .map(|s| s.title.clone())
+        .unwrap_or_else(|| "BIT".to_string());
+    let reply = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| crate::registry::safe_trunc(m.content.trim(), 80))
+        .unwrap_or_default();
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title(format!("BIT · {title}"))
+        .body(if reply.is_empty() { "任务执行完成".to_string() } else { reply })
+        .show();
+}
+
 #[tauri::command]
 pub async fn chat(
     state: State<'_, Arc<Ctx>>,
+    app: tauri::AppHandle,
     session_id: String,
     message: String,
     images: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     let messages = crate::agent::chat_turn(&ctx, &session_id, &message, images.unwrap_or_default()).await?;
+    notify_done(&app, &ctx, &session_id, &messages);
     Ok(json!({ "messages": messages }))
 }
 
@@ -533,6 +568,7 @@ pub async fn chat(
 #[tauri::command]
 pub async fn chat_stream(
     state: State<'_, Arc<Ctx>>,
+    app: tauri::AppHandle,
     session_id: String,
     message: String,
     event_name: String,
@@ -542,6 +578,7 @@ pub async fn chat_stream(
     let ev = if event_name.trim().is_empty() { "chat-stream".to_string() } else { event_name };
     let messages =
         crate::agent::chat_turn_stream(&ctx, &session_id, &message, &ev, images.unwrap_or_default()).await?;
+    notify_done(&app, &ctx, &session_id, &messages);
     Ok(json!({ "messages": messages }))
 }
 

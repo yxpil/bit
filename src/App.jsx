@@ -168,7 +168,7 @@ export default function App() {
                 className="h-full overflow-auto p-6"
                 style={{ display: tab === k ? "block" : "none" }}
               >
-                <Page onStats={refresh} stats={stats} />
+                <Page onStats={refresh} stats={stats} visible={tab === k} />
               </div>
             ))}
           </main>
