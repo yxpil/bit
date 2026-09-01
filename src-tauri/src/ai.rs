@@ -632,7 +632,8 @@ pub fn tools_manifest(ctx: &Arc<crate::state::Ctx>) -> serde_json::Value {
 }
 
 /// 组装系统提示词：内置能力 + 动态工具清单 + 记忆 + 技能
-pub fn system_prompt(ctx: &Arc<crate::state::Ctx>) -> String {
+/// session：当前会话 —— 目标/待办只注入「本会话创建的」或「全局（无会话归属）」的
+pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> String {
     let memories = ctx.memories.lock().unwrap();
     let mem_lines: Vec<String> = memories
         .iter()
@@ -649,12 +650,20 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>) -> String {
         .collect();
     drop(skills);
 
+    // 会话隔离：仅注入当前会话创建的或全局（session_id 为空）的目标/待办
+    let in_session = |sid: &Option<String>| -> bool {
+        match (sid.as_deref(), session) {
+            (None, _) => true,
+            (Some(s), Some(cur)) => s == cur,
+            (Some(_), None) => false,
+        }
+    };
     let goal_lines: Vec<String> = ctx
         .goals
         .lock()
         .unwrap()
         .iter()
-        .filter(|g| g.status == "active")
+        .filter(|g| g.status == "active" && in_session(&g.session_id))
         .map(|g| format!("- [{}] {} {}", g.id, g.title, g.detail))
         .collect();
     let todo_lines: Vec<String> = ctx
@@ -662,7 +671,7 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>) -> String {
         .lock()
         .unwrap()
         .iter()
-        .filter(|t| t.status != "completed")
+        .filter(|t| t.status != "completed" && in_session(&t.session_id))
         .map(|t| {
             format!(
                 "- [{}]{} {} ({})",

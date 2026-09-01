@@ -11,6 +11,9 @@ pub struct Goal {
     /// active | achieved | abandoned
     pub status: String,
     pub source: String,
+    /// 创建该目标的会话（None = 用户手动创建的全局目标）；注入提示词时只带本会话的
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -24,6 +27,9 @@ pub struct Todo {
     /// pending | in_progress | completed
     pub status: String,
     pub source: String,
+    /// 创建该待办的会话（None = 全局）；注入时只带本会话的
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 fn now() -> String {
@@ -46,7 +52,13 @@ fn persist(ctx: &Arc<crate::state::Ctx>) {
 
 // ---------- Goal ----------
 
-pub fn create_goal(ctx: &Arc<crate::state::Ctx>, title: &str, detail: &str, source: &str) -> Result<Goal, String> {
+pub fn create_goal(
+    ctx: &Arc<crate::state::Ctx>,
+    title: &str,
+    detail: &str,
+    source: &str,
+    session: Option<&str>,
+) -> Result<Goal, String> {
     let title = title.trim();
     if title.is_empty() {
         return Err("目标标题不能为空".into());
@@ -59,6 +71,7 @@ pub fn create_goal(ctx: &Arc<crate::state::Ctx>, title: &str, detail: &str, sour
         detail: detail.trim().to_string(),
         status: "active".into(),
         source: source.to_string(),
+        session_id: session.map(|s| s.to_string()),
     };
     let mut goals = ctx.goals.lock().unwrap();
     goals.push(g.clone());
@@ -119,6 +132,7 @@ pub fn add_todo(
     goal_id: Option<String>,
     content: &str,
     source: &str,
+    session: Option<&str>,
 ) -> Result<Todo, String> {
     let content = content.trim();
     if content.is_empty() {
@@ -137,6 +151,7 @@ pub fn add_todo(
         content: content.to_string(),
         status: "pending".into(),
         source: source.to_string(),
+        session_id: session.map(|s| s.to_string()),
     };
     let mut todos = ctx.todos.lock().unwrap();
     todos.push(t.clone());
@@ -171,6 +186,7 @@ pub fn rewrite_todos(
     goal_id: Option<String>,
     items: &[serde_json::Value],
     source: &str,
+    session: Option<&str>,
 ) -> Result<usize, String> {
     let mut todos = ctx.todos.lock().unwrap();
     // 清空同范围内旧待办
@@ -196,6 +212,7 @@ pub fn rewrite_todos(
             content,
             status,
             source: source.to_string(),
+            session_id: session.map(|s| s.to_string()),
         });
         count += 1;
     }

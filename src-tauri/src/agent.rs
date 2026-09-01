@@ -231,7 +231,7 @@ pub async fn execute_tool_call(
         "goal_create" => {
             let title = params.get("title").and_then(|v| v.as_str()).unwrap_or_default();
             let detail = params.get("detail").and_then(|v| v.as_str()).unwrap_or_default();
-            let g = crate::goal::create_goal(ctx, title, detail, "ai")?;
+            let g = crate::goal::create_goal(ctx, title, detail, "ai", session_id)?;
             crate::audit::record(ctx, "ai-self", "goal.create", &g.title, json!({}), true);
             Ok(json!({ "goal": g.title, "id": g.id }))
         }
@@ -246,7 +246,7 @@ pub async fn execute_tool_call(
         "todo_add" => {
             let content = params.get("content").and_then(|v| v.as_str()).unwrap_or_default();
             let goal_id = params.get("goal_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
-            let t = crate::goal::add_todo(ctx, goal_id, content, "ai")?;
+            let t = crate::goal::add_todo(ctx, goal_id, content, "ai", session_id)?;
             crate::audit::record(ctx, "ai-self", "todo.add", &t.content, json!({}), true);
             Ok(json!({ "todo": t.content, "id": t.id }))
         }
@@ -260,7 +260,7 @@ pub async fn execute_tool_call(
         "todo_write" => {
             let items = params.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             let goal_id = params.get("goal_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
-            let n = crate::goal::rewrite_todos(ctx, goal_id, &items, "ai")?;
+            let n = crate::goal::rewrite_todos(ctx, goal_id, &items, "ai", session_id)?;
             crate::audit::record(ctx, "ai-self", "todo.write", "todos", json!({ "count": n }), true);
             Ok(json!({ "written": n }))
         }
@@ -320,7 +320,7 @@ pub async fn chat_turn(
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
         let sess = store.sessions.iter().find(|s| s.id == target).ok_or("会话不存在")?;
-        let mut v = vec![ChatMessage::system(ai::system_prompt(ctx))];
+        let mut v = vec![ChatMessage::system(ai::system_prompt(ctx, Some(&target)))];
         // 只取最近若干条，且剥离 tool_calls（模型请求只需 role/content）
         for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
             v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
@@ -491,7 +491,7 @@ pub async fn chat_turn_stream(
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
         let sess = store.sessions.iter().find(|s| s.id == target).ok_or("会话不存在")?;
-        let mut v = vec![ChatMessage::system(ai::system_prompt(ctx))];
+        let mut v = vec![ChatMessage::system(ai::system_prompt(ctx, Some(&target)))];
         for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
             v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
         }
@@ -666,7 +666,7 @@ pub fn build_context(
         .iter()
         .find(|s| s.id == target)
         .ok_or("会话不存在")?;
-    let mut v = vec![ChatMessage::system(ai::system_prompt(ctx))];
+    let mut v = vec![ChatMessage::system(ai::system_prompt(ctx, Some(&target)))];
     for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
         v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
     }

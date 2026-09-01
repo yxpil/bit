@@ -432,10 +432,10 @@ async fn builtin_invoke(
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
-            let g = crate::goal::create_goal(ctx, goal, "", actor)?;
+            let g = crate::goal::create_goal(ctx, goal, "", actor, session)?;
             let mut ids = Vec::new();
             for s in &steps {
-                if let Ok(t) = crate::goal::add_todo(ctx, Some(g.id.clone()), s, actor) {
+                if let Ok(t) = crate::goal::add_todo(ctx, Some(g.id.clone()), s, actor, session) {
                     ids.push(t.id);
                 }
             }

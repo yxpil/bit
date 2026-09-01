@@ -1192,7 +1192,7 @@ pub fn create_goal(
     detail: String,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    let g = crate::goal::create_goal(&ctx, &title, &detail, "user")?;
+    let g = crate::goal::create_goal(&ctx, &title, &detail, "user", None)?;
     crate::audit::record(&ctx, "local-user", "goal.create", &g.title, json!({}), true);
     Ok(json!({ "goal": g }))
 }
@@ -1232,7 +1232,7 @@ pub fn add_todo(
     goal_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    let t = crate::goal::add_todo(&ctx, goal_id, &content, "user")?;
+    let t = crate::goal::add_todo(&ctx, goal_id, &content, "user", None)?;
     crate::audit::record(&ctx, "local-user", "todo.add", &t.content, json!({}), true);
     Ok(json!({ "todo": t }))
 }
