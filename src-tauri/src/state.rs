@@ -33,6 +33,9 @@ pub struct Ctx {
     pub autopilot_running: AtomicBool,
     /// 会话中断标志（session_id → flag），chat_interrupt 置位后执行循环在检查点停止
     pub interrupts: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 原生工具调用探测缓存（session_id → 该会话端点是否支持 tools 参数）。
+    /// 只存内存、不持久化：每个会话首次请求时探测一次，模型/接口更新后新会话自动重新探测
+    pub native_probe: Mutex<HashMap<String, bool>>,
     /// 待审批工具调用（request_id → 应答通道）
     pub approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     /// 审批请求自增 id
@@ -111,6 +114,7 @@ impl Ctx {
             sessions: Mutex::new(sessions),
             mcp: Mutex::new(mcp),
             interrupts: Mutex::new(HashMap::new()),
+            native_probe: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             approval_seq: AtomicU64::new(1),
             autopilot_running: AtomicBool::new(false),

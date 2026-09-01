@@ -316,11 +316,21 @@ pub async fn chat_turn(
     };
     register_interrupt(ctx, &target);
 
+    // 原生工具调用探测：每个会话只探测一次（内存缓存不持久化，新会话自动重新探测，
+    // 模型/接口更新后自适应）；探测过不支持的会话直接用文本约定提示词
+    let mut native_mode = ctx.native_probe.lock().unwrap().get(&target).copied() != Some(false);
+
     // 2) 构造发给模型的对话（system + 历史 + 每轮追加的工具反馈）
+    // 提示词随探测结果切换：原生模式不教文本调用格式，避免两种约定互相干扰
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
         let sess = store.sessions.iter().find(|s| s.id == target).ok_or("会话不存在")?;
-        let mut v = vec![ChatMessage::system(ai::system_prompt(ctx, Some(&target)))];
+        let sys = if native_mode {
+            ai::system_prompt_native(ctx, Some(&target))
+        } else {
+            ai::system_prompt(ctx, Some(&target))
+        };
+        let mut v = vec![ChatMessage::system(sys)];
         // 只取最近若干条，且剥离 tool_calls（模型请求只需 role/content）
         for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
             v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
@@ -329,6 +339,7 @@ pub async fn chat_turn(
     };
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
+    let mut native_exchanges: Vec<ai::ToolExchange> = Vec::new();
     let mut round = 0usize;
     loop {
         round += 1;
@@ -338,50 +349,95 @@ pub async fn chat_turn(
         }
         // 图片只在第一轮（真正的用户轮）随请求发送，工具反馈轮不再重复携带
         let round_images: &[String] = if round == 1 { &images } else { &[] };
-        let reply = ai::chat_with_images(ctx, &convo, round_images).await?;
 
-        match parse_tool_calls(&reply) {
-            Some(calls) if !calls.is_empty() && looks_like_tool_calls(&calls) => {
-                // 执行工具，收集可视化记录
-                let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
-                for call in calls.iter().take(6) {
-                    if interrupted(ctx, &target) {
-                        clear_interrupt(ctx, &target);
-                        return Err("对话已中断".into());
-                    }
-                    let name = call.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
-                    let params = call.get("params").cloned().unwrap_or(json!({}));
-                    let outcome = if name.is_empty() {
-                        Err("缺少 tool 字段".to_string())
-                    } else {
-                        execute_tool_call(ctx, name, &params, Some(&target)).await
-                    };
-                    records.push(crate::ai::ToolCallRecord {
-                        tool: name.to_string(),
-                        params,
-                        ok: outcome.is_ok(),
-                        result: outcome.unwrap_or_else(|e| json!(e)),
-                    });
-                }
-
-                // 存一条带工具调用可视化的 assistant 消息（content 去掉思考块与裸 JSON，仅留说明文字）
-                let visible = strip_tool_json(&strip_think_blocks(&reply));
-                let mut msg = ChatMessage::assistant(visible);
-                msg.tool_calls = records.clone();
-                {
-                    let mut store = ctx.sessions.lock().unwrap();
-                    if let Some(sess) = store.get_mut(&target) {
-                        sess.messages.push(msg);
-                        sess.touch();
-                        if sess.messages.len() > CHAT_MAX {
-                            let drop_n = sess.messages.len() - CHAT_MAX;
-                            sess.messages.drain(0..drop_n);
+        // 拿到本轮回复：原生 function calling 优先，未探测过/已支持时尝试；失败降级文本约定
+        let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
+            match ai::chat_native_round(ctx, &convo, round_images, &native_exchanges).await {
+                Ok(r) => {
+                    ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    // 结构化调用为空时兜底解析文本约定（有的模型在原生模式下仍爱手写 TOOL: 行）
+                    let calls = if !r.calls.is_empty() {
+                        r.calls
+                    } else if let Some(tc) = parse_tool_calls(&r.content) {
+                        if !tc.is_empty() && looks_like_tool_calls(&tc) {
+                            text_calls_to_native(&tc)
+                        } else {
+                            Vec::new()
                         }
+                    } else {
+                        Vec::new()
+                    };
+                    (r.content, calls)
+                }
+                Err(ai::NativeErr::Unsupported(_)) => {
+                    // 端点拒绝 tools 参数：本会话降级文本约定（提示词同步切换），下个会话重新探测
+                    ctx.native_probe.lock().unwrap().insert(target.clone(), false);
+                    native_mode = false;
+                    native_exchanges.clear();
+                    convo[0] = ChatMessage::system(ai::system_prompt(ctx, Some(&target)));
+                    round -= 1; // 重走本轮（保留第一轮携带图片的语义）
+                    continue;
+                }
+                Err(ai::NativeErr::Other(e)) => return Err(e),
+            }
+        } else {
+            let reply = ai::chat_with_images(ctx, &convo, round_images).await?;
+            let calls = match parse_tool_calls(&reply) {
+                Some(tc) if !tc.is_empty() && looks_like_tool_calls(&tc) => text_calls_to_native(&tc),
+                _ => Vec::new(),
+            };
+            (reply, calls)
+        };
+
+        if !native_calls.is_empty() {
+            // 执行工具，收集可视化记录
+            let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
+            for call in native_calls.iter().take(6) {
+                if interrupted(ctx, &target) {
+                    clear_interrupt(ctx, &target);
+                    return Err("对话已中断".into());
+                }
+                let outcome = if call.name.is_empty() {
+                    Err("缺少 tool 字段".to_string())
+                } else {
+                    execute_tool_call(ctx, &call.name, &call.args, Some(&target)).await
+                };
+                records.push(crate::ai::ToolCallRecord {
+                    tool: call.name.clone(),
+                    params: call.args.clone(),
+                    ok: outcome.is_ok(),
+                    result: outcome.unwrap_or_else(|e| json!(e)),
+                });
+            }
+
+            // 存一条带工具调用可视化的 assistant 消息（content 去掉思考块与裸 JSON，仅留说明文字）
+            let visible = strip_tool_json(&strip_think_blocks(&reply));
+            let mut msg = ChatMessage::assistant(visible);
+            msg.tool_calls = records.clone();
+            {
+                let mut store = ctx.sessions.lock().unwrap();
+                if let Some(sess) = store.get_mut(&target) {
+                    sess.messages.push(msg);
+                    sess.touch();
+                    if sess.messages.len() > CHAT_MAX {
+                        let drop_n = sess.messages.len() - CHAT_MAX;
+                        sess.messages.drain(0..drop_n);
                     }
                 }
-                crate::session::persist(ctx);
+            }
+            crate::session::persist(ctx);
 
-                // 把结果回喂给模型（仅用于本轮请求，不落库为可见气泡）
+            // 把结果回喂给模型：原生模式按协议回传（tool 消息/tool_result/functionResponse），
+            // 文本模式拼 feedback 用户消息（仅用于本轮请求，不落库为可见气泡）
+            if native_mode {
+                native_exchanges.push(ai::ToolExchange {
+                    calls: native_calls.clone(),
+                    results: records
+                        .iter()
+                        .map(|r| ai::ToolResult { ok: r.ok, value: r.result.clone() })
+                        .collect(),
+                });
+            } else {
                 let feedback = format!(
                     "工具调用结果（继续你的回复，如已完成请直接输出最终答案）：\n{}",
                     serde_json::to_string_pretty(&records.iter().map(|r| json!({
@@ -391,56 +447,69 @@ pub async fn chat_turn(
                 convo.push(ChatMessage::assistant(reply.clone()));
                 convo.push(ChatMessage::user(feedback));
             }
-            _ => {
-                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」，次数不限制
-                if looks_truncated(&reply) {
-                    let visible = strip_tool_json(&strip_think_blocks(&reply));
-                    if !visible.is_empty() {
-                        let mut store = ctx.sessions.lock().unwrap();
-                        if let Some(sess) = store.get_mut(&target) {
-                            sess.messages.push(ChatMessage::assistant(visible));
-                            sess.touch();
-                            if sess.messages.len() > CHAT_MAX {
-                                let drop_n = sess.messages.len() - CHAT_MAX;
-                                sess.messages.drain(0..drop_n);
-                            }
-                        }
-                        drop(store);
-                        crate::session::persist(ctx);
-                    }
-                    convo.push(ChatMessage::assistant(reply.clone()));
-                    convo.push(ChatMessage::user(CONTINUE_PROMPT));
-                    continue;
-                }
-                // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
-                let visible = strip_tool_json(&strip_think_blocks(&reply));
-                let visible = if visible.is_empty() { reply.clone() } else { visible };
-                {
-                    let mut store = ctx.sessions.lock().unwrap();
-                    if let Some(sess) = store.get_mut(&target) {
-                        sess.messages.push(ChatMessage::assistant(visible));
-                        sess.touch();
-                        if sess.messages.len() > CHAT_MAX {
-                            let drop_n = sess.messages.len() - CHAT_MAX;
-                            sess.messages.drain(0..drop_n);
-                        }
+            continue;
+        }
+
+        // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」，次数不限制（仅文本约定模式）
+        if !native_mode && looks_truncated(&reply) {
+            let visible = strip_tool_json(&strip_think_blocks(&reply));
+            if !visible.is_empty() {
+                let mut store = ctx.sessions.lock().unwrap();
+                if let Some(sess) = store.get_mut(&target) {
+                    sess.messages.push(ChatMessage::assistant(visible));
+                    sess.touch();
+                    if sess.messages.len() > CHAT_MAX {
+                        let drop_n = sess.messages.len() - CHAT_MAX;
+                        sess.messages.drain(0..drop_n);
                     }
                 }
+                drop(store);
                 crate::session::persist(ctx);
-                clear_interrupt(ctx, &target);
-                let out = ctx
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .sessions
-                    .iter()
-                    .find(|s| s.id == target)
-                    .map(|s| s.messages.clone())
-                    .unwrap_or_default();
-                return Ok(out);
+            }
+            convo.push(ChatMessage::assistant(reply.clone()));
+            convo.push(ChatMessage::user(CONTINUE_PROMPT));
+            continue;
+        }
+        // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
+        let visible = strip_tool_json(&strip_think_blocks(&reply));
+        let visible = if visible.is_empty() { reply.clone() } else { visible };
+        {
+            let mut store = ctx.sessions.lock().unwrap();
+            if let Some(sess) = store.get_mut(&target) {
+                sess.messages.push(ChatMessage::assistant(visible));
+                sess.touch();
+                if sess.messages.len() > CHAT_MAX {
+                    let drop_n = sess.messages.len() - CHAT_MAX;
+                    sess.messages.drain(0..drop_n);
+                }
             }
         }
+        crate::session::persist(ctx);
+        clear_interrupt(ctx, &target);
+        let out = ctx
+            .sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .iter()
+            .find(|s| s.id == target)
+            .map(|s| s.messages.clone())
+            .unwrap_or_default();
+        return Ok(out);
     }
+}
+
+/// 把文本约定解析出的调用（[{tool,params}]）统一转成原生调用结构，两条路径共用执行逻辑
+fn text_calls_to_native(calls: &[serde_json::Value]) -> Vec<ai::NativeToolCall> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ai::NativeToolCall {
+            id: format!("txt-{i}"),
+            name: c.get("tool").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            args: c.get("params").cloned().unwrap_or(json!({})),
+        })
+        .collect()
 }
 
 /// 流式版对话循环：通过 Tauri 事件 `event_name` 把增量文本 / 工具卡片 / 结束信号推给前端。
@@ -488,10 +557,19 @@ pub async fn chat_turn_stream(
     };
     let iflag = register_interrupt(ctx, &target);
 
+    // 原生工具调用探测：每个会话只探测一次（内存缓存不持久化，新会话自动重新探测）；
+    // 提示词随探测结果切换：原生模式不教文本调用格式，避免两种约定互相干扰
+    let mut native_mode = ctx.native_probe.lock().unwrap().get(&target).copied() != Some(false);
+
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
         let sess = store.sessions.iter().find(|s| s.id == target).ok_or("会话不存在")?;
-        let mut v = vec![ChatMessage::system(ai::system_prompt(ctx, Some(&target)))];
+        let sys = if native_mode {
+            ai::system_prompt_native(ctx, Some(&target))
+        } else {
+            ai::system_prompt(ctx, Some(&target))
+        };
+        let mut v = vec![ChatMessage::system(sys)];
         for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
             v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
         }
@@ -499,6 +577,8 @@ pub async fn chat_turn_stream(
     };
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
+    // 端点不支持 tools 参数时立即降级文本约定；原生模式下本轮回复一次性下发
+    let mut native_exchanges: Vec<ai::ToolExchange> = Vec::new();
     let mut round = 0usize;
     loop {
         round += 1;
@@ -512,80 +592,132 @@ pub async fn chat_turn_stream(
         emit(json!({ "type": "round_start" }));
         // 图片只在第一轮随请求发送
         let round_images: &[String] = if round == 1 { &images } else { &[] };
-        // 流式过程中若收到中断请求：停止推送增量，等本轮请求返回后终止
-        let stream_cancelled = Arc::new(AtomicBool::new(false));
-        let reply = {
-            let emit_ref = &emit;
-            let sc = stream_cancelled.clone();
-            let iflag2 = iflag.clone();
-            ai::chat_stream_with_images(ctx, &convo, round_images, move |tok| {
-                if iflag2.load(Ordering::Relaxed) {
-                    sc.store(true, Ordering::Relaxed);
-                    return;
+
+        // 拿到本轮回复：原生 function calling 优先，失败降级文本约定
+        let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
+            match ai::chat_native_round(ctx, &convo, round_images, &native_exchanges).await {
+                Ok(r) => {
+                    ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    let calls = if !r.calls.is_empty() {
+                        r.calls
+                    } else if let Some(tc) = parse_tool_calls(&r.content) {
+                        if !tc.is_empty() && looks_like_tool_calls(&tc) {
+                            text_calls_to_native(&tc)
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    (r.content, calls)
                 }
-                emit_ref(json!({ "type": "delta", "text": tok }));
-            })
-            .await
-        };
-        if interrupted(ctx, &target) || stream_cancelled.load(Ordering::Relaxed) {
-            clear_interrupt(ctx, &target);
-            let e = "对话已中断".to_string();
-            emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
-            return Err(e);
-        }
-        let reply = match reply {
-            Ok(r) => r,
-            Err(e) => {
+                Err(ai::NativeErr::Unsupported(_)) => {
+                    ctx.native_probe.lock().unwrap().insert(target.clone(), false);
+                    native_mode = false;
+                    native_exchanges.clear();
+                    convo[0] = ChatMessage::system(ai::system_prompt(ctx, Some(&target)));
+                    round -= 1;
+                    continue;
+                }
+                Err(ai::NativeErr::Other(e)) => {
+                    clear_interrupt(ctx, &target);
+                    emit(json!({ "type": "error", "error": e.clone() }));
+                    return Err(e);
+                }
+            }
+        } else {
+            // 流式过程中若收到中断请求：停止推送增量，等本轮请求返回后终止
+            let stream_cancelled = Arc::new(AtomicBool::new(false));
+            let result = {
+                let emit_ref = &emit;
+                let sc = stream_cancelled.clone();
+                let iflag2 = iflag.clone();
+                ai::chat_stream_with_images(ctx, &convo, round_images, move |tok| {
+                    if iflag2.load(Ordering::Relaxed) {
+                        sc.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    emit_ref(json!({ "type": "delta", "text": tok }));
+                })
+                .await
+            };
+            if interrupted(ctx, &target) || stream_cancelled.load(Ordering::Relaxed) {
                 clear_interrupt(ctx, &target);
-                emit(json!({ "type": "error", "error": e.clone() }));
+                let e = "对话已中断".to_string();
+                emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
                 return Err(e);
             }
+            let reply = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    clear_interrupt(ctx, &target);
+                    emit(json!({ "type": "error", "error": e.clone() }));
+                    return Err(e);
+                }
+            };
+            let calls = match parse_tool_calls(&reply) {
+                Some(tc) if !tc.is_empty() && looks_like_tool_calls(&tc) => text_calls_to_native(&tc),
+                _ => Vec::new(),
+            };
+            (reply, calls)
         };
 
-        match parse_tool_calls(&reply) {
-            Some(calls) if !calls.is_empty() && looks_like_tool_calls(&calls) => {
-                let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
-                for call in calls.iter().take(6) {
-                    if interrupted(ctx, &target) {
-                        clear_interrupt(ctx, &target);
-                        let e = "对话已中断".to_string();
-                        emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
-                        return Err(e);
-                    }
-                    let name = call.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
-                    let params = call.get("params").cloned().unwrap_or(json!({}));
-                    let outcome = if name.is_empty() {
-                        Err("缺少 tool 字段".to_string())
-                    } else {
-                        execute_tool_call(ctx, name, &params, Some(&target)).await
-                    };
-                    records.push(crate::ai::ToolCallRecord {
-                        tool: name.to_string(),
-                        params,
-                        ok: outcome.is_ok(),
-                        result: outcome.unwrap_or_else(|e| json!(e)),
-                    });
+        // 原生模式下没有逐 token 流式：一次性下发本轮文本（工具轮由 tools 事件接管渲染）
+        if native_mode && !reply.is_empty() {
+            emit(json!({ "type": "delta", "text": &reply }));
+        }
+
+        if !native_calls.is_empty() {
+            let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
+            for call in native_calls.iter().take(6) {
+                if interrupted(ctx, &target) {
+                    clear_interrupt(ctx, &target);
+                    let e = "对话已中断".to_string();
+                    emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
+                    return Err(e);
                 }
+                let outcome = if call.name.is_empty() {
+                    Err("缺少 tool 字段".to_string())
+                } else {
+                    execute_tool_call(ctx, &call.name, &call.args, Some(&target)).await
+                };
+                records.push(crate::ai::ToolCallRecord {
+                    tool: call.name.clone(),
+                    params: call.args.clone(),
+                    ok: outcome.is_ok(),
+                    result: outcome.unwrap_or_else(|e| json!(e)),
+                });
+            }
 
-                let visible = strip_tool_json(&strip_think_blocks(&reply));
-                let mut msg = ChatMessage::assistant(visible.clone());
-                msg.tool_calls = records.clone();
-                {
-                    let mut store = ctx.sessions.lock().unwrap();
-                    if let Some(sess) = store.get_mut(&target) {
-                        sess.messages.push(msg);
-                        sess.touch();
-                        if sess.messages.len() > CHAT_MAX {
-                            let drop_n = sess.messages.len() - CHAT_MAX;
-                            sess.messages.drain(0..drop_n);
-                        }
+            let visible = strip_tool_json(&strip_think_blocks(&reply));
+            let mut msg = ChatMessage::assistant(visible.clone());
+            msg.tool_calls = records.clone();
+            {
+                let mut store = ctx.sessions.lock().unwrap();
+                if let Some(sess) = store.get_mut(&target) {
+                    sess.messages.push(msg);
+                    sess.touch();
+                    if sess.messages.len() > CHAT_MAX {
+                        let drop_n = sess.messages.len() - CHAT_MAX;
+                        sess.messages.drain(0..drop_n);
                     }
                 }
-                crate::session::persist(ctx);
+            }
+            crate::session::persist(ctx);
 
-                // 通知前端：本轮是工具调用 → 丢弃流式文本，改渲染工具卡片
-                emit(json!({ "type": "tools", "visible": visible, "calls": records }));
+            // 通知前端：本轮是工具调用 → 丢弃流式文本，改渲染工具卡片
+            emit(json!({ "type": "tools", "visible": visible, "calls": records }));
 
+            // 回喂：原生模式按协议回传，文本模式拼 feedback 用户消息
+            if native_mode {
+                native_exchanges.push(ai::ToolExchange {
+                    calls: native_calls.clone(),
+                    results: records
+                        .iter()
+                        .map(|r| ai::ToolResult { ok: r.ok, value: r.result.clone() })
+                        .collect(),
+                });
+            } else {
                 let feedback = format!(
                     "工具调用结果（继续你的回复，如已完成请直接输出最终答案）：\n{}",
                     serde_json::to_string_pretty(&records.iter().map(|r| json!({
@@ -595,58 +727,58 @@ pub async fn chat_turn_stream(
                 convo.push(ChatMessage::assistant(reply.clone()));
                 convo.push(ChatMessage::user(feedback));
             }
-            _ => {
-                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」，次数不限制
-                if looks_truncated(&reply) {
-                    let visible = strip_tool_json(&strip_think_blocks(&reply));
-                    if !visible.is_empty() {
-                        let mut store = ctx.sessions.lock().unwrap();
-                        if let Some(sess) = store.get_mut(&target) {
-                            sess.messages.push(ChatMessage::assistant(visible.clone()));
-                            sess.touch();
-                            if sess.messages.len() > CHAT_MAX {
-                                let drop_n = sess.messages.len() - CHAT_MAX;
-                                sess.messages.drain(0..drop_n);
-                            }
-                        }
-                        drop(store);
-                        crate::session::persist(ctx);
-                    }
-                    // 通知前端：本轮是不完整回复 → 用清洗后的片段替换原始流式文本
-                    emit(json!({ "type": "continue", "visible": visible }));
-                    convo.push(ChatMessage::assistant(reply.clone()));
-                    convo.push(ChatMessage::user(CONTINUE_PROMPT));
-                    continue;
-                }
-                // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
-                let visible = strip_tool_json(&strip_think_blocks(&reply));
-                let visible = if visible.is_empty() { reply.clone() } else { visible };
-                {
-                    let mut store = ctx.sessions.lock().unwrap();
-                    if let Some(sess) = store.get_mut(&target) {
-                        sess.messages.push(ChatMessage::assistant(visible));
-                        sess.touch();
-                        if sess.messages.len() > CHAT_MAX {
-                            let drop_n = sess.messages.len() - CHAT_MAX;
-                            sess.messages.drain(0..drop_n);
-                        }
+            continue;
+        }
+
+        // 回复不完整（截断/纯思考残渣）：不结束回合，自动补发「继续」（仅文本约定模式）
+        if !native_mode && looks_truncated(&reply) {
+            let visible = strip_tool_json(&strip_think_blocks(&reply));
+            if !visible.is_empty() {
+                let mut store = ctx.sessions.lock().unwrap();
+                if let Some(sess) = store.get_mut(&target) {
+                    sess.messages.push(ChatMessage::assistant(visible.clone()));
+                    sess.touch();
+                    if sess.messages.len() > CHAT_MAX {
+                        let drop_n = sess.messages.len() - CHAT_MAX;
+                        sess.messages.drain(0..drop_n);
                     }
                 }
+                drop(store);
                 crate::session::persist(ctx);
-                clear_interrupt(ctx, &target);
-                let out = ctx
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .sessions
-                    .iter()
-                    .find(|s| s.id == target)
-                    .map(|s| s.messages.clone())
-                    .unwrap_or_default();
-                emit(json!({ "type": "final", "messages": out.clone() }));
-                return Ok(out);
+            }
+            // 通知前端：本轮是不完整回复 → 用清洗后的片段替换原始流式文本
+            emit(json!({ "type": "continue", "visible": visible }));
+            convo.push(ChatMessage::assistant(reply.clone()));
+            convo.push(ChatMessage::user(CONTINUE_PROMPT));
+            continue;
+        }
+        // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
+        let visible = strip_tool_json(&strip_think_blocks(&reply));
+        let visible = if visible.is_empty() { reply.clone() } else { visible };
+        {
+            let mut store = ctx.sessions.lock().unwrap();
+            if let Some(sess) = store.get_mut(&target) {
+                sess.messages.push(ChatMessage::assistant(visible));
+                sess.touch();
+                if sess.messages.len() > CHAT_MAX {
+                    let drop_n = sess.messages.len() - CHAT_MAX;
+                    sess.messages.drain(0..drop_n);
+                }
             }
         }
+        crate::session::persist(ctx);
+        clear_interrupt(ctx, &target);
+        let out = ctx
+            .sessions
+            .lock()
+            .unwrap()
+            .sessions
+            .iter()
+            .find(|s| s.id == target)
+            .map(|s| s.messages.clone())
+            .unwrap_or_default();
+        emit(json!({ "type": "final", "messages": out.clone() }));
+        return Ok(out);
     }
 }
 

@@ -631,9 +631,18 @@ pub fn tools_manifest(ctx: &Arc<crate::state::Ctx>) -> serde_json::Value {
         .collect::<Vec<_>>())
 }
 
-/// 组装系统提示词：内置能力 + 动态工具清单 + 记忆 + 技能
-/// session：当前会话 —— 目标/待办只注入「本会话创建的」或「全局（无会话归属）」的
+/// 组装系统提示词（文本约定模式）：内置能力 + 动态工具清单 + 记忆 + 技能
 pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> String {
+    system_prompt_mode(ctx, session, false)
+}
+
+/// 组装系统提示词（原生函数调用模式）：不教文本格式，指导模型直接发起 function call
+pub fn system_prompt_native(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> String {
+    system_prompt_mode(ctx, session, true)
+}
+
+/// session：当前会话 —— 目标/待办只注入「本会话创建的」或「全局（无会话归属）」的
+fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, native: bool) -> String {
     let memories = ctx.memories.lock().unwrap();
     let mem_lines: Vec<String> = memories
         .iter()
@@ -710,16 +719,36 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> Str
         "执行命令行（POSIX shell 语法，路径用 / 形式，如 /Users/xxx 与 /home/xxx）"
     };
 
+    // 操作手册 / skill 示例 / 收尾句：文本约定与原生函数调用两种模式各自一份
+    let (manual, skill_examples, closing) = if native {
+        (
+            "## 操作手册：如何调用工具（原生函数调用）\n\
+            你处于原生函数调用模式：需要动手做事时直接发起 function call（可一次并行发起多个），\
+            系统会执行并把每个工具的结果以工具消息回传给你；拿到结果后继续思考或再次调用，\
+            全部完成后用自然语言输出最终答案（不要在回答里再输出任何调用格式说明或 JSON 调用数组）。",
+            "写 SKILL、搜 SKILL 都用【工具6 · skill】：save 是自己写一条技能（同名覆盖），search 是搜索已有技能。",
+            "不再需要动手时直接用自然语言输出最终答案即可。",
+        )
+    } else {
+        (
+            "## 操作手册：如何调用工具（务必遵守）\n\
+            当你需要动手做事（执行命令、读写文件、制定计划、扩展自己、沉淀/查找技能）时，\
+            在回答里【单独一行】输出一个 JSON 数组，数组每个元素形如 {{\"tool\":\"工具名\",\"params\":{{...}}}}。\n\
+            这一行必须是纯 JSON，前后不要加解释文字、不要用代码块包裹；系统会执行后把结果回给你，你再据此继续。\n\
+            严禁自创标记语法（如 <xxx_function_call>）、严禁输出不带方括号的裸对象、严禁把多个调用拆成多行——\
+            多个调用必须放在同一个数组里：[{{...}},{{...}}]。不需要动手时正常用自然语言回答即可。\n\
+            单个工具调用示例：[{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]",
+            "写 SKILL、搜 SKILL 都用【工具6 · skill】：save 是自己写一条技能，search 是搜索已有技能。示例：\n\
+            - 写 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"批量重命名\",\"summary\":\"用 shell 遍历目录并 mv 重命名文件的步骤…\"}}}}]\n\
+            - 搜 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"重命名\"}}}}]",
+            "需要调用能力时输出 JSON 数组，每个元素 {{\"tool\":string,\"params\":object}}，单独一行，不要包裹其他文字之外的内容。",
+        )
+    };
+
     format!(
         "你是 BIT，一个可以自我扩展的 AI 助手。你能调用工具、并通过写代码为自己增加新工具。\n\
         \n\
-        ## 操作手册：如何调用工具（务必遵守）\n\
-        当你需要动手做事（执行命令、读写文件、制定计划、扩展自己、沉淀/查找技能）时，\
-        在回答里【单独一行】输出一个 JSON 数组，数组每个元素形如 {{\"tool\":\"工具名\",\"params\":{{...}}}}。\n\
-        这一行必须是纯 JSON，前后不要加解释文字、不要用代码块包裹；系统会执行后把结果回给你，你再据此继续。\n\
-        严禁自创标记语法（如 <xxx_function_call>）、严禁输出不带方括号的裸对象、严禁把多个调用拆成多行——\
-        多个调用必须放在同一个数组里：[{{...}},{{...}}]。不需要动手时正常用自然语言回答即可。\n\
-        单个工具调用示例：[{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]\n\
+        {manual}\n\
         \n\
         ## 七个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
         - 工具1 · shell：{shell_syntax}。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
@@ -729,9 +758,7 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> Str
         - 工具5 · add_tool：给自己增加工具——用本机某解释器把一段代码沉淀为常驻工具。参数 {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}\n\
         - 工具6 · skill：技能库读写。写入技能 {{\"action\":\"save\",\"name\":string,\"summary\":string}}（同名覆盖）；搜索技能 {{\"action\":\"search\",\"query\":string}}（query 留空返回全部）\n\
         - 工具7 · sub_agent：派生子智能体——新建独立会话执行自包含的大任务（调研/批量整理/写大文件），阻塞等待并返回其最终结论，子会话保留在侧栏可查看全过程。参数 {{\"task\":string,\"title\":string(可选)}}。注意 task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全\n\
-        写 SKILL、搜 SKILL 都用【工具6 · skill】：save 是自己写一条技能，search 是搜索已有技能。示例：\n\
-        - 写 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"批量重命名\",\"summary\":\"用 shell 遍历目录并 mv 重命名文件的步骤…\"}}}}]\n\
-        - 搜 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"重命名\"}}}}]\n\
+        {skill_examples}\n\
         \n\
         ## 自我扩展的扩展动作（同样作为 tool 调用）\n\
         - run_script：用本机解释器临时执行一段代码（不落地）。参数 {{\"runtime\":string,\"code\":string,\"params\":object}}\n\
@@ -756,12 +783,664 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> Str
         ## 已注册工具\n{}\n\
         ## 记忆\n{}\n\
         ## 技能\n{}\n\
-        需要调用能力时输出 JSON 数组，每个元素 {{\"tool\":string,\"params\":object}}，单独一行，不要包裹其他文字之外的内容。",
+        {closing}",
         if runtime_lines.is_empty() { "（未探测到任何解释器，可在「工具」页点刷新探测）".to_string() } else { runtime_lines.join("\n") },
         if goal_lines.is_empty() { "（暂无）".to_string() } else { goal_lines.join("\n") },
         if todo_lines.is_empty() { "（暂无）".to_string() } else { todo_lines.join("\n") },
         serde_json::to_string_pretty(&tools_manifest(ctx)).unwrap_or_default(),
         if mem_lines.is_empty() { "（空）".to_string() } else { mem_lines.join("\n") },
         if skill_lines.is_empty() { "（空）".to_string() } else { skill_lines.join("\n") },
+        manual = manual,
+        skill_examples = skill_examples,
+        closing = closing,
     )
+}
+
+// ============ 原生工具调用（function calling）：OpenAI / Claude / Gemini ============
+
+/// 原生协议返回的单个工具调用
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeToolCall {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// 单个工具的执行结果
+#[derive(Clone, Debug)]
+pub struct ToolResult {
+    pub ok: bool,
+    pub value: serde_json::Value,
+}
+
+/// 一轮工具交换（模型发起的调用 + 系统执行结果），原生模式下按协议转成回传历史
+#[derive(Clone, Debug)]
+pub struct ToolExchange {
+    pub calls: Vec<NativeToolCall>,
+    pub results: Vec<ToolResult>,
+}
+
+/// 原生一轮的结果：文本 + 工具调用（可同时存在）
+#[derive(Debug)]
+pub struct NativeRound {
+    pub content: String,
+    pub calls: Vec<NativeToolCall>,
+}
+
+/// 原生调用错误：Unsupported 表示端点不支持 tools 参数（应降级文本约定）
+#[derive(Debug)]
+#[allow(dead_code)] // Unsupported 携带的原始报错仅用于排查，降级是静默自动的
+pub enum NativeErr {
+    Unsupported(String),
+    Other(String),
+}
+
+/// 组装原生工具清单：已注册且启用的工具 + execute_tool_call 直接处理的扩展动作。
+/// 中立格式（name/description/parameters），发送前按协议转换。
+pub fn native_tool_defs(ctx: &Arc<crate::state::Ctx>) -> Vec<serde_json::Value> {
+    let mut defs: Vec<serde_json::Value> = {
+        let tools = ctx.tools.lock().unwrap();
+        tools
+            .iter()
+            .filter(|t| t.enabled)
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                })
+            })
+            .collect()
+    };
+    let extra: Vec<(&str, &str, serde_json::Value)> = vec![
+        (
+            "run_script",
+            "用本机解释器临时执行一段代码（不落地成常驻工具）。代码从 stdin 读 params JSON，结果打印到 stdout",
+            serde_json::json!({"type":"object","properties":{"runtime":{"type":"string","description":"本机可用解释器 id"},"code":{"type":"string","description":"完整代码"},"params":{"type":"object","description":"传给代码的参数"}},"required":["runtime","code"]}),
+        ),
+        (
+            "write_tool",
+            "用本机解释器把一段代码沉淀为常驻工具",
+            serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"runtime":{"type":"string"},"code":{"type":"string"}},"required":["name","description","runtime","code"]}),
+        ),
+        (
+            "add_memory",
+            "沉淀一条长期记忆",
+            serde_json::json!({"type":"object","properties":{"content":{"type":"string"},"kind":{"type":"string","description":"如 preference/fact"}},"required":["content"]}),
+        ),
+        (
+            "add_skill",
+            "沉淀一条可复用技能",
+            serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"summary":{"type":"string"}},"required":["name","summary"]}),
+        ),
+        (
+            "goal_create",
+            "创建目标",
+            serde_json::json!({"type":"object","properties":{"title":{"type":"string"},"detail":{"type":"string"}},"required":["title"]}),
+        ),
+        (
+            "goal_update",
+            "更新目标状态（active/done/archived 等）",
+            serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}},"required":["id","status"]}),
+        ),
+        (
+            "todo_add",
+            "添加待办",
+            serde_json::json!({"type":"object","properties":{"content":{"type":"string"},"goal_id":{"type":"string"}},"required":["content"]}),
+        ),
+        (
+            "todo_update",
+            "更新待办状态（pending/doing/completed）",
+            serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}},"required":["id","status"]}),
+        ),
+        (
+            "todo_write",
+            "整体重写待办清单",
+            serde_json::json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"string"}},"goal_id":{"type":"string"}},"required":["items"]}),
+        ),
+    ];
+    for (name, desc, params) in extra {
+        // 注册表里已有同名工具则跳过，避免重复
+        if defs.iter().any(|d| d["name"] == name) {
+            continue;
+        }
+        defs.push(serde_json::json!({
+            "name": name, "description": desc, "parameters": params,
+        }));
+    }
+    defs
+}
+
+/// 原生工具一轮对话：自动按提供方协议分发（OpenAI / Claude / Gemini）
+pub async fn chat_native_round(
+    ctx: &Arc<crate::state::Ctx>,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+) -> Result<NativeRound, NativeErr> {
+    let (p, params) = {
+        let cfg = ctx.ai_config.lock().unwrap();
+        match cfg.active() {
+            Some(p) => (p.clone(), cfg.clone()),
+            None => return Err(NativeErr::Other("未配置任何 AI 提供方".into())),
+        }
+    };
+    if p.api_key.is_empty() {
+        return Err(NativeErr::Other(format!(
+            "提供方「{}」未填写 API Key",
+            p.name
+        )));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| NativeErr::Other(e.to_string()))?;
+    let defs = native_tool_defs(ctx);
+    match p.protocol.as_str() {
+        "claude" => native_round_claude(&client, &p, convo, images, exchanges, &defs, &params).await,
+        "gemini" => native_round_gemini(&client, &p, convo, images, exchanges, &defs, &params).await,
+        _ => native_round_openai(&client, &p, convo, images, exchanges, &defs, &params).await,
+    }
+}
+
+/// 读响应体：非 2xx → 分类为 Unsupported / Other
+async fn read_json_native(resp: reqwest::Response) -> Result<serde_json::Value, NativeErr> {
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let short = crate::registry::safe_trunc(&text, 400);
+        if status.is_client_error() {
+            let low = text.to_lowercase();
+            if low.contains("tool") || low.contains("function") || low.contains("schema") {
+                return Err(NativeErr::Unsupported(format!("HTTP {status}: {short}")));
+            }
+        }
+        return Err(NativeErr::Other(format!("HTTP {status}: {short}")));
+    }
+    serde_json::from_str(&text).map_err(|e| NativeErr::Other(format!("响应解析失败: {e}")))
+}
+
+async fn native_round_openai(
+    client: &reqwest::Client,
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+) -> Result<NativeRound, NativeErr> {
+    let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
+    let mut msgs = openai_messages(convo, images);
+    for ex in exchanges {
+        let tcs: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id, "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": serde_json::to_string(&c.args).unwrap_or_else(|_| "{}".into()),
+                    },
+                })
+            })
+            .collect();
+        msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tcs}));
+        for (c, r) in ex.calls.iter().zip(ex.results.iter()) {
+            let content = if r.ok {
+                serde_json::to_string(&r.value).unwrap_or_default()
+            } else {
+                format!(
+                    "工具执行失败: {}",
+                    serde_json::to_string(&r.value).unwrap_or_default()
+                )
+            };
+            msgs.push(serde_json::json!({"role": "tool", "tool_call_id": c.id, "content": content}));
+        }
+    }
+    let tools: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| serde_json::json!({"type": "function", "function": d}))
+        .collect();
+    let mut body = serde_json::json!({
+        "model": p.model,
+        "messages": msgs,
+        "tools": tools,
+        "tool_choice": "auto",
+    });
+    apply_params("openai", &mut body, params);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", p.api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
+    let value = read_json_native(resp).await?;
+    let msg = &value["choices"][0]["message"];
+    let content = msg
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut calls = Vec::new();
+    if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+        for tc in arr {
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let args_raw = tc
+                .pointer("/function/arguments")
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let args = serde_json::from_str(args_raw).unwrap_or(serde_json::json!({}));
+            if !name.is_empty() {
+                calls.push(NativeToolCall {
+                    id: tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    name,
+                    args,
+                });
+            }
+        }
+    }
+    Ok(NativeRound { content, calls })
+}
+
+async fn native_round_claude(
+    client: &reqwest::Client,
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+) -> Result<NativeRound, NativeErr> {
+    let (system_txt, mut msgs) = claude_messages(convo, images);
+    for ex in exchanges {
+        // assistant：tool_use 块
+        let blocks: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.args})
+            })
+            .collect();
+        if !blocks.is_empty() {
+            msgs.push(serde_json::json!({"role": "assistant", "content": blocks}));
+        }
+        // user：tool_result 块
+        let results: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .zip(ex.results.iter())
+            .map(|(c, r)| {
+                serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": c.id,
+                    "content": serde_json::to_string(&r.value).unwrap_or_default(),
+                    "is_error": !r.ok,
+                })
+            })
+            .collect();
+        if !results.is_empty() {
+            msgs.push(serde_json::json!({"role": "user", "content": results}));
+        }
+    }
+    let tools: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d["name"], "description": d["description"], "input_schema": d["parameters"],
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "model": p.model,
+        "max_tokens": 4096,
+        "messages": msgs,
+        "tools": tools,
+        "tool_choice": {"type": "auto"},
+    });
+    apply_params("claude", &mut body, params);
+    if !system_txt.is_empty() {
+        body["system"] = serde_json::json!(system_txt);
+    }
+    let url = format!("{}/v1/messages", p.base_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .header("x-api-key", &p.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
+    let value = read_json_native(resp).await?;
+    let mut content = String::new();
+    let mut calls = Vec::new();
+    if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
+        for b in arr {
+            match b.get("type").and_then(|v| v.as_str()) {
+                Some("text") => {
+                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                        content.push_str(t);
+                    }
+                }
+                Some("tool_use") => {
+                    let name = b
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !name.is_empty() {
+                        calls.push(NativeToolCall {
+                            id: b
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            name,
+                            args: b.get("input").cloned().unwrap_or(serde_json::json!({})),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(NativeRound { content, calls })
+}
+
+async fn native_round_gemini(
+    client: &reqwest::Client,
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+) -> Result<NativeRound, NativeErr> {
+    let (system_txt, mut contents) = gemini_contents(convo, images);
+    for ex in exchanges {
+        // model：functionCall 部分
+        let model_parts: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({"functionCall": {"name": c.name, "args": c.args}})
+            })
+            .collect();
+        if !model_parts.is_empty() {
+            contents.push(serde_json::json!({"role": "model", "parts": model_parts}));
+        }
+        // user：functionResponse 部分（Gemini v1beta 按名字对应，无 id）
+        let user_parts: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .zip(ex.results.iter())
+            .map(|(c, r)| {
+                serde_json::json!({
+                    "functionResponse": {
+                        "name": c.name,
+                        "response": {"ok": r.ok, "result": r.value},
+                    },
+                })
+            })
+            .collect();
+        if !user_parts.is_empty() {
+            contents.push(serde_json::json!({"role": "user", "parts": user_parts}));
+        }
+    }
+    let decls: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d["name"], "description": d["description"], "parameters": d["parameters"],
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "contents": contents,
+        "tools": [{"functionDeclarations": decls}],
+    });
+    apply_params("gemini", &mut body, params);
+    if !system_txt.is_empty() {
+        body["systemInstruction"] =
+            serde_json::json!({"parts": [{"text": system_txt}]});
+    }
+    let url = format!(
+        "{}/v1beta/models/{}:generateContent",
+        p.base_url.trim_end_matches('/'),
+        p.model
+    );
+    let resp = client
+        .post(&url)
+        .header("x-goog-api-key", &p.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
+    let value = read_json_native(resp).await?;
+    let mut content = String::new();
+    let mut calls = Vec::new();
+    if let Some(parts) = value
+        .pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+    {
+        for part in parts {
+            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                content.push_str(t);
+            }
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !name.is_empty() {
+                    calls.push(NativeToolCall {
+                        id: format!("gemini-{}", calls.len()),
+                        name,
+                        args: fc.get("args").cloned().unwrap_or(serde_json::json!({})),
+                    });
+                }
+            }
+        }
+    }
+    Ok(NativeRound { content, calls })
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex as StdMutex;
+
+    /// 极简 mock AI 服务器：按入队顺序逐请求回 (状态码, JSON体)，并把每次收到的请求体记录下来
+    async fn spawn_mock_ai(responses: Vec<(u16, String)>) -> (String, Arc<StdMutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let queue = Arc::new(StdMutex::new(responses));
+        let bodies: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let bodies_cloned = bodies.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let queue = queue.clone();
+                let bodies = bodies_cloned.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = sock.read(&mut chunk).await else { return };
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p + 4;
+                        }
+                        if buf.len() > 1 << 20 { return; }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let clen: usize = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + clen {
+                        let Ok(n) = sock.read(&mut chunk).await else { break };
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    bodies.lock().unwrap().push(String::from_utf8_lossy(&buf[head_end..]).to_string());
+                    let (status, resp_body) = {
+                        let mut q = queue.lock().unwrap();
+                        if q.is_empty() { (500, "{}".into()) } else { q.remove(0) }
+                    };
+                    let reason = match status { 200 => "OK", 400 => "Bad Request", _ => "Error" };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), bodies)
+    }
+
+    fn test_provider(protocol: &str, base_url: &str) -> Provider {
+        Provider {
+            id: "t".into(),
+            name: "测试".into(),
+            protocol: protocol.into(),
+            base_url: base_url.into(),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            active: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_openai_round() {
+        // 第一轮：返回 tool_calls；第二轮：返回最终文本
+        let (url, bodies) = spawn_mock_ai(vec![
+            (
+                200,
+                json!({"choices":[{"message":{"content":"我来算一下","tool_calls":[
+                    {"id":"call-1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"echo hi\"}"}},
+                    {"id":"call-2","type":"function","function":{"name":"add","arguments":"{\"a\":1,\"b\":2}"}}
+                ]}}]}).to_string(),
+            ),
+            (200, json!({"choices":[{"message":{"content":"答案是 3"}}]}).to_string()),
+        ])
+        .await;
+        let p = test_provider("openai", &url);
+        let client = reqwest::Client::new();
+        let convo = vec![ChatMessage::system("sys".to_string()), ChatMessage::user("算 1+2".to_string())];
+
+        let r1 = native_round_openai(&client, &p, &convo, &[], &[], &[], &AiConfig::default()).await.unwrap();
+        assert_eq!(r1.calls.len(), 2);
+        assert_eq!(r1.calls[0].name, "shell");
+        assert_eq!(r1.calls[0].args["command"], "echo hi");
+        assert_eq!(r1.calls[1].args["a"], 1);
+
+        // 第二轮：带上工具交换 → 请求里应出现 assistant(tool_calls) 与 role:"tool" 消息
+        let ex = ToolExchange {
+            calls: r1.calls.clone(),
+            results: vec![
+                ToolResult { ok: true, value: json!("hi") },
+                ToolResult { ok: true, value: json!({"sum": 3}) },
+            ],
+        };
+        let r2 = native_round_openai(&client, &p, &convo, &[], &[ex], &[], &AiConfig::default()).await.unwrap();
+        assert_eq!(r2.content, "答案是 3");
+
+        let sent = bodies.lock().unwrap();
+        let req1: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(req1["tool_choice"], "auto");
+        let req2: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        let msgs = req2["messages"].as_array().unwrap();
+        let tool1 = msgs.iter().find(|m| m["role"] == "tool" && m["tool_call_id"] == "call-1").expect("缺少 call-1 的 tool 消息");
+        assert_eq!(tool1["content"], "\"hi\"");
+        let tool2 = msgs.iter().find(|m| m["role"] == "tool" && m["tool_call_id"] == "call-2").expect("缺少 call-2 的 tool 消息");
+        assert_eq!(tool2["content"], "{\"sum\":3}");
+        let asst = msgs.iter().find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some()).expect("缺少 assistant tool_calls");
+        assert_eq!(asst["tool_calls"][0]["id"], "call-1");
+    }
+
+    #[tokio::test]
+    async fn test_native_claude_round() {
+        let (url, bodies) = spawn_mock_ai(vec![(
+            200,
+            json!({"content":[
+                {"type":"text","text":"我用工具查一下"},
+                {"type":"tool_use","id":"tu_1","name":"shell","input":{"command":"ls"}}
+            ]}).to_string(),
+        )])
+        .await;
+        let p = test_provider("claude", &url);
+        let client = reqwest::Client::new();
+        let defs = vec![json!({"name":"shell","description":"执行命令","parameters":{"type":"object","properties":{}}})];
+        let r = native_round_claude(&client, &p, &[ChatMessage::user("列目录".to_string())], &[], &[], &defs, &AiConfig::default()).await.unwrap();
+        assert_eq!(r.content, "我用工具查一下");
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].id, "tu_1");
+        assert_eq!(r.calls[0].args["command"], "ls");
+
+        let req: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(req["tools"][0]["name"], "shell");
+        assert!(req["tools"][0].get("input_schema").is_some(), "claude 工具应为 input_schema");
+        assert_eq!(req["tool_choice"]["type"], "auto");
+    }
+
+    #[tokio::test]
+    async fn test_native_gemini_round() {
+        let (url, bodies) = spawn_mock_ai(vec![(
+            200,
+            json!({"candidates":[{"content":{"parts":[
+                {"text":"好的"},
+                {"functionCall":{"name":"add","args":{"a":20,"b":22}}}
+            ]}}]}).to_string(),
+        )])
+        .await;
+        let p = test_provider("gemini", &url);
+        let client = reqwest::Client::new();
+        let defs = vec![json!({"name":"add","description":"加法","parameters":{"type":"object","properties":{}}})];
+        let r = native_round_gemini(&client, &p, &[ChatMessage::user("算 20+22".to_string())], &[], &[], &defs, &AiConfig::default()).await.unwrap();
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].name, "add");
+        assert_eq!(r.calls[0].args["b"], 22);
+
+        let req: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        assert!(req["tools"][0].get("functionDeclarations").is_some(), "gemini 工具应为 functionDeclarations");
+    }
+
+    #[tokio::test]
+    async fn test_native_error_classification() {
+        // 4xx 且报错提到 tools/function → Unsupported（触发降级）
+        let (url, _) = spawn_mock_ai(vec![(
+            400,
+            json!({"error":{"message":"'tools' is not supported by this model"}}).to_string(),
+        )])
+        .await;
+        let p = test_provider("openai", &url);
+        let client = reqwest::Client::new();
+        let defs = vec![json!({"name":"shell","description":"","parameters":{}})];
+        let r = native_round_openai(&client, &p, &[ChatMessage::user("hi".to_string())], &[], &[], &defs, &AiConfig::default()).await;
+        assert!(matches!(r, Err(NativeErr::Unsupported(_))), "应识别为不支持原生工具: {r:?}");
+
+        // 401 鉴权错误 → Other（不应误降级）
+        let (url2, _) = spawn_mock_ai(vec![(401, json!({"error":{"message":"invalid api key"}}).to_string())]).await;
+        let p2 = test_provider("openai", &url2);
+        let r2 = native_round_openai(&client, &p2, &[ChatMessage::user("hi".to_string())], &[], &[], &defs, &AiConfig::default()).await;
+        assert!(matches!(r2, Err(NativeErr::Other(_))), "鉴权错误不应判定为不支持: {r2:?}");
+    }
 }
