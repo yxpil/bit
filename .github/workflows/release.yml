@@ -52,6 +52,63 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage \
             --clobber --repo "$GITHUB_REPOSITORY"
 
+  linux-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 手动补发时检出 main（包含最新兼容性修复），tag 推送时检出对应 tag
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 安装 Linux 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: 构建
+        run: |
+          npm ci
+          npx tauri build
+      - name: 上传到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" \
+            src-tauri/target/release/bundle/deb/*.deb \
+            src-tauri/target/release/bundle/rpm/*.rpm \
+            src-tauri/target/release/bundle/appimage/*.AppImage \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+  windows-arm:
+    # Windows ARM64（Surface / 骁龙 X 笔记本）：MSI 的 WiX 工具链对 ARM64 支持差，用 NSIS
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - name: 构建
+        run: |
+          npm ci
+          npx tauri build --target aarch64-pc-windows-msvc --bundles nsis
+      - name: 上传到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" \
+            src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
   macos:
     if: github.event_name == 'push' || inputs.include_macos
     runs-on: macos-14
