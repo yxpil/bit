@@ -49,6 +49,7 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb \
             src-tauri/target/release/bundle/rpm/*.rpm \
             src-tauri/target/release/bundle/appimage/*.AppImage \
+            src-tauri/target/release/bundle/pacman/*.pacman \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   macos:
