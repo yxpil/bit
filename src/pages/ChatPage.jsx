@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api } from "../api.js";
 import { useLang } from "../i18n.js";
 import {
@@ -70,36 +69,29 @@ export default function ChatPage({ onStats, visible }) {
   }, []);
 
   // 拖拽文件 / 文件夹到窗口：插入链接到输入框
+  // 注意：拖拽事件由 Tauri 发在 Webview 目标上，用全局 listen（Any 目标）确保能收到，
+  // Window.onDragDropEvent 的目标过滤会导致收不到事件
   const [dragOver, setDragOver] = useState(false);
   useEffect(() => {
-    let disposed = false;
-    let unlisten = null;
-    getCurrentWindow()
-      .onDragDropEvent((ev) => {
-        const p = ev.payload;
-        if (p.type === "enter" || p.type === "over") {
-          setDragOver(true);
-        } else if (p.type === "leave" || p.type === "cancel") {
-          setDragOver(false);
-        } else if (p.type === "drop") {
-          setDragOver(false);
-          const links = (p.paths || []).map((path) => {
-            const clean = path.replace(/[\\/]+$/, "");
-            const name = clean.split(/[\\/]/).pop() || path;
-            // 尖括号包裹：路径含空格也不会破坏 markdown 链接
-            return `[${name}](<file:///${clean.replace(/\\/g, "/")}>)`;
-          });
-          if (links.length) setInput((v) => (v ? `${v}\n` : "") + links.join("\n"));
-        }
-      })
-      .then((f) => {
-        if (disposed) f();
-        else unlisten = f;
+    const onDrop = (e) => {
+      setDragOver(false);
+      const p = e.payload || {};
+      const paths = p.paths || [];
+      const links = paths.map((path) => {
+        const clean = path.replace(/[\\/]+$/, "");
+        const name = clean.split(/[\\/]/).pop() || path;
+        // 尖括号包裹：路径含空格也不会破坏 markdown 链接
+        return `[${name}](<file:///${clean.replace(/\\/g, "/")}>)`;
       });
-    return () => {
-      disposed = true;
-      unlisten?.();
+      if (links.length) setInput((v) => (v ? `${v}\n` : "") + links.join("\n"));
     };
+    const uns = [
+      listen("tauri://drag-enter", () => setDragOver(true)),
+      listen("tauri://drag-over", () => setDragOver(true)),
+      listen("tauri://drag-leave", () => setDragOver(false)),
+      listen("tauri://drag-drop", onDrop),
+    ];
+    return () => uns.forEach((u) => u.then((f) => f()));
   }, []);
 
   // 派生：当前会话状态与全局运行数
