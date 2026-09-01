@@ -28,6 +28,28 @@ pub fn interrupted(ctx: &Arc<Ctx>, target: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 中断等待：每 150ms 轮询一次标志。配合 tokio::select! 让长请求（原生模式整段生成）
+/// 和长工具执行随时可被 chat_interrupt 打断，前端无需等请求自然结束
+async fn wait_interrupt(ctx: &Arc<Ctx>, target: &str) {
+    loop {
+        if interrupted(ctx, target) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/// 历史窗口：总量超限时按 8 条为步长对齐回退（而非每轮滑动一条），
+/// 使相邻多轮请求的消息前缀逐字节一致 → 命中各家提示词缓存（openai/gemini 自动、deepseek/kimi 等兼容端同样有效）
+fn history_window<'a>(msgs: &'a [ChatMessage]) -> &'a [ChatMessage] {
+    let total = msgs.len();
+    if total <= 24 {
+        return msgs;
+    }
+    let skip = ((total - 24).div_ceil(8)) * 8;
+    &msgs[skip..]
+}
+
 /// 工具审批：
 /// - ask：每次询问用户（全局事件 tool-approval，前端弹卡片，等待应答，120 秒超时自动拒绝）
 /// - auto：记忆/技能/目标/待办沉淀与只读类查询自动通过，其余询问
@@ -332,7 +354,7 @@ pub async fn chat_turn(
         };
         let mut v = vec![ChatMessage::system(sys)];
         // 只取最近若干条，且剥离 tool_calls（模型请求只需 role/content）
-        for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
+        for m in history_window(&sess.messages) {
             v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
         }
         v
@@ -352,7 +374,16 @@ pub async fn chat_turn(
 
         // 拿到本轮回复：原生 function calling 优先，未探测过/已支持时尝试；失败降级文本约定
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
-            match ai::chat_native_round(ctx, &convo, round_images, &native_exchanges).await {
+            // select! 让整段生成的原生请求也能被中断即时打断（150ms 内）
+            let attempt = tokio::select! {
+                r = ai::chat_native_round(ctx, &convo, round_images, &native_exchanges) => r,
+                _ = wait_interrupt(ctx, &target) => Err(ai::NativeErr::Other(String::new())),
+            };
+            if interrupted(ctx, &target) {
+                clear_interrupt(ctx, &target);
+                return Err("对话已中断".into());
+            }
+            match attempt {
                 Ok(r) => {
                     ctx.native_probe.lock().unwrap().insert(target.clone(), true);
                     // 结构化调用为空时兜底解析文本约定（有的模型在原生模式下仍爱手写 TOOL: 行）
@@ -397,11 +428,19 @@ pub async fn chat_turn(
                     clear_interrupt(ctx, &target);
                     return Err("对话已中断".into());
                 }
+                // select!：长工具（编译/大脚本）同样可被中断即时打断
                 let outcome = if call.name.is_empty() {
                     Err("缺少 tool 字段".to_string())
                 } else {
-                    execute_tool_call(ctx, &call.name, &call.args, Some(&target)).await
+                    tokio::select! {
+                        r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
+                        _ = wait_interrupt(ctx, &target) => Err(String::new()),
+                    }
                 };
+                if interrupted(ctx, &target) {
+                    clear_interrupt(ctx, &target);
+                    return Err("对话已中断".into());
+                }
                 records.push(crate::ai::ToolCallRecord {
                     tool: call.name.clone(),
                     params: call.args.clone(),
@@ -570,7 +609,7 @@ pub async fn chat_turn_stream(
             ai::system_prompt(ctx, Some(&target))
         };
         let mut v = vec![ChatMessage::system(sys)];
-        for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
+        for m in history_window(&sess.messages) {
             v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
         }
         v
@@ -595,7 +634,18 @@ pub async fn chat_turn_stream(
 
         // 拿到本轮回复：原生 function calling 优先，失败降级文本约定
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
-            match ai::chat_native_round(ctx, &convo, round_images, &native_exchanges).await {
+            // select!：整段生成的原生请求同样可被中断即时打断
+            let attempt = tokio::select! {
+                r = ai::chat_native_round(ctx, &convo, round_images, &native_exchanges) => r,
+                _ = wait_interrupt(ctx, &target) => Err(ai::NativeErr::Other(String::new())),
+            };
+            if interrupted(ctx, &target) {
+                clear_interrupt(ctx, &target);
+                let e = "对话已中断".to_string();
+                emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
+                return Err(e);
+            }
+            match attempt {
                 Ok(r) => {
                     ctx.native_probe.lock().unwrap().insert(target.clone(), true);
                     let calls = if !r.calls.is_empty() {
@@ -626,7 +676,7 @@ pub async fn chat_turn_stream(
                 }
             }
         } else {
-            // 流式过程中若收到中断请求：停止推送增量，等本轮请求返回后终止
+            // 流式过程中若收到中断请求：回调返回 false 立即断开 SSE 读取（不再等流自然结束）
             let stream_cancelled = Arc::new(AtomicBool::new(false));
             let result = {
                 let emit_ref = &emit;
@@ -635,9 +685,10 @@ pub async fn chat_turn_stream(
                 ai::chat_stream_with_images(ctx, &convo, round_images, move |tok| {
                     if iflag2.load(Ordering::Relaxed) {
                         sc.store(true, Ordering::Relaxed);
-                        return;
+                        return false;
                     }
                     emit_ref(json!({ "type": "delta", "text": tok }));
+                    true
                 })
                 .await
             };
@@ -676,11 +727,21 @@ pub async fn chat_turn_stream(
                     emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
                     return Err(e);
                 }
+                // select!：长工具执行同样可被中断即时打断
                 let outcome = if call.name.is_empty() {
                     Err("缺少 tool 字段".to_string())
                 } else {
-                    execute_tool_call(ctx, &call.name, &call.args, Some(&target)).await
+                    tokio::select! {
+                        r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
+                        _ = wait_interrupt(ctx, &target) => Err(String::new()),
+                    }
                 };
+                if interrupted(ctx, &target) {
+                    clear_interrupt(ctx, &target);
+                    let e = "对话已中断".to_string();
+                    emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
+                    return Err(e);
+                }
                 records.push(crate::ai::ToolCallRecord {
                     tool: call.name.clone(),
                     params: call.args.clone(),

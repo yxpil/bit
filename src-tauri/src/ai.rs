@@ -186,10 +186,11 @@ pub async fn chat_with_images(
     }
 }
 
-/// 流式对话：图片（base64 data URL）仅附加到最后一条 user 消息（多模态）。
-/// 每收到一个文本增量就调用 `on_token`，最终返回完整文本。
-/// 若提供方/网络不支持流式，则退回一次性请求并把整段作为单个 token 回调。
-pub async fn chat_stream_with_images<F: FnMut(&str)>(
+/// 流式被调用方中止的哨兵错误（中断会话时立即断开 SSE 读取，不回退非流式）
+pub const STREAM_STOP: &str = "__BIT_STREAM_STOP__";
+
+/// 流式对话：on_token 回调返回 false 表示调用方要求立即停止（如会话中断）
+pub async fn chat_stream_with_images<F: FnMut(&str) -> bool>(
     ctx: &Arc<crate::state::Ctx>,
     messages: &[ChatMessage],
     images: &[String],
@@ -219,6 +220,8 @@ pub async fn chat_stream_with_images<F: FnMut(&str)>(
     };
     match res {
         Ok(full) => Ok(full),
+        // 调用方主动停止（中断）：不回退非流式，直接上抛哨兵
+        Err(e) if e == STREAM_STOP => Err(e),
         // 流式失败（部分服务不支持 SSE）时退回普通请求
         Err(_) => {
             let full = match p.protocol.as_str() {
@@ -375,7 +378,7 @@ fn gemini_contents(messages: &[ChatMessage], images: &[String]) -> (String, Vec<
 }
 
 /// OpenAI 流式：/chat/completions stream=true
-async fn stream_openai<F: FnMut(&str)>(
+async fn stream_openai<F: FnMut(&str) -> bool>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
@@ -395,6 +398,7 @@ async fn stream_openai<F: FnMut(&str)>(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let mut full = String::new();
+    let mut stopped = false;
     read_sse(resp, |data| {
         if data == "[DONE]" {
             return true;
@@ -402,12 +406,19 @@ async fn stream_openai<F: FnMut(&str)>(
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(|x| x.as_str()) {
                 full.push_str(delta);
-                on_token(delta);
+                // 回调返回 false = 调用方中止（中断会话）：停止读取 SSE
+                if !on_token(delta) {
+                    stopped = true;
+                    return true;
+                }
             }
         }
         false
     })
     .await?;
+    if stopped {
+        return Err(STREAM_STOP.into());
+    }
     if full.is_empty() {
         return Err("流式无内容".into());
     }
@@ -415,7 +426,7 @@ async fn stream_openai<F: FnMut(&str)>(
 }
 
 /// Claude 流式：/v1/messages stream=true（content_block_delta）
-async fn stream_claude<F: FnMut(&str)>(
+async fn stream_claude<F: FnMut(&str) -> bool>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
@@ -423,14 +434,13 @@ async fn stream_claude<F: FnMut(&str)>(
     params: &AiConfig,
     on_token: &mut F,
 ) -> Result<String, String> {
-    let (system_txt, msgs) = claude_messages(messages, images);
+    let (system_txt, mut msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model, "max_tokens": 4096, "messages": msgs, "stream": true
     });
     apply_params("claude", &mut body, params);
-    if !system_txt.is_empty() {
-        body["system"] = serde_json::json!(system_txt);
-    }
+    claude_apply_cache(&mut body, &system_txt, &mut msgs);
+    body["messages"] = serde_json::json!(msgs);
     let url = format!("{}/v1/messages", p.base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -441,13 +451,17 @@ async fn stream_claude<F: FnMut(&str)>(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let mut full = String::new();
+    let mut stopped = false;
     read_sse(resp, |data| {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
             if t == "content_block_delta" {
                 if let Some(delta) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
                     full.push_str(delta);
-                    on_token(delta);
+                    if !on_token(delta) {
+                        stopped = true;
+                        return true;
+                    }
                 }
             } else if t == "message_stop" {
                 return true;
@@ -456,6 +470,9 @@ async fn stream_claude<F: FnMut(&str)>(
         false
     })
     .await?;
+    if stopped {
+        return Err(STREAM_STOP.into());
+    }
     if full.is_empty() {
         return Err("流式无内容".into());
     }
@@ -463,7 +480,7 @@ async fn stream_claude<F: FnMut(&str)>(
 }
 
 /// Gemini 流式：streamGenerateContent?alt=sse
-async fn stream_gemini<F: FnMut(&str)>(
+async fn stream_gemini<F: FnMut(&str) -> bool>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
@@ -490,16 +507,23 @@ async fn stream_gemini<F: FnMut(&str)>(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let mut full = String::new();
+    let mut stopped = false;
     read_sse(resp, |data| {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             if let Some(delta) = v.pointer("/candidates/0/content/parts/0/text").and_then(|x| x.as_str()) {
                 full.push_str(delta);
-                on_token(delta);
+                if !on_token(delta) {
+                    stopped = true;
+                    return true;
+                }
             }
         }
         false
     })
     .await?;
+    if stopped {
+        return Err(STREAM_STOP.into());
+    }
     if full.is_empty() {
         return Err("流式无内容".into());
     }
@@ -569,7 +593,36 @@ async fn chat_gemini(
         .ok_or_else(|| "响应中缺少 text".to_string())
 }
 
-/// Anthropic Claude 原生协议：/v1/messages
+/// Claude 提示词缓存：system 与最后一条消息打 cache_control 断点。
+/// 请求前缀稳定时命中 prompt cache（省 token、显著降首字延迟）；
+/// 因此系统提示词内的动态段落（记忆/目标/待办）只在变化时才使缓存失效。
+fn claude_apply_cache(
+    body: &mut serde_json::Value,
+    system_txt: &str,
+    msgs: &mut [serde_json::Value],
+) {
+    if !system_txt.is_empty() {
+        body["system"] = serde_json::json!([
+            {"type": "text", "text": system_txt, "cache_control": {"type": "ephemeral"}}
+        ]);
+    }
+    if let Some(last) = msgs.last_mut() {
+        let content = last.get("content").cloned().unwrap_or(serde_json::json!(""));
+        last["content"] = match content {
+            serde_json::Value::String(s) => serde_json::json!([
+                {"type": "text", "text": s, "cache_control": {"type": "ephemeral"}}
+            ]),
+            serde_json::Value::Array(mut arr) => {
+                if let Some(b) = arr.last_mut() {
+                    b["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                }
+                serde_json::Value::Array(arr)
+            }
+            other => other,
+        };
+    }
+}
+
 async fn chat_claude(
     client: &reqwest::Client,
     p: &Provider,
@@ -578,16 +631,15 @@ async fn chat_claude(
     params: &AiConfig,
 ) -> Result<String, String> {
     // system 单独抽出，其余作为 messages（role: user/assistant），图片挂到最后一条 user
-    let (system_txt, msgs) = claude_messages(messages, images);
+    let (system_txt, mut msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model,
         "max_tokens": 4096,
         "messages": msgs,
     });
     apply_params("claude", &mut body, params);
-    if !system_txt.is_empty() {
-        body["system"] = serde_json::json!(system_txt);
-    }
+    claude_apply_cache(&mut body, &system_txt, &mut msgs);
+    body["messages"] = serde_json::json!(msgs);
     let url = format!("{}/v1/messages", p.base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -1064,7 +1116,6 @@ async fn native_round_claude(
 ) -> Result<NativeRound, NativeErr> {
     let (system_txt, mut msgs) = claude_messages(convo, images);
     for ex in exchanges {
-        // assistant：tool_use 块
         let blocks: Vec<serde_json::Value> = ex
             .calls
             .iter()
@@ -1109,9 +1160,8 @@ async fn native_round_claude(
         "tool_choice": {"type": "auto"},
     });
     apply_params("claude", &mut body, params);
-    if !system_txt.is_empty() {
-        body["system"] = serde_json::json!(system_txt);
-    }
+    claude_apply_cache(&mut body, &system_txt, &mut msgs);
+    body["messages"] = serde_json::json!(msgs);
     let url = format!("{}/v1/messages", p.base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -1442,5 +1492,71 @@ mod native_tests {
         let p2 = test_provider("openai", &url2);
         let r2 = native_round_openai(&client, &p2, &[ChatMessage::user("hi".to_string())], &[], &[], &defs, &AiConfig::default()).await;
         assert!(matches!(r2, Err(NativeErr::Other(_))), "鉴权错误不应判定为不支持: {r2:?}");
+    }
+
+    /// 模拟 OpenAI SSE 流式端点：把 chunks 按固定间隔分块下发（真实 chunked 传输）
+    async fn spawn_sse_server(chunks: Vec<&'static str>, delay_ms: u64) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tauri::async_runtime::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 16384];
+            let _ = sock.read(&mut buf).await; // 丢弃请求
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            for c in chunks {
+                let ev = format!("data: {}\n\n", json!({"choices":[{"delta":{"content":c}}]}));
+                let _ = sock
+                    .write_all(format!("{:x}\r\n{}\r\n", ev.len(), ev).as_bytes())
+                    .await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            let done = "data: [DONE]\n\n";
+            let _ = sock
+                .write_all(format!("{:x}\r\n{}\r\n", done.len(), done).as_bytes())
+                .await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_stream_openai_mock() {
+        // 模拟流式 API：分 4 块逐块下发 → 应按序收到 4 个增量并拼出全文
+        let url = spawn_sse_server(vec!["你", "好", "，", "世界"], 40).await;
+        let p = test_provider("openai", &url);
+        let client = reqwest::Client::new();
+        let mut tokens: Vec<String> = Vec::new();
+        let full = stream_openai(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |t| { tokens.push(t.to_string()); true },
+        )
+        .await
+        .unwrap();
+        assert_eq!(full, "你好，世界");
+        assert_eq!(tokens, vec!["你", "好", "，", "世界"]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_openai_abort() {
+        // 中断：回调在第 2 块返回 false → 立即停止读取并返回 STREAM_STOP（不等后 2 块）
+        let url = spawn_sse_server(vec!["a", "b", "c", "d"], 400).await;
+        let p = test_provider("openai", &url);
+        let client = reqwest::Client::new();
+        let start = std::time::Instant::now();
+        let mut n = 0;
+        let r = stream_openai(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |_t| { n += 1; n < 2 },
+        )
+        .await;
+        assert!(matches!(r, Err(ref e) if e == STREAM_STOP), "应为 STREAM_STOP: {r:?}");
+        assert_eq!(n, 2);
+        assert!(start.elapsed() < std::time::Duration::from_millis(1000), "中止应及时返回");
     }
 }

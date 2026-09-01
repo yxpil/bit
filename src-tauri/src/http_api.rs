@@ -510,6 +510,7 @@ async fn openai_chat_completions(
 
             let result = crate::ai::chat_stream_with_images(&ctx2, &messages, &images, |tok| {
                 send_chunk(json!({ "content": tok }), None);
+                true
             })
             .await;
 

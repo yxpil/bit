@@ -12,6 +12,21 @@ const PROTOCOLS = [
 ];
 const protoLabel = (id) => PROTOCOLS.find((p) => p.id === id)?.label || id;
 
+// 主流模型预设：点选自动填充协议 / Base URL / 模型名（OpenAI 兼容的国内外主流端全覆盖）
+const PRESETS = [
+  { name: "OpenAI GPT-4o", protocol: "openai", base: "https://api.openai.com/v1", model: "gpt-4o" },
+  { name: "DeepSeek", protocol: "openai", base: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  { name: "Kimi 月之暗面", protocol: "openai", base: "https://api.moonshot.cn/v1", model: "kimi-k2-0905-preview" },
+  { name: "通义千问 Qwen", protocol: "openai", base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-max" },
+  { name: "智谱 GLM", protocol: "openai", base: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.6" },
+  { name: "xAI Grok", protocol: "openai", base: "https://api.x.ai/v1", model: "grok-4" },
+  { name: "OpenRouter", protocol: "openai", base: "https://openrouter.ai/api/v1", model: "openrouter/auto" },
+  { name: "硅基流动", protocol: "openai", base: "https://api.siliconflow.cn/v1", model: "deepseek-ai/DeepSeek-V3" },
+  { name: "Ollama（本地）", protocol: "openai", base: "http://127.0.0.1:11434/v1", model: "qwen2.5" },
+  { name: "Google Gemini", protocol: "gemini", base: "https://generativelanguage.googleapis.com", model: "gemini-2.5-flash" },
+  { name: "Anthropic Claude", protocol: "claude", base: "https://api.anthropic.com", model: "claude-sonnet-4-5" },
+];
+
 const EMPTY = { id: null, name: "", protocol: "openai", base_url: "", api_key: "", model: "" };
 
 // AI 设置：可增删的多家提供方，用播放/暂停切换，每次仅一个激活
@@ -58,6 +73,18 @@ export default function AiSettingsPage({ onStats, stats }) {
       base_url: f.base_url && f.id ? f.base_url : proto?.base || "",
       model: f.model && f.id ? f.model : proto?.model || "",
     }));
+  };
+
+  // 选预设：一键填充协议 / Base URL / 模型 / 名称（Key 需用户自填）
+  const pickPreset = (preset) => {
+    setForm((f) => ({
+      ...f,
+      name: preset.name,
+      protocol: preset.protocol,
+      base_url: preset.base,
+      model: preset.model,
+    }));
+    setError("");
   };
 
   const submit = async (e) => {
@@ -298,6 +325,27 @@ export default function AiSettingsPage({ onStats, stats }) {
               {t("ai.cancelEdit")}
             </button>
           )}
+        </div>
+
+        {/* 主流模型预设：点选一键填充 */}
+        <div>
+          <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.preset")}</label>
+          <div className="flex flex-wrap gap-1.5 px-2">
+            {PRESETS.map((preset) => (
+              <button
+                key={preset.name}
+                type="button"
+                onClick={() => pickPreset(preset)}
+                className={`rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                  form.model === preset.model && form.base_url === preset.base
+                    ? "border-neutral-900 bg-neutral-900 text-white dark:border-white dark:bg-white dark:text-black"
+                    : "border-neutral-200 text-neutral-500 hover:border-neutral-400 hover:text-neutral-900 dark:border-neutral-700 dark:hover:border-neutral-500 dark:hover:text-white"
+                }`}
+              >
+                {preset.name}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div>
