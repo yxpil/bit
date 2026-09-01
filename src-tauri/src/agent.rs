@@ -328,13 +328,16 @@ pub async fn chat_turn(
         v
     };
 
-    for round in 0..5 {
+    // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
+    let mut round = 0usize;
+    loop {
+        round += 1;
         if interrupted(ctx, &target) {
             clear_interrupt(ctx, &target);
             return Err("对话已中断".into());
         }
         // 图片只在第一轮（真正的用户轮）随请求发送，工具反馈轮不再重复携带
-        let round_images: &[String] = if round == 0 { &images } else { &[] };
+        let round_images: &[String] = if round == 1 { &images } else { &[] };
         let reply = ai::chat_with_images(ctx, &convo, round_images).await?;
 
         match parse_tool_calls(&reply) {
@@ -416,8 +419,6 @@ pub async fn chat_turn(
             }
         }
     }
-    clear_interrupt(ctx, &target);
-    Err("工具调用轮次超出上限（5 轮）".into())
 }
 
 /// 流式版对话循环：通过 Tauri 事件 `event_name` 把增量文本 / 工具卡片 / 结束信号推给前端。
@@ -474,7 +475,10 @@ pub async fn chat_turn_stream(
         v
     };
 
-    for round in 0..5 {
+    // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
+    let mut round = 0usize;
+    loop {
+        round += 1;
         if interrupted(ctx, &target) {
             clear_interrupt(ctx, &target);
             let e = "对话已中断".to_string();
@@ -484,7 +488,7 @@ pub async fn chat_turn_stream(
         // 流式获取本轮回复，逐 token 推给前端
         emit(json!({ "type": "round_start" }));
         // 图片只在第一轮随请求发送
-        let round_images: &[String] = if round == 0 { &images } else { &[] };
+        let round_images: &[String] = if round == 1 { &images } else { &[] };
         // 流式过程中若收到中断请求：停止推送增量，等本轮请求返回后终止
         let stream_cancelled = Arc::new(AtomicBool::new(false));
         let reply = {
@@ -596,10 +600,6 @@ pub async fn chat_turn_stream(
             }
         }
     }
-    clear_interrupt(ctx, &target);
-    let err = "工具调用轮次超出上限（5 轮）".to_string();
-    emit(json!({ "type": "error", "error": err.clone() }));
-    Err(err)
 }
 
 /// 构造发给模型的完整上下文（system prompt + 最近消息 + 工具清单），对话与预览共用
