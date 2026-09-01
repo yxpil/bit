@@ -330,7 +330,6 @@ pub async fn chat_turn(
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
     let mut round = 0usize;
-    let mut auto_continues = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
@@ -393,9 +392,8 @@ pub async fn chat_turn(
                 convo.push(ChatMessage::user(feedback));
             }
             _ => {
-                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」
-                if auto_continues < MAX_AUTO_CONTINUE && looks_truncated(&reply) {
-                    auto_continues += 1;
+                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」，次数不限制
+                if looks_truncated(&reply) {
                     let visible = strip_tool_json(&strip_think_blocks(&reply));
                     if !visible.is_empty() {
                         let mut store = ctx.sessions.lock().unwrap();
@@ -501,7 +499,6 @@ pub async fn chat_turn_stream(
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
     let mut round = 0usize;
-    let mut auto_continues = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
@@ -598,9 +595,8 @@ pub async fn chat_turn_stream(
                 convo.push(ChatMessage::user(feedback));
             }
             _ => {
-                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」
-                if auto_continues < MAX_AUTO_CONTINUE && looks_truncated(&reply) {
-                    auto_continues += 1;
+                // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」，次数不限制
+                if looks_truncated(&reply) {
                     let visible = strip_tool_json(&strip_think_blocks(&reply));
                     if !visible.is_empty() {
                         let mut store = ctx.sessions.lock().unwrap();
@@ -733,9 +729,6 @@ fn strip_tool_json(reply: &str) -> String {
 fn looks_like_tool_calls(calls: &[serde_json::Value]) -> bool {
     calls.iter().all(|c| c.get("tool").and_then(|v| v.as_str()).is_some())
 }
-
-/// 自动续发上限：模型连续输出不完整回复时，最多自动替用户补发多少次「继续」
-const MAX_AUTO_CONTINUE: usize = 8;
 
 /// 去掉模型输出里混入的思考块：成对的 <think>...</think>、未闭合的 <think> 残尾、游离的 </think>
 pub fn strip_think_blocks(reply: &str) -> String {
