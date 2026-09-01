@@ -433,14 +433,43 @@ async fn builtin_invoke(
                 return Err("old_string 不能为空".into());
             }
             let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
-            let count = text.matches(old).count();
+            // 精确匹配失败时自动适配换行风格（文件 CRLF / 模型给 LF，或反过来）
+            let mut count = text.matches(old).count();
+            let mut old_eff = old.to_string();
+            let mut new_eff = new.to_string();
             if count == 0 {
-                return Err("未找到 old_string，无法替换".into());
+                let old_norm = old.replace("\r\n", "\n");
+                if old_norm != old && text.contains(&old_norm) {
+                    old_eff = old_norm;
+                    new_eff = new.replace("\r\n", "\n");
+                    count = text.matches(&old_eff).count();
+                } else if text.contains("\r\n") && old.contains('\n') {
+                    let old_crlf = old_norm.replace('\n', "\r\n");
+                    let c2 = text.matches(&old_crlf).count();
+                    if c2 > 0 {
+                        old_eff = old_crlf;
+                        new_eff = new.replace("\r\n", "\n").replace('\n', "\r\n");
+                        count = c2;
+                    }
+                }
+            }
+            if count == 0 {
+                // 给模型有用的线索：old_string 首行是否在文件中存在
+                let mut hint = String::new();
+                if let Some(first) = old.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    if let Some(n) = text.lines().enumerate().find(|(_, l)| l.trim() == first).map(|(i, _)| i + 1) {
+                        hint = format!("；文件第 {n} 行附近有首行相同的内容，差异可能在空格/缩进或后续行");
+                    }
+                }
+                return Err(format!(
+                    "未找到 old_string，无法替换{hint}。请先 read_file 查看该文件的当前内容，确保 old_string 与文件逐字符一致（含空格与换行），再重试或改用更大的上下文片段",
+                ));
             }
             if count > 1 && !replace_all {
                 return Err(format!("old_string 匹配到 {count} 处，请提供更精确的上下文，或设 replace_all=true"));
             }
-            let updated = if replace_all { text.replace(old, new) } else { text.replacen(old, new, 1) };
+            let updated =
+                if replace_all { text.replace(&old_eff, &new_eff) } else { text.replacen(&old_eff, &new_eff, 1) };
             std::fs::write(path, &updated).map_err(|e| format!("写回失败: {e}"))?;
             Ok(serde_json::json!({ "path": path, "replaced": if replace_all { count } else { 1 } }))
         }
