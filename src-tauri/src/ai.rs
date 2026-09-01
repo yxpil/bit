@@ -701,11 +701,12 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>) -> String {
         当你需要动手做事（执行命令、读写文件、制定计划、扩展自己、沉淀/查找技能）时，\
         在回答里【单独一行】输出一个 JSON 数组，数组每个元素形如 {{\"tool\":\"工具名\",\"params\":{{...}}}}。\n\
         这一行必须是纯 JSON，前后不要加解释文字、不要用代码块包裹；系统会执行后把结果回给你，你再据此继续。\n\
-        可一次排多个工具（数组里放多个元素，按顺序执行）。不需要动手时正常用自然语言回答即可。\n\
+        严禁自创标记语法（如 <xxx_function_call>）、严禁输出不带方括号的裸对象、严禁把多个调用拆成多行——\
+        多个调用必须放在同一个数组里：[{{...}},{{...}}]。不需要动手时正常用自然语言回答即可。\n\
         单个工具调用示例：[{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]\n\
         \n\
         ## 六个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
-        - 工具1 · shell：执行命令行。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
+        - 工具1 · shell：执行命令行（Windows PowerShell 语法，路径用 C:\\ 形式）。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
         - 工具2 · write_file：写入/覆盖文件（文档编辑）。参数 {{\"path\":string,\"content\":string}}\n\
         - 工具3 · plan：制定计划，登记目标与分步待办。参数 {{\"goal\":string,\"steps\":[string]}}\n\
         - 工具4 · edit：增量补丁改文件，精确替换。参数 {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(可选)}}\n\

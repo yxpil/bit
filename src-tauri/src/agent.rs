@@ -483,7 +483,7 @@ pub async fn chat_turn_stream(
             }
         };
 
-        match crate::autopilot::parse_json_array(&reply) {
+        match parse_tool_calls(&reply) {
             Some(calls) if !calls.is_empty() && looks_like_tool_calls(&calls) => {
                 let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
                 for call in calls.iter().take(6) {
@@ -593,42 +593,122 @@ pub fn build_context(
     Ok((v, ai::tools_manifest(ctx)))
 }
 
-/// 从回复里去掉裸 JSON 工具调用块，只保留 AI 的自然语言说明
+/// 从回复里去掉工具调用 JSON（裸数组 / ```json 围栏 / 散落的单对象）与
+/// <xxx_function_call> 之类自创标记，只保留 AI 的自然语言说明
 fn strip_tool_json(reply: &str) -> String {
     let trimmed = reply.trim();
     // 若整段就是 JSON 数组，返回空（工具卡片已展示内容）
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         return String::new();
     }
-    // 否则去掉其中的 ```json ... ``` 或裸 [ ... ] 片段
-    let mut out = String::new();
-    let mut depth = 0i32;
-    let mut in_fence = false;
-    for line in reply.lines() {
+    // 先按字节区间删除散落的 {"tool":...} 对象
+    let spans = find_tool_objects(reply);
+    let base = if spans.is_empty() {
+        reply.to_string()
+    } else {
+        let mut out = String::new();
+        let mut last = 0;
+        for (_, s, e) in &spans {
+            out.push_str(&reply[last..*s]);
+            last = *e;
+        }
+        out.push_str(&reply[last..]);
+        out
+    };
+    // 逐行清理：代码围栏残行、自创标记残行、多余空行
+    let mut lines: Vec<&str> = Vec::new();
+    for line in base.lines() {
         let l = line.trim();
         if l.starts_with("```") {
-            in_fence = !in_fence;
             continue;
         }
-        if in_fence {
+        if l.starts_with('<') && (l.contains("function_call") || l.contains("tool_call")) {
             continue;
         }
-        if l.starts_with('[') {
-            depth += 1;
+        if l.is_empty() && lines.last().map(|p: &&str| p.trim().is_empty()).unwrap_or(true) {
+            continue; // 跳过行首与连续空行
         }
-        if depth > 0 {
-            if l.ends_with(']') {
-                depth -= 1;
-            }
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
+        lines.push(line);
     }
-    out.trim().to_string()
+    while lines.last().map(|p: &&str| p.trim().is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n").trim().to_string()
 }
 
 /// 只有元素都带 tool 字段才视为工具调用，避免把普通数组输出误判
 fn looks_like_tool_calls(calls: &[serde_json::Value]) -> bool {
     calls.iter().all(|c| c.get("tool").and_then(|v| v.as_str()).is_some())
+}
+
+/// 扫描文本中所有平衡的 {...} JSON 对象，返回（解析值, 起始字节, 结束字节）。
+/// 只保留含字符串字段 "tool" 的对象——部分模型不按数组协议输出，而是每行一个
+/// 裸对象、甚至自创 <xxx_function_call> 之类的标记前缀
+fn find_tool_objects(reply: &str) -> Vec<(serde_json::Value, usize, usize)> {
+    let bytes = reply.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut j = i;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    b'"' => in_str = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        if j >= bytes.len() || depth != 0 {
+            break; // 剩余部分不平衡，放弃
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply[i..=j]) {
+            if v.get("tool").and_then(|t| t.as_str()).is_some() {
+                out.push((v, i, j + 1));
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 解析回复中的工具调用：标准 JSON 数组协议优先；
+/// 兼容模型散落的单个 {"tool":...} 对象（可带 <xxx_function_call> 自创标记）
+fn parse_tool_calls(reply: &str) -> Option<Vec<serde_json::Value>> {
+    if let Some(calls) = crate::autopilot::parse_json_array(reply) {
+        if !calls.is_empty() && looks_like_tool_calls(&calls) {
+            return Some(calls);
+        }
+    }
+    let objs = find_tool_objects(reply);
+    if objs.is_empty() {
+        None
+    } else {
+        Some(objs.into_iter().map(|(v, _, _)| v).collect())
+    }
 }
