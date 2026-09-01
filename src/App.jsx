@@ -60,119 +60,88 @@ export default function App() {
   const current = PAGES[tab] || PAGES[PRIMARY];
   const Page = current.page;
 
-  // 单个导航项渲染
+  // 图标导航项：只显示图标（悬停显示名称），把宽度留给内容区
   const NavItem = ({ k }) => {
     const { label, icon: Icon } = PAGES[k];
     const active = tab === k;
     return (
       <button
         onClick={() => setTab(k)}
-        className={`flex w-full items-center gap-3 rounded-full px-3.5 py-2 text-[13px] font-medium transition-all duration-200 ${
+        title={t(label)}
+        className={`flex w-full items-center justify-center rounded-xl py-2.5 transition-all duration-200 ${
           active
             ? "bg-neutral-900 text-white shadow-sm dark:bg-white dark:text-black"
             : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/5 dark:hover:text-white"
         }`}
       >
-        <Icon size={16} />
-        {t(label)}
+        <Icon size={18} />
       </button>
     );
   };
+
+  // 栏底圆形小按钮（主题 / 语言 / 关于）
+  const RailBtn = ({ onClick, title, children }) => (
+    <button
+      onClick={onClick}
+      title={title}
+      className="flex w-full items-center justify-center rounded-xl py-2 text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/5 dark:hover:text-white"
+    >
+      {children}
+    </button>
+  );
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-neutral-100 text-neutral-900 dark:bg-black dark:text-neutral-100">
       <TitleBar />
 
       <div className="flex min-h-0 flex-1">
-        {/* 侧边栏：毛玻璃 */}
-        <aside className="flex w-56 shrink-0 flex-col border-r border-neutral-200/70 bg-white/60 backdrop-blur-md dark:border-neutral-800/70 dark:bg-black/40">
-          {/* 品牌区 */}
-          <div className="group flex items-center gap-2.5 border-b border-neutral-200/70 px-4 py-4 dark:border-neutral-800/70">
-            <div className="flex h-9 w-9 items-center justify-center rounded-full bg-neutral-900 shadow-md transition-transform duration-300 ease-out group-hover:-rotate-6 group-hover:scale-105 dark:bg-white">
-              <img
-                src={logoUrl}
-                alt="BIT"
-                className="h-5 w-5 rounded-full bg-white dark:bg-black"
-              />
-            </div>
-            <div className="min-w-0 leading-tight">
-              <h1 className="text-base font-bold tracking-tight">BIT</h1>
-              <p className="truncate text-[10px] text-neutral-400">{t("app.tagline")}</p>
-            </div>
-          </div>
+        {/* 图标侧栏：只有一列图标，主体空间留给对话 */}
+        <aside className="flex w-14 shrink-0 flex-col items-center gap-1 border-r border-neutral-200/70 bg-white/60 py-3 backdrop-blur-md dark:border-neutral-800/70 dark:bg-black/40">
+          {/* 品牌 */}
+          <button
+            onClick={() => setTab(PRIMARY)}
+            title="BIT"
+            className="mb-2 flex h-9 w-9 items-center justify-center rounded-full bg-neutral-900 shadow-md transition-transform duration-300 ease-out hover:-rotate-6 hover:scale-105 dark:bg-white"
+          >
+            <img src={logoUrl} alt="BIT" className="h-5 w-5 rounded-full bg-white dark:bg-black" />
+          </button>
 
           {/* 导航：对话主功能置顶，其余分组 */}
-          <nav className="flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-3">
+          <nav className="flex w-full flex-1 flex-col gap-1 px-1.5">
             <NavItem k={PRIMARY} />
-
-            <p className="mt-3 px-3.5 pb-1 text-[10px] font-semibold uppercase tracking-wider text-neutral-400">
-              {t("nav.capabilities")}
-            </p>
+            <div className="mx-auto my-2 h-px w-6 bg-neutral-200 dark:bg-neutral-800" />
             {SECONDARY.map((k) => (
               <NavItem key={k} k={k} />
             ))}
           </nav>
+
+          {/* 栏底：主题 / 语言 / 关于 */}
+          <div className="flex w-full flex-col gap-0.5 px-1.5">
+            <RailBtn onClick={toggle} title={t(isDark ? "app.switchLight" : "app.switchDark")}>
+              {isDark ? <IconSun size={17} /> : <IconMoon size={17} />}
+            </RailBtn>
+            <RailBtn onClick={toggleLang} title={lang === "zh" ? "切换到 English" : "Switch to 中文"}>
+              <span className="text-xs font-semibold">{lang === "zh" ? "EN" : "中"}</span>
+            </RailBtn>
+            <RailBtn onClick={() => setShowAbout(true)} title={t("app.about")}>
+              <IconInfo size={17} />
+            </RailBtn>
+          </div>
         </aside>
 
-        {/* 右侧：顶栏 + 主内容 */}
-        <div className="flex min-w-0 flex-1 flex-col">
-          {/* 顶栏：面包屑 + 右上角图标按钮组 */}
-          <header className="flex h-14 shrink-0 items-center gap-4 border-b border-neutral-200/70 bg-white/60 px-6 backdrop-blur-md dark:border-neutral-800/70 dark:bg-black/40">
-            <div className="flex min-w-0 flex-1 items-center gap-2">
-              <span className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
-                BIT
-              </span>
-              <span className="text-neutral-300 dark:text-neutral-700">/</span>
-              <span className="truncate text-sm text-neutral-500 dark:text-neutral-400">
-                {t(current.label)}
-              </span>
+        {/* 主内容：所有页面常驻挂载（display 切换），保证对话页的
+            执行状态 / 等待队列 / 审批监听在切换页面后不丢失 */}
+        <main className="min-h-0 flex-1 overflow-hidden">
+          {Object.entries(PAGES).map(([k, { page: Page }]) => (
+            <div
+              key={k}
+              className={`h-full overflow-auto ${k === PRIMARY ? "p-3" : "p-6"}`}
+              style={{ display: tab === k ? "block" : "none" }}
+            >
+              <Page onStats={refresh} stats={stats} visible={tab === k} />
             </div>
-            <div className="flex items-center gap-1.5">
-              <button
-                onClick={toggle}
-                title={t(isDark ? "app.switchLight" : "app.switchDark")}
-                className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
-              >
-                {isDark ? <IconSun size={17} /> : <IconMoon size={17} />}
-              </button>
-              <button
-                onClick={() => setTab("ai")}
-                title={t("nav.ai")}
-                className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
-              >
-                <IconSettings size={17} />
-              </button>
-              <button
-                onClick={() => setShowAbout(true)}
-                title={t("app.about")}
-                className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
-              >
-                <IconInfo size={17} />
-              </button>
-              <button
-                onClick={toggleLang}
-                title={lang === "zh" ? "切换到 English" : "Switch to 中文"}
-                className="rounded-full p-2 text-neutral-600 transition-colors hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-900"
-              >
-                <span className="text-xs font-semibold">{lang === "zh" ? "EN" : "中"}</span>
-              </button>
-            </div>
-          </header>
-
-          {/* 主内容：所有页面常驻挂载（display 切换），保证对话页的
-              执行状态 / 等待队列 / 审批监听在切换页面后不丢失 */}
-          <main className="min-h-0 flex-1 overflow-hidden">
-            {Object.entries(PAGES).map(([k, { page: Page }]) => (
-              <div
-                key={k}
-                className="h-full overflow-auto p-6"
-                style={{ display: tab === k ? "block" : "none" }}
-              >
-                <Page onStats={refresh} stats={stats} visible={tab === k} />
-              </div>
-            ))}
-          </main>
-        </div>
+          ))}
+        </main>
       </div>
 
       {/* 关于弹窗 */}

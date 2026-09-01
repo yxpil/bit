@@ -8,7 +8,6 @@ import {
   IconPlus,
   IconEdit,
   IconChat,
-  IconImage,
   IconFile,
   IconLink,
   IconX,
@@ -44,6 +43,16 @@ export default function ChatPage({ onStats, visible }) {
   const [urlParse, setUrlParse] = useState(true); // true=解析网址抓正文；false=仅作为文本插入
   const imgInput = useRef(null);
   const docInput = useRef(null);
+  const inputRef = useRef(null); // 输入框自动增高用
+  const [attachMenu, setAttachMenu] = useState(false); // 附件 + 菜单（图片/文档/网址）
+
+  // 输入框自动增高：随内容增长，超过 160px 后内部滚动
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  }, [input]);
 
   // 等待发送队列：会话执行中提交的新消息先排队，任务结束后自动按顺序发送
   const [queues, setQueues] = useState({}); // {sid: [{bubble, composed, imgData}]}
@@ -511,7 +520,7 @@ export default function ChatPage({ onStats, visible }) {
       )}
       {/* 会话侧栏 */}
       <div className="flex w-52 shrink-0 flex-col gap-2">
-        <button onClick={newSession} className="pill pill-hover w-full justify-center">
+        <button onClick={newSession} className="pill pill-hover w-full justify-center py-1.5 text-[13px]">
           <IconPlus size={15} />
           {t("chat.newChat")}
         </button>
@@ -931,38 +940,58 @@ export default function ChatPage({ onStats, visible }) {
                 </div>
               )}
             </div>
-            {/* 附件工具栏 */}
-            <button
-              onClick={() => imgInput.current?.click()}
-              disabled={busy || !activeId}
-              title={t("chat.uploadImages")}
-              className="shrink-0 rounded-full p-2 text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-white/10 dark:hover:text-white"
-            >
-              <IconImage size={18} />
-            </button>
-            <button
-              onClick={() => docInput.current?.click()}
-              disabled={busy || !activeId}
-              title={t("chat.uploadDocs")}
-              className="shrink-0 rounded-full p-2 text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 disabled:opacity-40 dark:hover:bg-white/10 dark:hover:text-white"
-            >
-              <IconFile size={18} />
-            </button>
-            <button
-              onClick={() => setUrlOpen((v) => !v)}
-              disabled={busy || !activeId}
-              title={t("chat.addUrl")}
-              className={`shrink-0 rounded-full p-2 transition-colors disabled:opacity-40 ${
-                urlOpen
-                  ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
-                  : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
-              }`}
-            >
-              <IconLink size={18} />
-            </button>
+            {/* 附件：图片 / 文档 / 网址 收进一个 + 菜单，减少一排重复图标 */}
+            <div className="relative shrink-0">
+              <button
+                onClick={() => setAttachMenu((v) => !v)}
+                disabled={busy || !activeId}
+                title={t("chat.attach")}
+                className={`shrink-0 rounded-full p-2 transition-colors disabled:opacity-40 ${
+                  attachMenu
+                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
+                }`}
+              >
+                <IconPlus size={18} />
+              </button>
+              {attachMenu && (
+                <div className="card absolute bottom-11 left-0 z-20 w-44 p-1">
+                  <button
+                    onClick={() => {
+                      setAttachMenu(false);
+                      imgInput.current?.click();
+                    }}
+                    className="w-full rounded-lg px-3 py-1.5 text-left text-xs hover:bg-neutral-900/5 dark:hover:bg-white/10"
+                  >
+                    {t("chat.uploadImages")}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAttachMenu(false);
+                      docInput.current?.click();
+                    }}
+                    className="w-full rounded-lg px-3 py-1.5 text-left text-xs hover:bg-neutral-900/5 dark:hover:bg-white/10"
+                  >
+                    {t("chat.uploadDocs")}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAttachMenu(false);
+                      setUrlOpen(true);
+                    }}
+                    className="w-full rounded-lg px-3 py-1.5 text-left text-xs hover:bg-neutral-900/5 dark:hover:bg-white/10"
+                  >
+                    {t("chat.addUrl")}
+                  </button>
+                </div>
+              )}
+            </div>
 
-            <input
-              className="field flex-1"
+            {/* 多行输入：随内容自动增高，超出后内部滚动；Enter 发送，Shift+Enter 换行 */}
+            <textarea
+              ref={inputRef}
+              rows={1}
+              className="max-h-40 min-h-[42px] flex-1 resize-none overflow-y-auto rounded-2xl border border-neutral-300 bg-white px-4 py-2.5 text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-400 focus:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-500 dark:focus:border-neutral-200"
               value={input}
               placeholder={
                 !activeId
@@ -972,27 +1001,31 @@ export default function ChatPage({ onStats, visible }) {
                     : t("chat.inputPlaceholder")
               }
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && send()}
+              onKeyDown={(e) => {
+                // isComposing：中文输入法选词回车不发送
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
               disabled={!activeId}
             />
             {busy && (
               <button
                 onClick={interrupt}
                 title={t("chat.stop")}
-                className="pill shrink-0 bg-red-500/10 text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-400"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-500/10 text-red-600 transition-colors hover:bg-red-500/25 dark:text-red-400"
               >
-                <IconStop size={13} />
-                {t("chat.stop")}
+                <IconStop size={16} />
               </button>
             )}
             <button
               onClick={send}
               disabled={(!input.trim() && !hasAttachments) || !activeId}
               title={busy ? t("chat.enqueue") : t("common.send")}
-              className="pill pill-hover shrink-0"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-white shadow-sm transition-colors hover:bg-neutral-700 disabled:opacity-40 dark:bg-white dark:text-black dark:hover:bg-neutral-200"
             >
-              {busy ? <IconQueue size={15} /> : <IconSend size={15} />}
-              {busy ? t("chat.enqueue") : t("common.send")}
+              {busy ? <IconQueue size={16} /> : <IconSend size={16} />}
             </button>
           </div>
         </div>
