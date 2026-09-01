@@ -21,7 +21,7 @@ import ToolCallCard from "../components/ToolCallCard.jsx";
 import Markdown from "../components/Markdown.jsx";
 
 // AI 对话：多会话分组 + 工具调用可视化
-export default function ChatPage({ onStats }) {
+export default function ChatPage({ onStats, visible }) {
   const { t } = useLang();
   const [sessions, setSessions] = useState([]);
   const [activeId, setActiveId] = useState("");

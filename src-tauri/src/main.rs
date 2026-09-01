@@ -23,6 +23,16 @@ mod tray;
 use tauri::Manager;
 
 fn main() {
+    // WebView2 默认遵循系统代理，而安装版前端经 http://tauri.localhost 加载；
+    // 系统代理（如 Clash）未排除该主机时会白屏。前端资源全部本地内嵌，禁用代理无副作用。
+    // 追加而非覆盖，保留外部传入的调试参数（如 --remote-debugging-port）。
+    let mut webview_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+    if !webview_args.is_empty() && !webview_args.contains("no-proxy-server") {
+        webview_args.push(' ');
+    }
+    webview_args.push_str("--no-proxy-server");
+    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
