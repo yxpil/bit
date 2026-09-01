@@ -73,7 +73,7 @@ fn build_menu(
     Menu::with_items(app, &[&show, &remote, &sep, &quit])
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
+pub fn show_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
         let _ = win.unminimize();

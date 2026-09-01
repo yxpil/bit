@@ -1,6 +1,6 @@
 [package]
 name = "bit"
-version = "0.2.9"
+version = "0.2.10"
 description = "BIT - Agent Tool Hub with audit and remote access"
 edition = "2021"
 
@@ -10,6 +10,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
+# 单实例保护：二次启动时唤起已有实例的主窗口而不是再开一个进程
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

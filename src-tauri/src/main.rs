@@ -34,6 +34,10 @@ fn main() {
     std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
 
     tauri::Builder::default()
+        // 单实例保护：必须最先注册；二次启动时唤起已有实例的主窗口后退出新进程
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main_window(app);
+        }))
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let ctx = state::Ctx::load(app.handle().clone());
