@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api } from "../api.js";
 import { useLang } from "../i18n.js";
 import {
@@ -66,6 +67,39 @@ export default function ChatPage({ onStats, visible }) {
       setApprovals((arr) => [...arr, e.payload]);
     });
     return () => un.then((f) => f());
+  }, []);
+
+  // 拖拽文件 / 文件夹到窗口：插入链接到输入框
+  const [dragOver, setDragOver] = useState(false);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    getCurrentWindow()
+      .onDragDropEvent((ev) => {
+        const p = ev.payload;
+        if (p.type === "enter" || p.type === "over") {
+          setDragOver(true);
+        } else if (p.type === "leave" || p.type === "cancel") {
+          setDragOver(false);
+        } else if (p.type === "drop") {
+          setDragOver(false);
+          const links = (p.paths || []).map((path) => {
+            const clean = path.replace(/[\\/]+$/, "");
+            const name = clean.split(/[\\/]/).pop() || path;
+            // 尖括号包裹：路径含空格也不会破坏 markdown 链接
+            return `[${name}](<file:///${clean.replace(/\\/g, "/")}>)`;
+          });
+          if (links.length) setInput((v) => (v ? `${v}\n` : "") + links.join("\n"));
+        }
+      })
+      .then((f) => {
+        if (disposed) f();
+        else unlisten = f;
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   // 派生：当前会话状态与全局运行数
@@ -464,7 +498,13 @@ export default function ChatPage({ onStats, visible }) {
   const visibleMessages = messages.filter((m) => m.role !== "system");
 
   return (
-    <div className="flex h-full gap-3">
+    <div className="relative flex h-full gap-3">
+      {/* 拖拽文件 / 文件夹提示遮罩 */}
+      {dragOver && (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center rounded-xl border-2 border-dashed border-neutral-400 bg-neutral-500/10 dark:border-neutral-500">
+          <div className="card px-6 py-4 text-sm font-medium">{t("chat.dropHint")}</div>
+        </div>
+      )}
       {/* 会话侧栏 */}
       <div className="flex w-52 shrink-0 flex-col gap-2">
         <button onClick={newSession} className="pill pill-hover w-full justify-center">

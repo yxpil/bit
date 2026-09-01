@@ -137,6 +137,7 @@ const dict = {
     "chat.selectFirst": "请先新建或选择一个对话",
     "chat.busyPlaceholder": "本对话执行中，可切换其他对话继续…",
     "chat.inputPlaceholder": "输入消息，Enter 发送",
+    "chat.dropHint": "松开鼠标，插入文件 / 文件夹链接",
     // 工具页
     "tools.badTestParams": "测试参数不是合法 JSON",
     "tools.errNameRequired": "请填写工具名称",
@@ -405,6 +406,7 @@ const dict = {
     "chat.selectFirst": "Create or select a conversation first",
     "chat.busyPlaceholder": "This conversation is running — switch to another to continue…",
     "chat.inputPlaceholder": "Type a message, Enter to send",
+    "chat.dropHint": "Release to insert file / folder links",
     // Tools page
     "tools.badTestParams": "Test parameters are not valid JSON",
     "tools.errNameRequired": "Please enter a tool name",
