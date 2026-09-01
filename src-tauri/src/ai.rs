@@ -94,7 +94,7 @@ pub struct ToolCallRecord {
 
 /// 调用当前激活提供方进行一次对话（按协议分派）
 pub async fn chat(ctx: &Arc<crate::state::Ctx>, messages: &[ChatMessage]) -> Result<String, String> {
-    chat_with_images(ctx, messages, &[]).await
+    chat_with_images(ctx, messages, &[]).await.map(|(s, _)| s)
 }
 
 /// 把用户设置的思考强度 / 温度按协议注入请求体。
@@ -155,12 +155,13 @@ fn apply_params(protocol: &str, body: &mut serde_json::Value, cfg: &AiConfig) {
     }
 }
 
-/// 带图片（base64 data URL）的一次性对话：图片仅附加到最后一条 user 消息（多模态）
+/// 带图片（base64 data URL）的一次性对话：图片仅附加到最后一条 user 消息（多模态）。
+/// 返回 (完整文本, token 用量)
 pub async fn chat_with_images(
     ctx: &Arc<crate::state::Ctx>,
     messages: &[ChatMessage],
     images: &[String],
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let provider = {
         let cfg = ctx.ai_config.lock().unwrap();
         cfg.active().cloned()
@@ -189,13 +190,14 @@ pub async fn chat_with_images(
 /// 流式被调用方中止的哨兵错误（中断会话时立即断开 SSE 读取，不回退非流式）
 pub const STREAM_STOP: &str = "__BIT_STREAM_STOP__";
 
-/// 流式对话：on_token 回调返回 false 表示调用方要求立即停止（如会话中断）
+/// 流式对话：on_token 回调返回 false 表示调用方要求立即停止（如会话中断）。
+/// 返回 (完整文本, token 用量)
 pub async fn chat_stream_with_images<F: FnMut(&str) -> bool>(
     ctx: &Arc<crate::state::Ctx>,
     messages: &[ChatMessage],
     images: &[String],
     mut on_token: F,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let provider = {
         let cfg = ctx.ai_config.lock().unwrap();
         cfg.active().cloned()
@@ -219,18 +221,18 @@ pub async fn chat_stream_with_images<F: FnMut(&str) -> bool>(
         _ => stream_openai(&client, &p, messages, images, &params, &mut on_token).await,
     };
     match res {
-        Ok(full) => Ok(full),
+        Ok((full, usage)) => Ok((full, usage)),
         // 调用方主动停止（中断）：不回退非流式，直接上抛哨兵
         Err(e) if e == STREAM_STOP => Err(e),
-        // 流式失败（部分服务不支持 SSE）时退回普通请求
+        // 流式失败（部分服务不支持 SSE）时退回一次性请求并把整段作为单个 token 回调
         Err(_) => {
-            let full = match p.protocol.as_str() {
+            let (full, usage) = match p.protocol.as_str() {
                 "gemini" => chat_gemini(&client, &p, messages, images, &params).await,
                 "claude" => chat_claude(&client, &p, messages, images, &params).await,
                 _ => chat_openai(&client, &p, messages, images, &params).await,
             }?;
             on_token(&full);
-            Ok(full)
+            Ok((full, usage))
         }
     }
 }
@@ -385,10 +387,14 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
     images: &[String],
     params: &AiConfig,
     on_token: &mut F,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
     let msgs = openai_messages(messages, images);
-    let mut body = serde_json::json!({ "model": p.model, "messages": msgs, "stream": true });
+    // include_usage：最后一个 chunk 携带 usage（含缓存命中统计），不影响正文增量
+    let mut body = serde_json::json!({
+        "model": p.model, "messages": msgs, "stream": true,
+        "stream_options": {"include_usage": true},
+    });
     apply_params("openai", &mut body, params);
     let resp = client
         .post(&url)
@@ -398,12 +404,16 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let mut full = String::new();
+    let mut usage = TokenUsage::default();
     let mut stopped = false;
     read_sse(resp, |data| {
         if data == "[DONE]" {
             return true;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+            if v.get("usage").is_some() {
+                usage = usage_from_openai(&v);
+            }
             if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(|x| x.as_str()) {
                 full.push_str(delta);
                 // 回调返回 false = 调用方中止（中断会话）：停止读取 SSE
@@ -422,7 +432,7 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
     if full.is_empty() {
         return Err("流式无内容".into());
     }
-    Ok(full)
+    Ok((full, usage))
 }
 
 /// Claude 流式：/v1/messages stream=true（content_block_delta）
@@ -433,7 +443,7 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
     images: &[String],
     params: &AiConfig,
     on_token: &mut F,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let (system_txt, mut msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model, "max_tokens": 4096, "messages": msgs, "stream": true
@@ -451,11 +461,23 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let mut full = String::new();
+    let mut usage = TokenUsage::default();
     let mut stopped = false;
+    // input/cache 用量在 message_start，output 用量在 message_delta
     read_sse(resp, |data| {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            if t == "content_block_delta" {
+            if t == "message_start" {
+                if let Some(u) = v.pointer("/message/usage") {
+                    usage.prompt_tokens = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    usage.cache_read_tokens = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    usage.cache_write_tokens = u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                }
+            } else if t == "message_delta" {
+                if let Some(n) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
+                    usage.completion_tokens = n;
+                }
+            } else if t == "content_block_delta" {
                 if let Some(delta) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
                     full.push_str(delta);
                     if !on_token(delta) {
@@ -476,7 +498,7 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
     if full.is_empty() {
         return Err("流式无内容".into());
     }
-    Ok(full)
+    Ok((full, usage))
 }
 
 /// Gemini 流式：streamGenerateContent?alt=sse
@@ -487,7 +509,7 @@ async fn stream_gemini<F: FnMut(&str) -> bool>(
     images: &[String],
     params: &AiConfig,
     on_token: &mut F,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let (system_txt, contents) = gemini_contents(messages, images);
     let mut body = serde_json::json!({ "contents": contents });
     apply_params("gemini", &mut body, params);
@@ -507,9 +529,14 @@ async fn stream_gemini<F: FnMut(&str) -> bool>(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let mut full = String::new();
+    let mut usage = TokenUsage::default();
     let mut stopped = false;
     read_sse(resp, |data| {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+            // 每块都带 usageMetadata（渐进累计，取最后一块即最终值）
+            if v.get("usageMetadata").is_some() {
+                usage = usage_from_gemini(&v);
+            }
             if let Some(delta) = v.pointer("/candidates/0/content/parts/0/text").and_then(|x| x.as_str()) {
                 full.push_str(delta);
                 if !on_token(delta) {
@@ -527,7 +554,7 @@ async fn stream_gemini<F: FnMut(&str) -> bool>(
     if full.is_empty() {
         return Err("流式无内容".into());
     }
-    Ok(full)
+    Ok((full, usage))
 }
 
 /// OpenAI 兼容协议：/chat/completions
@@ -537,7 +564,7 @@ async fn chat_openai(
     messages: &[ChatMessage],
     images: &[String],
     params: &AiConfig,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
     // 只发送 role/content（图片挂到最后一条 user），剥离本地可视化用的 tool_calls 字段
     let msgs = openai_messages(messages, images);
@@ -551,11 +578,12 @@ async fn chat_openai(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let value = read_json_resp(resp).await?;
-    value
+    let content = value
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "响应中缺少 content".to_string())
+        .ok_or_else(|| "响应中缺少 content".to_string())?;
+    Ok((content, usage_from_openai(&value)))
 }
 
 /// Google Gemini 原生协议：generateContent
@@ -565,7 +593,7 @@ async fn chat_gemini(
     messages: &[ChatMessage],
     images: &[String],
     params: &AiConfig,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     // system 合并进 systemInstruction，其余转为 contents（role: user/model），图片挂到最后一条 user
     let (system_txt, contents) = gemini_contents(messages, images);
     let mut body = serde_json::json!({ "contents": contents });
@@ -586,11 +614,12 @@ async fn chat_gemini(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let value = read_json_resp(resp).await?;
-    value
+    let text = value
         .pointer("/candidates/0/content/parts/0/text")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "响应中缺少 text".to_string())
+        .ok_or_else(|| "响应中缺少 text".to_string())?;
+    Ok((text, usage_from_gemini(&value)))
 }
 
 /// Claude 提示词缓存：system 与最后一条消息打 cache_control 断点。
@@ -629,7 +658,7 @@ async fn chat_claude(
     messages: &[ChatMessage],
     images: &[String],
     params: &AiConfig,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     // system 单独抽出，其余作为 messages（role: user/assistant），图片挂到最后一条 user
     let (system_txt, mut msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
@@ -650,11 +679,12 @@ async fn chat_claude(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let value = read_json_resp(resp).await?;
-    value
+    let text = value
         .pointer("/content/0/text")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "响应中缺少 text".to_string())
+        .ok_or_else(|| "响应中缺少 text".to_string())?;
+    Ok((text, usage_from_claude(&value)))
 }
 
 /// 统一处理 HTTP 响应：非 2xx 返回错误，否则解析 JSON
@@ -873,11 +903,68 @@ pub struct ToolExchange {
     pub results: Vec<ToolResult>,
 }
 
+/// 单次请求的 token 用量（含缓存命中信息，用于统计提示词缓存命中率）
+#[derive(Default, Clone, Debug, Serialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl TokenUsage {
+    fn is_empty(&self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0
+    }
+}
+
+/// openai 协议 usage（兼容 deepseek 的 prompt_cache_hit_tokens 字段）
+fn usage_from_openai(v: &serde_json::Value) -> TokenUsage {
+    let u = v.get("usage");
+    TokenUsage {
+        prompt_tokens: u.and_then(|x| x.get("prompt_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_tokens: u
+            .and_then(|x| x.pointer("/prompt_tokens_details/cached_tokens"))
+            .and_then(|x| x.as_u64())
+            .or_else(|| u.and_then(|x| x.get("prompt_cache_hit_tokens")).and_then(|x| x.as_u64()))
+            .unwrap_or(0),
+        cache_write_tokens: 0,
+        completion_tokens: u.and_then(|x| x.get("completion_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+    }
+}
+
+/// claude 协议 usage（cache_read/cache_creation 为缓存命中/写入 token）
+fn usage_from_claude(v: &serde_json::Value) -> TokenUsage {
+    let u = v.get("usage");
+    TokenUsage {
+        prompt_tokens: u.and_then(|x| x.get("input_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_tokens: u.and_then(|x| x.get("cache_read_input_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_write_tokens: u.and_then(|x| x.get("cache_creation_input_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+        completion_tokens: u.and_then(|x| x.get("output_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+    }
+}
+
+/// gemini 协议 usageMetadata
+fn usage_from_gemini(v: &serde_json::Value) -> TokenUsage {
+    let u = v.get("usageMetadata");
+    TokenUsage {
+        prompt_tokens: u.and_then(|x| x.get("promptTokenCount")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_tokens: u.and_then(|x| x.get("cachedContentTokenCount")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_write_tokens: 0,
+        completion_tokens: u
+            .and_then(|x| x.get("candidatesTokenCount"))
+            .and_then(|x| x.as_u64())
+            .or_else(|| u.and_then(|x| x.get("totalTokenCount")).and_then(|x| x.as_u64()))
+            .unwrap_or(0),
+    }
+}
+
 /// 原生一轮的结果：文本 + 工具调用（可同时存在）
 #[derive(Debug)]
 pub struct NativeRound {
     pub content: String,
     pub calls: Vec<NativeToolCall>,
+    pub usage: TokenUsage,
 }
 
 /// 原生调用错误：Unsupported 表示端点不支持 tools 参数（应降级文本约定）
@@ -1102,7 +1189,7 @@ async fn native_round_openai(
             }
         }
     }
-    Ok(NativeRound { content, calls })
+    Ok(NativeRound { content, calls, usage: usage_from_openai(&value) })
 }
 
 async fn native_round_claude(
@@ -1204,7 +1291,7 @@ async fn native_round_claude(
             }
         }
     }
-    Ok(NativeRound { content, calls })
+    Ok(NativeRound { content, calls, usage: usage_from_claude(&value) })
 }
 
 async fn native_round_gemini(
@@ -1303,7 +1390,7 @@ async fn native_round_gemini(
             }
         }
     }
-    Ok(NativeRound { content, calls })
+    Ok(NativeRound { content, calls, usage: usage_from_gemini(&value) })
 }
 
 #[cfg(test)]
@@ -1530,7 +1617,7 @@ mod native_tests {
         let p = test_provider("openai", &url);
         let client = reqwest::Client::new();
         let mut tokens: Vec<String> = Vec::new();
-        let full = stream_openai(
+        let (full, usage) = stream_openai(
             &client, &p,
             &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
             &mut |t| { tokens.push(t.to_string()); true },
@@ -1539,6 +1626,9 @@ mod native_tests {
         .unwrap();
         assert_eq!(full, "你好，世界");
         assert_eq!(tokens, vec!["你", "好", "，", "世界"]);
+        // 模拟端点未携带 usage 字段：用量应保持为 0（不计入命中率统计）
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 0);
     }
 
     #[tokio::test]

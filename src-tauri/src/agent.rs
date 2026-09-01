@@ -50,6 +50,19 @@ fn history_window<'a>(msgs: &'a [ChatMessage]) -> &'a [ChatMessage] {
     &msgs[skip..]
 }
 
+/// 累计本会话 token 用量，返回带命中率的 usage 事件负载
+fn record_and_payload(ctx: &Arc<Ctx>, session: &str, usage: &ai::TokenUsage) -> serde_json::Value {
+    let stats = crate::state::record_usage(ctx, session, usage);
+    json!({
+        "requests": stats.requests,
+        "prompt_tokens": stats.prompt_tokens,
+        "cache_read_tokens": stats.cache_read_tokens,
+        "cache_write_tokens": stats.cache_write_tokens,
+        "completion_tokens": stats.completion_tokens,
+        "hit_rate": (stats.hit_rate() * 1000.0).round() / 1000.0,
+    })
+}
+
 /// 工具审批：
 /// - ask：每次询问用户（全局事件 tool-approval，前端弹卡片，等待应答，120 秒超时自动拒绝）
 /// - auto：记忆/技能/目标/待办沉淀与只读类查询自动通过，其余询问
@@ -309,6 +322,7 @@ pub async fn chat_turn(
     user_input: &str,
     images: Vec<String>,
 ) -> Result<Vec<ChatMessage>, String> {
+    use tauri::Emitter;
     // 1) 追加用户消息到目标会话
     {
         let mut store = ctx.sessions.lock().unwrap();
@@ -386,6 +400,9 @@ pub async fn chat_turn(
             match attempt {
                 Ok(r) => {
                     ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    // 记录本轮用量并推送缓存命中率统计
+                    let payload = record_and_payload(ctx, &target, &r.usage);
+                    let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
                     // 结构化调用为空时兜底解析文本约定（有的模型在原生模式下仍爱手写 TOOL: 行）
                     let calls = if !r.calls.is_empty() {
                         r.calls
@@ -412,7 +429,10 @@ pub async fn chat_turn(
                 Err(ai::NativeErr::Other(e)) => return Err(e),
             }
         } else {
-            let reply = ai::chat_with_images(ctx, &convo, round_images).await?;
+            let (reply, usage) = ai::chat_with_images(ctx, &convo, round_images).await?;
+            // 记录本轮用量并推送缓存命中率统计
+            let payload = record_and_payload(ctx, &target, &usage);
+            let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
             let calls = match parse_tool_calls(&reply) {
                 Some(tc) if !tc.is_empty() && looks_like_tool_calls(&tc) => text_calls_to_native(&tc),
                 _ => Vec::new(),
@@ -648,6 +668,10 @@ pub async fn chat_turn_stream(
             match attempt {
                 Ok(r) => {
                     ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    // 记录本轮用量并随流式通道推送缓存命中率统计
+                    let mut payload = record_and_payload(ctx, &target, &r.usage);
+                    payload["type"] = json!("usage");
+                    emit(payload);
                     let calls = if !r.calls.is_empty() {
                         r.calls
                     } else if let Some(tc) = parse_tool_calls(&r.content) {
@@ -698,7 +722,7 @@ pub async fn chat_turn_stream(
                 emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
                 return Err(e);
             }
-            let reply = match result {
+            let (reply, round_usage) = match result {
                 Ok(r) => r,
                 Err(e) => {
                     clear_interrupt(ctx, &target);
@@ -706,6 +730,10 @@ pub async fn chat_turn_stream(
                     return Err(e);
                 }
             };
+            // 记录本轮用量并随流式通道推送缓存命中率统计
+            let mut payload = record_and_payload(ctx, &target, &round_usage);
+            payload["type"] = json!("usage");
+            emit(payload);
             let calls = match parse_tool_calls(&reply) {
                 Some(tc) if !tc.is_empty() && looks_like_tool_calls(&tc) => text_calls_to_native(&tc),
                 _ => Vec::new(),

@@ -30,6 +30,8 @@ export default function ChatPage({ onStats, visible }) {
   // 多会话并发：busyMap/liveMap 以会话 id 为键，A 会话流式时仍可切到 B 会话继续聊
   const [busyMap, setBusyMap] = useState({}); // { sessionId: true }
   const [liveMap, setLiveMap] = useState({}); // { sessionId: { text, cards } }
+  // 缓存命中率统计（会话累计，由后端 usage/chat-usage 事件推送）
+  const [usageMap, setUsageMap] = useState({}); // { sessionId: { requests, prompt_tokens, cache_read_tokens, completion_tokens, hit_rate } }
   const bottom = useRef(null);
   const activeRef = useRef(""); // 事件回调里判断用户当前正在看哪个会话
 
@@ -68,13 +70,21 @@ export default function ChatPage({ onStats, visible }) {
   const [preview, setPreview] = useState(null);
   const [previewOpen, setPreviewOpen] = useState(false);
 
-  // 审批模式初始化 + 全局审批请求监听
+  // 审批模式初始化 + 全局审批请求监听 + 非流式对话的用量统计监听
   useEffect(() => {
     api.getToolApproval().then((r) => r?.mode && setApprovalMode(r.mode)).catch(() => {});
     const un = listen("tool-approval", (e) => {
       setApprovals((arr) => [...arr, e.payload]);
     });
-    return () => un.then((f) => f());
+    // 非流式对话路径通过全局 chat-usage 事件上报缓存命中率
+    const unUsage = listen("chat-usage", (e) => {
+      const p = e.payload || {};
+      if (p.session && p.usage) setUsageMap((m) => ({ ...m, [p.session]: { ...p.usage, type: "usage" } }));
+    });
+    return () => {
+      un.then((f) => f());
+      unUsage.then((f) => f());
+    };
   }, []);
 
   // 拖拽文件 / 文件夹到窗口：插入链接到输入框
@@ -406,6 +416,10 @@ export default function ChatPage({ onStats, visible }) {
             // 后端检测到回复被截断，自动续发「继续」：用清洗后的片段替换原始流式文本
             setLiveMap((m) => ({ ...m, [sid]: { text: ev.visible || "", cards: m[sid]?.cards || [] } }));
             break;
+          case "usage":
+            // 本轮 token 用量与缓存命中率（会话累计）
+            setUsageMap((m) => ({ ...m, [sid]: ev }));
+            break;
           case "final":
             // 仅当用户还停留在这个会话时刷新消息列表；后台会话结果已落库
             if (activeRef.current === sid && ev.messages) setMessages(ev.messages);
@@ -712,6 +726,27 @@ export default function ChatPage({ onStats, visible }) {
                   {compressing ? t("chat.compressing") : t("chat.compress")}
                 </button>
               )}
+            </div>
+          )}
+
+          {/* 缓存命中率条：≥80% 绿色（前缀稳定）→ <50% 黄色（前缀漂移，缓存命中偏低） */}
+          {usageMap[activeId]?.prompt_tokens > 0 && (
+            <div
+              className={`flex items-center gap-2 self-start rounded-full px-3 py-1 text-[11px] ${
+                usageMap[activeId].hit_rate >= 0.8
+                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                  : usageMap[activeId].hit_rate >= 0.5
+                    ? "text-neutral-400"
+                    : "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+              }`}
+              title={t("chat.cacheTip")}
+            >
+              <span>
+                {t("chat.cacheHit") + ` ${Math.round((usageMap[activeId].hit_rate || 0) * 100)}% · `}
+                {`${fmtK(usageMap[activeId].cache_read_tokens)} / ${fmtK(usageMap[activeId].prompt_tokens)} tokens · `}
+                {t("chat.cacheOut") + ` ${fmtK(usageMap[activeId].completion_tokens)} · `}
+                {`${usageMap[activeId].requests} ${t("chat.cacheRequests")}`}
+              </span>
             </div>
           )}
 

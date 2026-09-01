@@ -540,7 +540,7 @@ async fn openai_chat_completions(
     } else {
         // 非流式：整体返回 OpenAI completion 格式
         match crate::ai::chat_with_images(&ctx, &messages, &images).await {
-            Ok(reply) => {
+            Ok((reply, usage)) => {
                 crate::audit::record(&ctx, &actor, "chat.openai", "/v1/chat/completions", json!({ "stream": false, "ok": true, "reply_len": reply.len() }), true);
                 Json(json!({
                     "id": id, "object": "chat.completion", "created": created, "model": model,
@@ -549,7 +549,12 @@ async fn openai_chat_completions(
                         "message": { "role": "assistant", "content": reply },
                         "finish_reason": "stop"
                     }],
-                    "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+                    "usage": {
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+                        "prompt_tokens_details": { "cached_tokens": usage.cache_read_tokens }
+                    }
                 }))
                 .into_response()
             }

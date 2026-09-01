@@ -14,6 +14,47 @@ use crate::registry::ToolDef;
 use crate::runtime::Runtime;
 use crate::session::SessionStore;
 
+/// 会话累计的 token 用量与缓存命中统计（内存态，重启清零）
+#[derive(Default, Clone, Debug, Serialize)]
+pub struct CacheStats {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl CacheStats {
+    /// 提示词缓存命中率 = 命中缓存的输入 token / 总输入 token（0.0 ~ 1.0）
+    pub fn hit_rate(&self) -> f64 {
+        if self.prompt_tokens == 0 {
+            0.0
+        } else {
+            self.cache_read_tokens as f64 / self.prompt_tokens as f64
+        }
+    }
+}
+
+/// 把单次请求用量累计进会话统计，返回累计值。
+/// 端点未返回用量（全 0）时不计入，避免拉低命中率可信度
+pub fn record_usage(ctx: &Arc<Ctx>, session: &str, usage: &crate::ai::TokenUsage) -> CacheStats {
+    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
+        let map = ctx.cache_stats.lock().unwrap();
+        if let Some(s) = map.get(session) {
+            return s.clone();
+        }
+        return CacheStats::default();
+    }
+    let mut map = ctx.cache_stats.lock().unwrap();
+    let e = map.entry(session.to_string()).or_default();
+    e.requests += 1;
+    e.prompt_tokens += usage.prompt_tokens;
+    e.cache_read_tokens += usage.cache_read_tokens;
+    e.cache_write_tokens += usage.cache_write_tokens;
+    e.completion_tokens += usage.completion_tokens;
+    e.clone()
+}
+
 pub struct Ctx {
     pub app: tauri::AppHandle,
     pub data_dir: PathBuf,
@@ -36,6 +77,8 @@ pub struct Ctx {
     /// 原生工具调用探测缓存（session_id → 该会话端点是否支持 tools 参数）。
     /// 只存内存、不持久化：每个会话首次请求时探测一次，模型/接口更新后新会话自动重新探测
     pub native_probe: Mutex<HashMap<String, bool>>,
+    /// 提示词缓存命中率统计（session_id → 累计用量）。内存态，重启清零
+    pub cache_stats: Mutex<HashMap<String, CacheStats>>,
     /// 待审批工具调用（request_id → 应答通道）
     pub approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     /// 审批请求自增 id
@@ -115,6 +158,7 @@ impl Ctx {
             mcp: Mutex::new(mcp),
             interrupts: Mutex::new(HashMap::new()),
             native_probe: Mutex::new(HashMap::new()),
+            cache_stats: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             approval_seq: AtomicU64::new(1),
             autopilot_running: AtomicBool::new(false),
