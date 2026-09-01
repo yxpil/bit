@@ -1649,4 +1649,25 @@ mod native_tests {
         assert_eq!(n, 2);
         assert!(start.elapsed() < std::time::Duration::from_millis(1000), "中止应及时返回");
     }
+
+    #[tokio::test]
+    async fn test_stream_large_payload_perf() {
+        // 性能压测：500 块流式负载（约 4KB 文本）全部有序到达且完整拼接
+        let chunks: Vec<&'static str> = (0..500)
+            .map(|i| -> &'static str { Box::leak(format!("t{i};").into_boxed_str()) })
+            .collect();
+        let expect: String = chunks.concat();
+        let url = spawn_sse_server(chunks, 0).await;
+        let p = test_provider("openai", &url);
+        let client = reqwest::Client::new();
+        let (full, _) = stream_openai(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |_| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(full, expect, "500 块应全部有序到达且无损拼接");
+        assert!(full.starts_with("t0;t1;") && full.ends_with("t498;t499;"));
+    }
 }

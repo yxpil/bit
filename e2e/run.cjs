@@ -173,6 +173,53 @@ function record(name, ok, detail) {
     }
   } catch (e) { record("T10 new-tool-in-manifest", false, e.message); }
 
+  // T11 MCP 服务端全流程：tools/list → tools/call（BIT 自身作为 MCP 服务器，Streamable HTTP / JSON-RPC 2.0）
+  try {
+    const rpc = (method, params) => new Promise((resolve, reject) => {
+      const data = JSON.stringify({ jsonrpc: "2.0", id: 1, method, ...(params ? { params } : {}) });
+      const req = http.request(
+        { host: BASE, port: PORT, path: "/mcp", method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data) },
+          timeout: 60000, agent },
+        (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b })); }
+      );
+      req.on("error", reject);
+      req.write(data);
+      req.end();
+    });
+    const init = await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e", version: "0" } });
+    const list = await rpc("tools/list");
+    const hasShell = (JSON.parse(list.body).result?.tools || []).some((t) => t.name === "shell");
+    const call = await rpc("tools/call", { name: "shell", arguments: { command: "echo e2e-mcp-ok" } });
+    const okMcp =
+      init.code === 200 &&
+      list.code === 200 && hasShell &&
+      call.code === 200 && call.body.includes("e2e-mcp-ok") && call.body.includes('"isError":false');
+    record("T11 mcp-server-roundtrip", okMcp, `init=${init.code} list=${list.code} hasShell=${hasShell} call=${call.code} ${call.body.slice(0, 80)}`);
+  } catch (e) { record("T11 mcp-server-roundtrip", false, e.message); }
+
+  // T12 MCP 错误分支：未知 method → JSON-RPC -32601；未知工具 → -32602
+  try {
+    const rpc = (body) => new Promise((resolve, reject) => {
+      const data = JSON.stringify(body);
+      const req = http.request(
+        { host: BASE, port: PORT, path: "/mcp", method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data) },
+          timeout: 15000, agent },
+        (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b })); }
+      );
+      req.on("error", reject);
+      req.write(data);
+      req.end();
+    });
+    const unknown = await rpc({ jsonrpc: "2.0", id: 2, method: "resources/list" });
+    const noTool = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "no-such-tool", arguments: {} } });
+    const okErr =
+      unknown.code === 200 && unknown.body.includes("-32601") &&
+      noTool.code === 200 && noTool.body.includes("-32602");
+    record("T12 mcp-error-branches", okErr, `unknown=${unknown.code}:${unknown.body.slice(0, 60)} noTool=${noTool.code}:${noTool.body.slice(0, 60)}`);
+  } catch (e) { record("T12 mcp-error-branches", false, e.message); }
+
   const pass = results.filter((x) => x.ok).length;
   console.log(`\n==== ${pass}/${results.length} passed ====`);
   process.exit(pass === results.length ? 0 : 1);

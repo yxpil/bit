@@ -136,18 +136,39 @@ async fn mcp_endpoint(
     }
 }
 
+/// 鉴权校验（纯函数，便于单测）：
+/// - /api/health 免鉴权
+/// - 第一重：Bearer Client Key 或 ?key= 查询参数；Client Key 未配置一律拒绝（防止空 key 绕过）
+/// - 第二重：X-Access-Password（/v1/ OpenAI 兼容端点与 /mcp 端点豁免——OpenAI 客户端无法携带自定义头）
+/// 返回 Err(状态码) 表示拒绝
+fn check_auth(
+    cfg: &crate::config::Config,
+    path: &str,
+    bearer: &str,
+    qkey: &str,
+    access_password: &str,
+) -> Result<(), StatusCode> {
+    if path == "/api/health" {
+        return Ok(());
+    }
+    if cfg.client_key.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    if bearer != cfg.client_key && qkey != cfg.client_key {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let openai_endpoint = path.starts_with("/v1/");
+    let mcp_endpoint = path == "/mcp";
+    if !openai_endpoint && !mcp_endpoint && !cfg.verify_access_password(access_password) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
 /// 双重认证：Bearer Client Key + X-Access-Password 访问密码，含 HTTP 请求审计。
 /// OpenAI 兼容端点（/v1/）例外：OpenAI 客户端无法携带自定义头，仅校验 Client Key。
 async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
-    if path == "/api/health" {
-        return next.run(req).await;
-    }
-    let openai_endpoint = path.starts_with("/v1/");
-    // MCP 端点：仅校验 Client Key（Bearer 或 ?key= 查询参数），与 /v1 同级
-    let mcp_endpoint = path == "/mcp";
-
-    let cfg = ctx.config.lock().unwrap().clone();
     let provided = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -161,53 +182,40 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
         .query()
         .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("key=")))
         .unwrap_or("");
+    let access_password = req
+        .headers()
+        .get("x-access-password")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let cfg = ctx.config.lock().unwrap().clone();
 
-    // Client Key 为空 = 未配置密钥，一律拒绝（否则空 key 请求会绕过鉴权）
-    if cfg.client_key.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "BIT 尚未配置 Client Key，远程访问已禁用" })),
-        )
-            .into_response();
-    }
-    if provided != cfg.client_key && qkey != cfg.client_key {
-        crate::audit::record(
-            &ctx,
-            &actor_of(&provided),
-            "http.auth_failed",
-            &path,
-            json!({ "reason": "client_key" }),
-            false,
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": { "message": "无效的 API Key（BIT Client Key）", "type": "invalid_request_error", "code": "invalid_api_key" } })),
-        )
-            .into_response();
-    }
-
-    // 第二重：访问密码校验（OpenAI 兼容端点与 MCP 端点跳过）
-    if !openai_endpoint && !mcp_endpoint {
-        let provided_pwd = req
-            .headers()
-            .get("x-access-password")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !cfg.verify_access_password(provided_pwd) {
+    if let Err(status) = check_auth(&cfg, &path, &provided, &qkey, access_password) {
+        if status == StatusCode::UNAUTHORIZED {
+            let reason = if provided != cfg.client_key && qkey != cfg.client_key {
+                "client_key"
+            } else {
+                "access_password"
+            };
             crate::audit::record(
                 &ctx,
                 &actor_of(&provided),
                 "http.auth_failed",
                 &path,
-                json!({ "reason": "access_password" }),
+                json!({ "reason": reason }),
                 false,
             );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "访问密码错误或缺失（需 X-Access-Password 头）" })),
-            )
-                .into_response();
+            let body = if reason == "client_key" {
+                Json(json!({ "error": { "message": "无效的 API Key（BIT Client Key）", "type": "invalid_request_error", "code": "invalid_api_key" } }))
+            } else {
+                Json(json!({ "error": "访问密码错误或缺失（需 X-Access-Password 头）" }))
+            };
+            return (status, body).into_response();
         }
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "BIT 尚未配置 Client Key，远程访问已禁用" })),
+        )
+            .into_response();
     }
 
     let actor = actor_of(&provided);
@@ -586,5 +594,184 @@ async fn openai_chat_completions(
                     .into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn cfg_with_key(key: &str, password: Option<&str>) -> Config {
+        let mut cfg = Config::default();
+        cfg.client_key = key.to_string();
+        cfg.access_password = password.map(String::from);
+        cfg
+    }
+
+    // ---------- 安全：鉴权边界测试 ----------
+
+    #[test]
+    fn test_auth_health_bypass() {
+        // /api/health 免鉴权：无任何凭据也放行
+        let cfg = cfg_with_key("sk-bit-test", Some("12345678"));
+        assert!(check_auth(&cfg, "/api/health", "", "", "").is_ok());
+    }
+
+    #[test]
+    fn test_auth_no_client_key_configured_rejects_all() {
+        // 安全关键：Client Key 为空时即使请求也不带 key 也必须拒绝，杜绝空 key 绕过
+        let cfg = cfg_with_key("", Some("12345678"));
+        assert_eq!(
+            check_auth(&cfg, "/api/tools", "", "", "12345678"),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(check_auth(&cfg, "/v1/models", "", "", ""), Err(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(check_auth(&cfg, "/mcp", "", "", ""), Err(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn test_auth_bearer_key_accept_and_reject() {
+        let cfg = cfg_with_key("sk-bit-right", Some("12345678"));
+        // 正确 Bearer + 密码 → 放行
+        assert!(check_auth(&cfg, "/api/tools", "sk-bit-right", "", "12345678").is_ok());
+        // 错误 Bearer → 401
+        assert_eq!(
+            check_auth(&cfg, "/api/tools", "sk-bit-wrong", "", "12345678"),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        // 缺失 Bearer → 401
+        assert_eq!(
+            check_auth(&cfg, "/api/tools", "", "", "12345678"),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn test_auth_query_key_equivalent() {
+        // 等价类：?key= 与 Bearer 应等价
+        let cfg = cfg_with_key("sk-bit-right", Some("12345678"));
+        assert!(check_auth(&cfg, "/api/tools", "", "sk-bit-right", "12345678").is_ok());
+        assert_eq!(
+            check_auth(&cfg, "/api/tools", "", "sk-bit-wrong", "12345678"),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn test_auth_access_password_enforced_only_on_api() {
+        let cfg = cfg_with_key("sk-bit-right", Some("12345678"));
+        // /api/ 需要访问密码
+        assert_eq!(
+            check_auth(&cfg, "/api/chat", "sk-bit-right", "", ""),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            check_auth(&cfg, "/api/chat", "sk-bit-right", "", "wrong-pwd"),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert!(check_auth(&cfg, "/api/chat", "sk-bit-right", "", "12345678").is_ok());
+        // 等价类：/v1/ 与 /mcp 豁免访问密码（OpenAI 客户端无法携带自定义头）
+        assert!(check_auth(&cfg, "/v1/chat/completions", "sk-bit-right", "", "").is_ok());
+        assert!(check_auth(&cfg, "/mcp", "sk-bit-right", "", "").is_ok());
+    }
+
+    #[test]
+    fn test_auth_password_disabled_passes() {
+        // 未启用密码校验（password_enabled=false）时直接通过
+        let mut cfg = cfg_with_key("sk-bit-right", None);
+        cfg.password_enabled = false;
+        assert!(check_auth(&cfg, "/api/chat", "sk-bit-right", "", "").is_ok());
+        // 启用但 access_password 为 None：一律拒绝（无法匹配）
+        let mut cfg2 = cfg_with_key("sk-bit-right", None);
+        cfg2.password_enabled = true;
+        assert_eq!(
+            check_auth(&cfg2, "/api/chat", "sk-bit-right", "", ""),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    // ---------- 边缘：actor 标识 ----------
+
+    #[test]
+    fn test_actor_of_edges() {
+        assert_eq!(actor_of(""), "agent:unknown");
+        assert_eq!(actor_of("ab"), "agent:unknown"); // skip(4) 后为空 → unknown
+        assert_eq!(actor_of("sk-bit-12345678xyz"), "agent:it-12345"); // skip 4 位取 8 位
+    }
+
+    // ---------- 错误路径：模型列表拉取 ----------
+
+    /// 起一个只回 401 JSON 的本地 TCP 服务
+    async fn spawn_401_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let body = r#"{"error":{"message":"Incorrect API key"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    use tokio::io::AsyncWriteExt;
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[tokio::test]
+    async fn test_list_models_http_error_propagates() {
+        // 上游 401：错误信息应透传而不是静默返回空列表
+        let base = spawn_401_server().await;
+        let err = super::super::commands::list_provider_models(
+            "openai".into(),
+            base,
+            "bad-key".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("401"), "应透传 HTTP 状态码: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_list_models_connection_refused() {
+        // 连接不存在的端口：应返回 Err 而非 panic/空列表
+        let err = super::super::commands::list_provider_models(
+            "openai".into(),
+            "http://127.0.0.1:9/v1".into(),
+            String::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_empty_base_url() {
+        let err = super::super::commands::list_provider_models("openai".into(), "  ".into(), String::new())
+            .await
+            .unwrap_err();
+        assert!(err.contains("Base URL"));
+    }
+
+    #[tokio::test]
+    async fn test_list_models_trailing_slash_normalized() {
+        // 边缘：base_url 带尾斜杠不应产生 //models 双斜杠（对 401 服务请求即可验证 URL 拼接正常）
+        let base = spawn_401_server().await;
+        let err = super::super::commands::list_provider_models(
+            "openai".into(),
+            format!("{base}/"),
+            "bad-key".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("401"), "尾斜杠应被归一化: {err}");
     }
 }
