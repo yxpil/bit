@@ -6,7 +6,7 @@ use std::sync::Arc;
 /// 同时兼容返回 application/json 或 text/event-stream 的服务器。
 
 /// 已接入的 MCP 服务器（持久化到 mcp_servers.json）
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct McpServer {
     pub id: String,
     /// 服务器自报名称（serverInfo.name）
@@ -134,7 +134,16 @@ async fn rpc(
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() > n { format!("{}…", &s[..n]) } else { s.to_string() }
+    if s.len() > n {
+        // 回退到 UTF-8 字符边界，避免多字节字符（如中文错误信息）切片 panic
+        let mut end = n;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    } else {
+        s.to_string()
+    }
 }
 
 /// initialize 握手：返回 (serverInfo, protocolVersion, session id)
@@ -229,7 +238,7 @@ pub async fn discover(host: &str, start: u16, end: u16) -> Result<Vec<Discovered
 }
 
 /// MCP 工具定义（tools/list 条目）
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct McpTool {
     pub name: String,
     #[serde(default)]
@@ -238,29 +247,49 @@ pub struct McpTool {
     pub input_schema: serde_json::Value,
 }
 
-/// 拉取服务器的工具清单
+/// 拉取服务器的工具清单（自动跟随 nextCursor 分页，避免工具多时只拿到第一页）
 pub async fn list_tools(server: &McpServer) -> Result<Vec<McpTool>, String> {
     let http = client()?;
-    let (result, _) = rpc(&http, &server.url, Some(&server.session), "tools/list", serde_json::json!({})).await?;
-    let arr = result
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let tools: Vec<McpTool> = arr
-        .into_iter()
-        .filter_map(|t| {
-            Some(McpTool {
-                name: t.get("name")?.as_str()?.to_string(),
-                description: t
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                input_schema: t.get("inputSchema").cloned().unwrap_or(serde_json::json!({"type":"object","properties":{}})),
-            })
-        })
-        .collect();
+    let mut tools: Vec<McpTool> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..100 {
+        // 分页上限保护：100 页足以覆盖任何真实服务器
+        let mut params = serde_json::json!({});
+        if let Some(c) = &cursor {
+            params["cursor"] = serde_json::json!(c);
+        }
+        let (result, _) =
+            rpc(&http, &server.url, Some(&server.session), "tools/list", params).await?;
+        let arr = result
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for t in arr {
+            if let Some(name) = t.get("name").and_then(|v| v.as_str()) {
+                tools.push(McpTool {
+                    name: name.to_string(),
+                    description: t
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    input_schema: t
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({"type":"object","properties":{}})),
+                });
+            }
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        if cursor.is_none() {
+            break;
+        }
+    }
     Ok(tools)
 }
 
@@ -309,4 +338,224 @@ pub async fn call_tool(
 /// 全局：查找已接入服务器
 pub fn find<'a>(ctx: &Arc<crate::state::Ctx>, id: &str) -> Option<McpServer> {
     ctx.mcp.lock().unwrap().iter().find(|s| s.id == id).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    // ── 纯函数 ──
+
+    #[test]
+    fn test_truncate_utf8_boundary() {
+        // 中文（3 字节/字）在第 200 字节附近切断不得 panic
+        let s = "错误信息".repeat(100);
+        let t = truncate(&s, 200);
+        assert!(t.ends_with('…'));
+        assert!(t.len() <= 201);
+    }
+
+    #[test]
+    fn test_parse_body_json() {
+        let r = parse_body("application/json", r#"{"jsonrpc":"2.0","id":1,"result":{"ok":1}}"#).unwrap();
+        assert_eq!(r.result.unwrap()["ok"], 1);
+    }
+
+    #[test]
+    fn test_parse_body_sse() {
+        let body = "event: message\r\ndata: {\"journal\":1}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\r\n\r\n";
+        let r = parse_body("text/event-stream", body).unwrap();
+        assert_eq!(r.result.unwrap()["tools"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_parse_body_rpc_error() {
+        let r = parse_body("application/json", r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method 404"}}"#).unwrap();
+        assert_eq!(r.error.unwrap().message.unwrap(), "method 404");
+    }
+
+    // ── 集成：本地 mock MCP 服务器（Streamable HTTP，JSON 与 SSE 混合响应） ──
+
+    /// 极简异步 HTTP 服务器：按 JSON-RPC method 路由，逐请求读取、写完即关
+    async fn spawn_mock_mcp() -> (String, Arc<StdMutex<HashMap<String, usize>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits: Arc<StdMutex<HashMap<String, usize>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let hits_cloned = hits.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let hits = hits_cloned.clone();
+                tauri::async_runtime::spawn(async move {
+                    // 读请求头
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk).await else { return };
+                        if n == 0 { return; }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break p + 4;
+                        }
+                        if buf.len() > 65536 { return; }
+                    };
+                    // 解析 Content-Length 并读 body
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let clen: usize = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    while buf.len() < head_end + clen {
+                        let Ok(n) = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk).await else { return };
+                        if n == 0 { break; }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+                    let req: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let params = req.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                    *hits.lock().unwrap().entry(method.clone()).or_insert(0) += 1;
+
+                    let (ct, payload, session) = match method.as_str() {
+                        "initialize" => (
+                            "application/json",
+                            json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "result": {
+                                    "protocolVersion": "2025-03-26",
+                                    "serverInfo": { "name": "Mock MCP", "version": "1.2.3" }
+                                }
+                            })
+                            .to_string(),
+                            Some("sess-mock-1".to_string()),
+                        ),
+                        "notifications/initialized" => ("text/plain", String::new(), None),
+                        "tools/list" => {
+                            // 带分页：第一次给 cursor，第二次返回剩余工具
+                            let page2 = params.get("cursor").is_some();
+                            let tools = if page2 {
+                                json!([{ "name": "tool_b", "description": "第二个工具",
+                                         "inputSchema": { "type": "object", "properties": {} } }])
+                            } else {
+                                json!([{ "name": "tool_a", "description": "第一个工具",
+                                         "inputSchema": { "type": "object", "properties": { "x": { "type": "number" } } } }])
+                            };
+                            let mut result = json!({ "tools": tools });
+                            if !page2 {
+                                result["nextCursor"] = json!("cursor-page-2");
+                            }
+                            (
+                                "text/event-stream",
+                                format!(
+                                    "event: message\r\ndata: {}\r\n\r\n",
+                                    json!({ "jsonrpc": "2.0", "id": 1, "result": result })
+                                ),
+                                None,
+                            )
+                        }
+                        "tools/call" => (
+                            "application/json",
+                            json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "result": { "content": [
+                                    { "type": "text", "text": "第一行结果" },
+                                    { "type": "text", "text": "second line" }
+                                ], "isError": false }
+                            })
+                            .to_string(),
+                            None,
+                        ),
+                        _ => (
+                            "application/json",
+                            json!({ "jsonrpc": "2.0", "id": 1,
+                                    "error": { "code": -32601, "message": format!("未知方法 {method}") } })
+                                .to_string(),
+                            None,
+                        ),
+                    };
+                    let mut resp = format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n", payload.len());
+                    if let Some(sid) = &session {
+                        resp.push_str(&format!("Mcp-Session-Id: {sid}\r\n"));
+                    }
+                    resp.push_str("\r\n");
+                    resp.push_str(&payload);
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut sock).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn test_initialize_and_full_flow() {
+        let (url, hits) = spawn_mock_mcp().await;
+        let http = client().unwrap();
+
+        // 1. 握手：解析 serverInfo + 会话 id
+        let (name, version, protocol, session) = initialize(&http, &url).await.unwrap();
+        assert_eq!(name, "Mock MCP");
+        assert_eq!(version, "1.2.3");
+        assert_eq!(protocol, "2025-03-26");
+        assert_eq!(session, "sess-mock-1");
+
+        // 2. 拉取工具清单：自动跟随 nextCursor 分页，两页共 2 个工具
+        let server = McpServer {
+            id: "t1".into(),
+            name: name.clone(),
+            url: url.clone(),
+            version,
+            protocol,
+            session,
+            enabled: true,
+            connected_at: "now".into(),
+        };
+        let tools = list_tools(&server).await.unwrap();
+        assert_eq!(tools.len(), 2, "分页工具应全部拉取: {tools:?}");
+        assert_eq!(tools[0].name, "tool_a");
+        assert_eq!(tools[0].input_schema["properties"]["x"]["type"], "number");
+        assert_eq!(tools[1].name, "tool_b");
+
+        // 3. 调用工具：SSE 响应、多段 text 内容拼接
+        let out = call_tool(&server, "tool_a", json!({ "x": 42 })).await.unwrap();
+        assert_eq!(out["text"], "第一行结果\nsecond line");
+        assert!(out.get("raw").is_some());
+
+        // 4. 规范流程核对：initialized 通知已发出
+        let h = hits.lock().unwrap();
+        assert!(h.get("initialize").copied().unwrap_or(0) >= 1);
+        assert!(h.get("notifications/initialized").copied().unwrap_or(0) >= 1);
+        assert!(h.get("tools/list").copied().unwrap_or(0) >= 2, "分页应请求两次");
+        assert!(h.get("tools/call").copied().unwrap_or(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_rejects_non_mcp_server() {
+        // 普通 HTTP 服务（无 JSON-RPC）不应被识别为 MCP 服务器
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                tauri::async_runtime::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+                    let body = "<html>hello</html>";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                });
+            }
+        });
+        let url = format!("http://{addr}");
+        let http = client().unwrap();
+        assert!(initialize(&http, &url).await.is_err(), "HTML 服务不应通过 MCP 握手");
+    }
 }
