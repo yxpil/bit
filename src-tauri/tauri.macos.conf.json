@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "title": "BIT",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 920,
+        "minHeight": 620,
+        "center": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "transparent": false,
+        "shadow": true,
+        "visible": false
+      }
+    ]
+  }
+}

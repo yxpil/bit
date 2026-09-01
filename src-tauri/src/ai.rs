@@ -703,6 +703,13 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> Str
         })
         .collect();
 
+    // shell 工具说明按平台区分：Windows 用 PowerShell，macOS/Linux 用 POSIX shell
+    let shell_syntax = if cfg!(windows) {
+        "执行命令行（Windows PowerShell 语法，路径用 C:\\ 形式）"
+    } else {
+        "执行命令行（POSIX shell 语法，路径用 / 形式，如 /Users/xxx 与 /home/xxx）"
+    };
+
     format!(
         "你是 BIT，一个可以自我扩展的 AI 助手。你能调用工具、并通过写代码为自己增加新工具。\n\
         \n\
@@ -715,7 +722,7 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> Str
         单个工具调用示例：[{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]\n\
         \n\
         ## 七个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
-        - 工具1 · shell：执行命令行（Windows PowerShell 语法，路径用 C:\\ 形式）。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
+        - 工具1 · shell：{shell_syntax}。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
         - 工具2 · write_file：写入/覆盖文件（文档编辑）。参数 {{\"path\":string,\"content\":string}}\n\
         - 工具3 · plan：制定计划，登记目标与分步待办。参数 {{\"goal\":string,\"steps\":[string]}}\n\
         - 工具4 · edit：增量补丁改文件，精确替换。参数 {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(可选)}}\n\

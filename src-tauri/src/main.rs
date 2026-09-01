@@ -151,6 +151,16 @@ fn main() {
             commands::remove_todo,
             commands::quit_app,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running BIT");
+        .build(tauri::generate_context!())
+        .expect("error while building BIT")
+        .run(|app, event| {
+            // macOS：点击 Dock 图标时若主窗口隐藏则重新显示
+            // （Windows 任务栏点击自带唤起，macOS 需要 Reopen 事件处理）
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                tray::show_main_window(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

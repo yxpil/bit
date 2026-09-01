@@ -1,0 +1,75 @@
+name: release
+
+# 手动触发（可指定已有 tag 补发资产）或推送 v* tag 自动触发
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并上传资产的 tag（如 v0.3.1）"
+        required: true
+        default: "v0.3.1"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 安装 Linux 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: 构建
+        run: |
+          npm ci
+          npx tauri build
+      - name: 上传到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" \
+            src-tauri/target/release/bundle/deb/*.deb \
+            src-tauri/target/release/bundle/rpm/*.rpm \
+            src-tauri/target/release/bundle/appimage/*.AppImage \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: 构建 arm64 + x86_64
+        run: |
+          npm ci
+          npx tauri build --target aarch64-apple-darwin
+          npx tauri build --target x86_64-apple-darwin
+      - name: 上传到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" \
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
+            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg \
+            --clobber --repo "$GITHUB_REPOSITORY"

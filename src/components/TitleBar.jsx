@@ -7,6 +7,10 @@ import { useLang } from "../i18n.js";
 
 const fmtK = (n) => (n >= 1024 ? `${(n / 1024).toFixed(1)}K` : String(n));
 
+// macOS 使用原生 Overlay 标题栏（系统红绿灯按钮），隐藏自绘窗口按钮并为其留出空间；
+// Windows/Linux 保持自绘无边框标题栏不变
+const isMac = navigator.platform.toUpperCase().includes("MAC");
+
 // 自定义无边框标题栏：与窗口按钮同高的页眉仪表盘（版本/会话/Token/内存），
 // 数据不侵占内容区；中段可拖动，右侧窗口按钮
 export default function TitleBar() {
@@ -55,6 +59,7 @@ export default function TitleBar() {
     <div
       data-tauri-drag-region
       className="flex h-9 shrink-0 select-none items-center gap-1 px-3"
+      style={isMac ? { paddingLeft: 76 } : undefined}
     >
       {/* 页眉仪表盘（可拖动） */}
       <div
@@ -86,28 +91,32 @@ export default function TitleBar() {
       {/* 弹性拖动区 */}
       <div data-tauri-drag-region className="flex-1" />
 
-      {/* 窗口按钮 */}
-      <button
-        onClick={minimize}
-        aria-label={t("title.minimize")}
-        className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
-      >
-        <IconMinus size={13} />
-      </button>
-      <button
-        onClick={toggleMax}
-        aria-label={t("title.maximize")}
-        className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
-      >
-        <IconSquare size={12} />
-      </button>
-      <button
-        onClick={close}
-        aria-label={t("common.close")}
-        className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-red-600 hover:text-white"
-      >
-        <IconX size={14} />
-      </button>
+      {/* 窗口按钮（macOS 由系统红绿灯提供，不重复渲染） */}
+      {!isMac && (
+        <>
+          <button
+            onClick={minimize}
+            aria-label={t("title.minimize")}
+            className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+          >
+            <IconMinus size={13} />
+          </button>
+          <button
+            onClick={toggleMax}
+            aria-label={t("title.maximize")}
+            className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+          >
+            <IconSquare size={12} />
+          </button>
+          <button
+            onClick={close}
+            aria-label={t("common.close")}
+            className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-red-600 hover:text-white"
+          >
+            <IconX size={14} />
+          </button>
+        </>
+      )}
     </div>
   );
 }
