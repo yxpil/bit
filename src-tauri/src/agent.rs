@@ -680,6 +680,11 @@ fn strip_tool_json(reply: &str) -> String {
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         return String::new();
     }
+    // 先截掉未闭合的工具 JSON 残尾（输出被截断时不会有完整对象可解析）
+    let reply = match find_unterminated_tool_json(reply) {
+        Some(start) => &reply[..start],
+        None => reply,
+    };
     // 先按字节区间删除散落的 {"tool":...} 对象；若对象外层的数组因此变空，连 [] 一起删
     let spans = find_tool_objects(reply);
     let base = if spans.is_empty() {
@@ -709,6 +714,10 @@ fn strip_tool_json(reply: &str) -> String {
     for line in base.lines() {
         let l = line.trim();
         if l.starts_with("```") {
+            continue;
+        }
+        // 只剩数组标点的残行（平衡对象 + 截断残尾混合后的遗留）
+        if !l.is_empty() && l.chars().all(|c| matches!(c, '[' | ']' | ',' | ' ' | '\t')) {
             continue;
         }
         if l.starts_with('<') && (l.contains("function_call") || l.contains("tool_call")) {
@@ -786,11 +795,63 @@ fn looks_truncated(reply: &str) -> bool {
     if t.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1 {
         return true;
     }
+    // 工具 JSON 写到一半被截断（大 content 撑爆输出上限的典型形态）
+    if find_unterminated_tool_json(t).is_some() {
+        return true;
+    }
     false
 }
 
 /// 自动续发时补给模型的消息
-const CONTINUE_PROMPT: &str = "继续（你上一条回复似乎未输出完整：若要调用工具请按协议单独一行输出 JSON 数组，若已完成请直接给出最终答案）";
+const CONTINUE_PROMPT: &str = "继续（你上一条回复未输出完整就被截断了：若要调用工具请按协议单独一行输出 JSON 数组；如需写入大文件，请拆成多次较小的写入避免单次输出过长；若已完成请直接给出最终答案）";
+
+/// 扫描 JSON 文本（对象/字符串状态机），到达末尾时是否仍未闭合
+fn is_unbalanced_json(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for &c in bytes {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    depth > 0 || in_str || esc
+}
+
+/// 查找未闭合的工具 JSON 残尾起始位置（含前置 `[`）。
+/// 典型场景：write_file 的 content 太长，输出在 JSON 中途被截断——
+/// 此时解析不出工具调用，原始 JSON 会漏到正文里，回合也错误地结束。
+fn find_unterminated_tool_json(reply: &str) -> Option<usize> {
+    let mut search_end = reply.len();
+    while let Some(pos) = reply[..search_end].rfind("{\"tool\"") {
+        if is_unbalanced_json(&reply[pos..]) {
+            // 若对象前面紧邻 `[`，把数组起点一起纳入
+            let before = reply[..pos].trim_end();
+            let start = if before.ends_with('[') {
+                before.len() - 1
+            } else {
+                pos
+            };
+            return Some(start);
+        }
+        search_end = pos;
+    }
+    None
+}
 
 /// 扫描文本中所有平衡的 {...} JSON 对象，返回（解析值, 起始字节, 结束字节）。
 /// 只保留含字符串字段 "tool" 的对象——部分模型不按数组协议输出，而是每行一个
@@ -1002,5 +1063,46 @@ mod tests {
     fn test_empty_reply_is_truncated() {
         assert!(looks_truncated(""));
         assert!(looks_truncated("   \n  "));
+    }
+
+    /// 截图中的真实案例：write_file 的 content 输出到一半被截断——
+    /// 应判定为截断（自动续发），且残尾 JSON 不得漏进正文
+    #[test]
+    fn test_unterminated_tool_json_is_truncated() {
+        let reply = concat!(
+            "抱歉，让我完成创建DIY 3D打印机BOM清单：\n",
+            r#"[{"tool":"write_file","params":{"path":"C:\\Users\\yxpil\\Desktop\\3D打印\\DIY_BOM清单.html","content":"<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"UTF-8\">"#,
+        );
+        assert!(looks_truncated(reply));
+        // 完整对象不算截断残尾
+        assert!(!looks_truncated(
+            r#"执行：[{"tool":"shell","params":{"command":"dir"}}] 完成。"#
+        ));
+    }
+
+    /// 截断的 JSON 残尾应从正文中删除，只保留自然语言部分
+    #[test]
+    fn test_strip_unterminated_tool_json() {
+        let reply = concat!(
+            "好的，我来写入文件：\n",
+            r#"[{"tool":"write_file","params":{"path":"C:\\a.html","content":"<!DOCTYPE html>"#,
+        );
+        let visible = strip_tool_json(reply);
+        assert!(visible.contains("好的，我来写入文件"));
+        assert!(!visible.contains("tool"));
+        assert!(!visible.contains("DOCTYPE"));
+    }
+
+    /// 平衡对象在前、截断残尾在后：平衡对象仍可解析执行，残尾从正文删除
+    #[test]
+    fn test_balanced_then_unterminated() {
+        let reply = concat!(
+            r#"[{"tool":"shell","params":{"command":"mkdir work"}},"#,
+            r#"{"tool":"write_file","params":{"path":"C:\\b.html","content":"<html>"#,
+        );
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "shell");
+        assert_eq!(strip_tool_json(reply), "");
     }
 }
