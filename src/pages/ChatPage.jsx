@@ -49,6 +49,8 @@ export default function ChatPage({ onStats }) {
   const [queues, setQueues] = useState({}); // {sid: [{bubble, composed, imgData}]}
   const [queuePaused, setQueuePaused] = useState({}); // 中断后暂停自动续发
   const pausedRef = useRef({});
+  const queuesRef = useRef({}); // 队列同步 ref：pumpQueue 读取用，避免在 setState updater 里产生副作用
+  const runningRef = useRef(new Set()); // runTask 重入保护
   // 工具审批：ask = 每次询问 / auto = 自动审批 / allow_all = 完全放行
   const [approvals, setApprovals] = useState([]); // 待审批 [{id, tool, params}]
   const [approvalMode, setApprovalMode] = useState("allow_all");
@@ -271,8 +273,10 @@ export default function ChatPage({ onStats }) {
     setAttachErr("");
 
     // 会话执行中：加入等待队列，当前任务结束后自动按顺序发送
-    if (busyMap[sid]) {
-      setQueues((q) => ({ ...q, [sid]: [...(q[sid] || []), item] }));
+    if (busyMap[sid] || runningRef.current.has(sid)) {
+      const next = { ...queuesRef.current, [sid]: [...(queuesRef.current[sid] || []), item] };
+      queuesRef.current = next;
+      setQueues(next);
       if (activeRef.current === sid) {
         setMessages((msgs) => [...msgs, { role: "user", content: `${item.bubble}\n\n⏳` }]);
       }
@@ -282,12 +286,16 @@ export default function ChatPage({ onStats }) {
     if (activeRef.current === sid) {
       setMessages((msgs) => [...msgs, { role: "user", content: item.bubble }]);
     }
+    // 用户主动发消息 = 想继续对话：解除此前中断造成的队列暂停
+    setPausedFor(sid, false);
     runTask(sid, item);
   };
 
   // 实际执行一次对话任务（流式），结束时自动续发该会话的等待队列。
   // busy 标记统一在此设置：无论是直接发送还是队列续发，执行期间新消息都会正确排队
   const runTask = async (sid, item) => {
+    if (runningRef.current.has(sid)) return; // 重入保护：同一会话绝不并发两个任务
+    runningRef.current.add(sid);
     setBusyMap((m) => ({ ...m, [sid]: true }));
     setLiveMap((m) => ({ ...m, [sid]: m[sid] || { text: "", cards: [] } }));
     // 结束时移除该会话的运行/流式状态
@@ -342,11 +350,11 @@ export default function ChatPage({ onStats }) {
       loadSessions();
       onStats?.();
     } catch (e) {
-      if (activeRef.current === sid) {
-        setMessages((msgs) => [...msgs, { role: "assistant", content: t("chat.callFailed") + e }]);
-      }
+      // 错误已通过 error 事件推送给用户，这里只兜底清理（避免双重错误消息）
+      console.error("chat task failed:", e);
       endLive();
     } finally {
+      runningRef.current.delete(sid);
       setBusyMap((m) => {
         const n = { ...m };
         delete n[sid];
@@ -363,26 +371,29 @@ export default function ChatPage({ onStats }) {
   };
 
   const clearQueue = (sid) => {
-    setQueues((q) => {
-      const n = { ...q };
-      delete n[sid];
-      return n;
-    });
+    const next = { ...queuesRef.current };
+    delete next[sid];
+    queuesRef.current = next;
+    setQueues(next);
   };
 
-  const removeQueueItem = (sid, i) =>
-    setQueues((q) => ({ ...q, [sid]: (q[sid] || []).filter((_, j) => j !== i) }));
+  const removeQueueItem = (sid, i) => {
+    const next = { ...queuesRef.current, [sid]: (queuesRef.current[sid] || []).filter((_, j) => j !== i) };
+    queuesRef.current = next;
+    setQueues(next);
+  };
 
-  // 任务结束后按顺序续发；被中断的会话暂停续发，需手动「继续」
+  // 任务结束后按顺序续发；被中断的会话暂停续发，需手动「继续」。
+  // 副作用（setTimeout 启动 runTask）在 updater 外执行，避免 StrictMode 下 updater 双调用导致重复发送
   const pumpQueue = (sid) => {
     if (pausedRef.current[sid]) return;
-    setQueues((q) => {
-      const arr = q[sid] || [];
-      if (arr.length === 0) return q;
-      const [next, ...rest] = arr;
-      setTimeout(() => runTask(sid, next), 50);
-      return { ...q, [sid]: rest };
-    });
+    const arr = queuesRef.current[sid] || [];
+    if (arr.length === 0) return;
+    const [next, ...rest] = arr;
+    const updated = { ...queuesRef.current, [sid]: rest };
+    queuesRef.current = updated;
+    setQueues(updated);
+    setTimeout(() => runTask(sid, next), 50);
   };
 
   const resumeQueue = (sid) => {

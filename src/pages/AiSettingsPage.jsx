@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 import { useLang } from "../i18n.js";
 import PillSwitch from "../components/PillSwitch.jsx";
@@ -32,13 +32,19 @@ export default function AiSettingsPage({ onStats, stats }) {
     api.getAiParams().then((r) => setParams({ temperature: r?.temperature ?? null, reasoning_effort: r?.reasoning_effort || "" })).catch(() => {});
   }, []);
 
-  // 变更即保存
-  const saveParams = (next) => {
+  // 变更即保存（温度滑块拖动用 300ms 防抖，避免频繁落盘）
+  const debounceRef = useRef(null);
+  const saveParams = (next, debounce = false) => {
     setParams(next);
-    api.setAiParams(next.temperature, next.reasoning_effort).then(() => {
-      setParamsSaved(true);
-      setTimeout(() => setParamsSaved(false), 1500);
-    }).catch(() => {});
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    const doSave = () => {
+      api.setAiParams(next.temperature, next.reasoning_effort).then(() => {
+        setParamsSaved(true);
+        setTimeout(() => setParamsSaved(false), 1500);
+      }).catch(() => {});
+    };
+    if (debounce) debounceRef.current = setTimeout(doSave, 300);
+    else doSave();
   };
 
   const editing = form.id !== null;
@@ -267,9 +273,7 @@ export default function AiSettingsPage({ onStats, stats }) {
                 max="2"
                 step="0.1"
                 value={params.temperature}
-                onChange={(e) => setParams({ ...params, temperature: parseFloat(e.target.value) })}
-                onMouseUp={(e) => saveParams({ ...params, temperature: parseFloat(e.target.value) })}
-                onTouchEnd={(e) => saveParams({ ...params, temperature: parseFloat(e.target.value) })}
+                onChange={(e) => saveParams({ ...params, temperature: parseFloat(e.target.value) }, true)}
                 className="flex-1"
               />
               <span className="w-10 text-right text-xs tabular-nums">{params.temperature.toFixed(1)}</span>

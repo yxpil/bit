@@ -32,7 +32,13 @@ fn interrupted(ctx: &Arc<Ctx>, target: &str) -> bool {
 /// - ask：每次询问用户（全局事件 tool-approval，前端弹卡片，等待应答，120 秒超时自动拒绝）
 /// - auto：记忆/技能/目标/待办沉淀与只读类查询自动通过，其余询问
 /// - allow_all：完全放行
-async fn approve_tool(ctx: &Arc<Ctx>, tool: &str, params: &serde_json::Value) -> Result<(), String> {
+/// 等待期间每 500ms 轮询一次会话中断标志：用户点「停止」可立即取消审批中的工具
+async fn approve_tool(
+    ctx: &Arc<Ctx>,
+    tool: &str,
+    params: &serde_json::Value,
+    session_id: Option<&str>,
+) -> Result<(), String> {
     let mode = ctx.config.lock().unwrap().tool_approval.clone();
     if mode == "allow_all" || (mode == "auto" && is_safe_tool(tool)) {
         return Ok(());
@@ -53,21 +59,45 @@ async fn approve_tool(ctx: &Arc<Ctx>, tool: &str, params: &serde_json::Value) ->
         json!({ "params": params }),
         true,
     );
-    match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
-        Ok(Ok(true)) => {
-            crate::audit::record(ctx, "user", "tool.approved", tool, json!({}), true);
-            Ok(())
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut rx = rx;
+    let outcome = loop {
+        tokio::select! {
+            r = &mut rx => {
+                break match r {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(format!("用户拒绝执行工具 `{tool}`")),
+                    Err(_) => Err("审批通道已关闭，已自动拒绝".into()),
+                };
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // 等待期间用户中断了会话：立即取消审批
+                if session_id
+                    .map(|sid| interrupted(ctx, sid))
+                    .unwrap_or(false)
+                {
+                    break Err("对话已中断".into());
+                }
+                if std::time::Instant::now() >= deadline {
+                    break Err("审批超时（120 秒），已自动拒绝".into());
+                }
+            }
         }
-        Ok(Ok(false)) => {
-            ctx.approvals.lock().unwrap().remove(&id);
-            crate::audit::record(ctx, "user", "tool.rejected", tool, json!({}), false);
-            Err(format!("用户拒绝执行工具 `{tool}`"))
-        }
-        _ => {
-            ctx.approvals.lock().unwrap().remove(&id);
-            Err("审批超时（120 秒），已自动拒绝".into())
-        }
+    };
+    // 无论结果如何都清理审批表（若前端此刻才应答，tool_approve 端 remove 不到即为空操作）
+    ctx.approvals.lock().unwrap().remove(&id);
+    match &outcome {
+        Ok(()) => crate::audit::record(ctx, "user", "tool.approved", tool, json!({}), true),
+        Err(e) => crate::audit::record(
+            ctx,
+            "user",
+            if e.contains("拒绝") { "tool.rejected" } else { "tool.approval_cancelled" },
+            tool,
+            json!({ "reason": e }),
+            false,
+        ),
     }
+    outcome
 }
 
 /// auto 模式下自动通过的工具：沉淀类（记忆/技能/目标/待办/AI 自写工具）与只读类查询
@@ -92,13 +122,15 @@ fn is_safe_tool(tool: &str) -> bool {
         .any(|k| lower.contains(k))
 }
 
-/// 执行 AI 输出的单个工具调用（含 AI 自写插件能力）
+/// 执行 AI 输出的单个工具调用（含 AI 自写插件能力）。
+/// session_id 用于审批等待期间响应会话中断；外部调用（远程/自动驾驶）传 None
 pub async fn execute_tool_call(
     ctx: &Arc<Ctx>,
     name: &str,
     params: &serde_json::Value,
+    session_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    approve_tool(ctx, name, params).await?;
+    approve_tool(ctx, name, params, session_id).await?;
     match name {
         // ---- AI 基础能力：为自己写插件并注册 ----
         "write_plugin" => {
@@ -319,7 +351,7 @@ pub async fn chat_turn(
                     let outcome = if name.is_empty() {
                         Err("缺少 tool 字段".to_string())
                     } else {
-                        execute_tool_call(ctx, name, &params).await
+                        execute_tool_call(ctx, name, &params, Some(&target)).await
                     };
                     records.push(crate::ai::ToolCallRecord {
                         tool: name.to_string(),
@@ -498,7 +530,7 @@ pub async fn chat_turn_stream(
                     let outcome = if name.is_empty() {
                         Err("缺少 tool 字段".to_string())
                     } else {
-                        execute_tool_call(ctx, name, &params).await
+                        execute_tool_call(ctx, name, &params, Some(&target)).await
                     };
                     records.push(crate::ai::ToolCallRecord {
                         tool: name.to_string(),
@@ -710,5 +742,107 @@ fn parse_tool_calls(reply: &str) -> Option<Vec<serde_json::Value>> {
         None
     } else {
         Some(objs.into_iter().map(|(v, _, _)| v).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_standard_array() {
+        let reply = r#"[{"tool":"shell","params":{"command":"echo hi"}}]"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "shell");
+    }
+
+    #[test]
+    fn test_parse_array_in_fence() {
+        let reply = "好的，我来执行：\n```json\n[{\"tool\":\"write_file\",\"params\":{\"path\":\"C:\\\\a.txt\",\"content\":\"x\"}}]\n```";
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "write_file");
+    }
+
+    /// 模型自创 <dots_function_call> 标记 + 每行一个裸对象（截图中的真实案例）
+    #[test]
+    fn test_parse_scattered_objects_with_markup() {
+        let reply = "<dots_function_call> {\"tool\":\"shell\",\"params\":{\"command\":\"ls -la /d/\"}}\n\
+                     <dots_function_call> {\"tool\":\"shell\",\"params\":{\"command\":\"du -sh /d/\"}}\n\
+                     <dots_function_call> {\"tool\":\"shell\",\"params\":{\"command\":\"df -h /d/ 2>/dev/null || echo 'df not available'\"}}";
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0]["tool"], "shell");
+        assert_eq!(calls[2]["params"]["command"], "df -h /d/ 2>/dev/null || echo 'df not available'");
+    }
+
+    #[test]
+    fn test_parse_single_bare_object() {
+        let reply = r#"我来查看：{"tool":"shell","params":{"command":"dir"}}"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["params"]["command"], "dir");
+    }
+
+    /// 不含 tool 字段的 JSON 不应被误判为工具调用
+    #[test]
+    fn test_plain_json_not_tool_call() {
+        let reply = r#"示例：{"name": "test", "value": 42}"#;
+        assert!(parse_tool_calls(reply).is_none());
+    }
+
+    /// 中文字符串（多字节 UTF-8）不得导致字节扫描 panic 或解析失败
+    #[test]
+    fn test_utf8_safety() {
+        let reply = "你好世界 {\"tool\":\"shell\",\"params\":{\"command\":\"echo 中文测试\"}} 完成";
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls[0]["params"]["command"], "echo 中文测试");
+    }
+
+    /// 字符串值里包含花括号/方括号不得破坏平衡扫描
+    #[test]
+    fn test_braces_inside_strings() {
+        let reply = r#"{"tool":"shell","params":{"command":"echo '{not a json}' [ok]"}}"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls[0]["params"]["command"], "echo '{not a json}' [ok]");
+    }
+
+    /// 不平衡的对象应整体放弃而不是 panic
+    #[test]
+    fn test_unbalanced_object() {
+        let reply = r#"{"tool":"shell","params":{"command":"unbalanced"#;
+        assert!(parse_tool_calls(reply).is_none());
+    }
+
+    /// 工具数组与普通数组混合：数组含非 tool 元素时回退散对象扫描
+    #[test]
+    fn test_mixed_array_falls_back() {
+        let reply = r#"[{"a":1},{"tool":"shell","params":{"command":"x"}}]"#;
+        // 数组元素不全带 tool → 数组协议不命中；散对象扫描命中 1 个
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "shell");
+    }
+
+    #[test]
+    fn test_strip_marked_objects() {
+        let reply = "<dots_function_call> {\"tool\":\"shell\",\"params\":{\"command\":\"ls\"}}\n好的，开始整理 D 盘。";
+        let visible = strip_tool_json(reply);
+        assert!(!visible.contains("dots_function_call"));
+        assert!(!visible.contains("\"tool\""));
+        assert!(visible.contains("整理 D 盘"));
+    }
+
+    #[test]
+    fn test_strip_pure_array_returns_empty() {
+        let reply = r#"[{"tool":"shell","params":{}}]"#;
+        assert_eq!(strip_tool_json(reply), "");
+    }
+
+    #[test]
+    fn test_strip_keeps_plain_text() {
+        let reply = "这是普通回答，没有任何工具调用。";
+        assert_eq!(strip_tool_json(reply), reply);
     }
 }

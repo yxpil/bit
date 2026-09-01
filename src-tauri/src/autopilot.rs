@@ -75,7 +75,7 @@ async fn autonomous_step(ctx: &Arc<Ctx>) -> Result<(), String> {
                 if name.is_empty() {
                     continue;
                 }
-                match crate::agent::execute_tool_call(ctx, name, &params).await {
+                match crate::agent::execute_tool_call(ctx, name, &params, None).await {
                     Ok(_) => done += 1,
                     Err(e) => {
                         crate::audit::record(ctx, "autopilot", "autonomous.tool_error", name, json!({ "error": e }), false);
