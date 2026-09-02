@@ -22,12 +22,8 @@ finish-args:
   - --filesystem=home
   - --socket=pulseaudio
 modules:
-  # Flathub 官方共享模块：libdbusmenu → libindicator → libayatana-appindicator 链式构建
-  - name: shared-modules
-    type: git
-    url: https://github.com/flathub/shared-modules.git
-    commit: 6eed6448215ff322f3567f2fba53ea444f5861df
-  - shared-modules/libappindicator/libappindicator-gtk3-intro.json
+  # Flathub 共享模块（CI 会先克隆到本目录）：intltool → libdbusmenu → libayatana-indicator → libayatana-appindicator
+  - shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json
   - name: bit
     buildsystem: simple
     build-options:
