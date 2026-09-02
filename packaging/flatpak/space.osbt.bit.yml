@@ -22,6 +22,19 @@ finish-args:
   - --filesystem=home
   - --socket=pulseaudio
 modules:
+  # libayatana-ido：ayatana-indicator 的缺失上游依赖（共享模块链未包含，runtime 亦无）
+  - name: ayatana-ido
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DENABLE_GTKDOC=OFF
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - /lib/*.la
+    sources:
+      - type: archive
+        url: https://github.com/AyatanaIndicators/ayatana-ido/archive/refs/tags/0.10.4.tar.gz
+        sha256: bd59abd5f1314e411d0d55ce3643e91cef633271f58126be529de5fb71c5ab38
   # Flathub 共享模块（CI 会先克隆到本目录）：intltool → libdbusmenu → libayatana-indicator → libayatana-appindicator
   - shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json
   - name: bit
