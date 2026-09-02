@@ -1,0 +1,52 @@
+name: mirror-pages
+
+# 将 Release 资产镜像到 GitHub Pages（https://yxpil.github.io/bit/）。
+# osbt.space 等下载入口直链该地址：直连 200 不重定向，文件托管在 GitHub，无需自有服务器。
+# 每次部署为全量站点（仅含最新 tag 的资产），旧版本资产由 GitHub Releases 本身承担。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要镜像的 tag（如 v0.4.9）"
+        required: true
+        default: "v0.4.9"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Pages 部署互斥，新部署覆盖旧的
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v4
+      - name: 下载 Release 资产并组装站点
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          mkdir -p "site/$VERSION"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "site/$VERSION"
+          # 站点首页：版本内全部文件的直链清单
+          {
+            echo "<!doctype html><meta charset=utf-8><title>BIT $VERSION downloads</title>"
+            echo "<h1>BIT $VERSION</h1><ul>"
+            (cd "site/$VERSION" && ls -1 | sed "s/.*/<li><a href=\"$VERSION\/&\">&<\/a><\/li>/")
+            echo "</ul>"
+          } > site/index.html
+          ls -la "site/$VERSION"
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
