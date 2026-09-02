@@ -1,0 +1,45 @@
+name: winget-manifest-validate
+
+# 用真实 winget validate 验证待提交 microsoft/winget-pkgs 的清单，
+# 避免 PR 提交后被 02. Manifest Validation 打回（winget-pkgs 流水线失败即关 PR）。
+# 清单源：yxpil/winget-pkgs fork 分支（默认 master，可指定）
+on:
+  workflow_dispatch:
+    inputs:
+      fork_ref:
+        description: "yxpil/winget-pkgs 的分支或 SHA"
+        required: false
+        default: "master"
+      version:
+        description: "清单版本目录名（如 0.4.9）"
+        required: false
+        default: "0.4.9"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: 拉取 fork 上的清单
+        shell: pwsh
+        env:
+          REF: ${{ inputs.fork_ref || 'master' }}
+          VER: ${{ inputs.version || '0.4.9' }}
+        run: |
+          New-Item -ItemType Directory -Force manifest | Out-Null
+          $base = "https://raw.githubusercontent.com/yxpil/winget-pkgs/$($env:REF)/manifests/y/yxpil/bit/$($env:VER)"
+          foreach ($f in @("yxpil.bit.yaml", "yxpil.bit.locale.en-US.yaml", "yxpil.bit.installer.yaml")) {
+            Invoke-WebRequest "$base/$f" -OutFile "manifest/$f"
+            Write-Host "downloaded $f"
+          }
+      - name: winget validate
+        shell: pwsh
+        run: |
+          winget validate --manifest manifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 结果
+        if: success()
+        shell: pwsh
+        run: Write-Host "winget validate 通过"
