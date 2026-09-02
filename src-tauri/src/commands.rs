@@ -1391,6 +1391,70 @@ pub async fn run_autopilot_now(state: State<'_, Arc<Ctx>>) -> Result<serde_json:
     Ok(json!({ "triggered": true }))
 }
 
+/// ── 文件打开（send_file 文件卡片用）──
+
+/// 用系统默认程序打开文件；reveal=true 时打开所在文件夹并定位该文件
+#[tauri::command]
+pub fn open_path(path: String, reveal: Option<bool>) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在: {path}"));
+    }
+    open_target(p, reveal.unwrap_or(false))
+}
+
+fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        if reveal {
+            cmd.arg("-R");
+        }
+        cmd.arg(p);
+        return cmd
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开失败: {e}"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // CREATE_NO_WINDOW：避免后台命令闪黑框
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if reveal {
+            return std::process::Command::new("explorer")
+                .arg(format!("/select,{}", p.display()))
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("打开失败: {e}"));
+        }
+        return std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(p)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开失败: {e}"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let target = if reveal {
+            // xdg-open 无「定位选中」能力，退化为打开所在文件夹
+            p.parent().unwrap_or(p).to_path_buf()
+        } else {
+            p.to_path_buf()
+        };
+        return std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开失败: {e}"));
+    }
+    #[allow(unreachable_code)]
+    Err("不支持的平台".into())
+}
+
 #[cfg(test)]
 mod tests {
     /// 外部集成测试：连接独立运行的 mock AI（e2e/mock-ai.cjs，默认 127.0.0.1:9901），

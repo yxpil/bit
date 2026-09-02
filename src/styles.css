@@ -24,6 +24,16 @@
   #root {
     height: 100%;
   }
+  /* 触摸屏/触摸板滚动修复：
+     - 所有元素 contain：内层滚动容器到边界后不把滚动链传给外层（防整页被带走）
+     - 根元素 none：禁止 WebView 根滚动视图的超视距回弹（rubber-band） */
+  * {
+    overscroll-behavior: contain;
+  }
+  html,
+  body {
+    overscroll-behavior: none;
+  }
   /* 主题强调色：默认黑白胶囊；用户在调色盘选择后经内联样式覆盖 */
   :root {
     --accent: #171717;

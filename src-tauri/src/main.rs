@@ -151,6 +151,7 @@ fn main() {
             commands::add_todo,
             commands::update_todo_status,
             commands::remove_todo,
+            commands::open_path,
             commands::quit_app,
         ])
         .build(tauri::generate_context!())

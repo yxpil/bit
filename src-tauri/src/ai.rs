@@ -832,7 +832,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         \n\
         {manual}\n\
         \n\
-        ## 七个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
+        ## 八个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
         - 工具1 · shell：{shell_syntax}。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
         - 工具2 · write_file：写入/覆盖文件（文档编辑）。参数 {{\"path\":string,\"content\":string}}\n\
         - 工具3 · plan：制定计划，登记目标与分步待办。参数 {{\"goal\":string,\"steps\":[string]}}\n\
@@ -840,6 +840,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         - 工具5 · add_tool：给自己增加工具——用本机某解释器把一段代码沉淀为常驻工具。参数 {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}。同名工具若是你自建的解释器/脚本工具会【原位覆盖更新】（发现自己之前的实现有误可直接重写同名工具修正）；系统/远程工具不可覆盖\n\
         - 工具6 · skill：技能库读写。写入技能 {{\"action\":\"save\",\"name\":string,\"summary\":string}}（同名覆盖）；搜索技能 {{\"action\":\"search\",\"query\":string}}（query 留空返回全部）\n\
         - 工具7 · sub_agent：派生子智能体——新建独立会话执行自包含的大任务（调研/批量整理/写大文件），阻塞等待并把最终结论【原文完整】直接返回到当前对话（无需约定文件位置，直接基于返回内容继续），子会话保留在侧栏可查看全过程。参数 {{\"task\":string,\"title\":string(可选)}}。注意 task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全\n\
+        - 工具8 · send_file：把一个现成文件【发送给用户】——聊天里会出现可点击打开的文件卡片，如同发文件一样交付成果（报告/HTML/图片/数据文件等）。参数 {{\"path\":string,\"note\":string(可选,一句话说明)}}\n\
         {skill_examples}\n\
         \n\
         ## 自我扩展的扩展动作（同样作为 tool 调用）\n\

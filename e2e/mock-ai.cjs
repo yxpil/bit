@@ -173,6 +173,15 @@ const server = http.createServer((req, res) => {
         return respond(res, "E2E-FINAL-RETOOL failed: 覆盖后调用无有效结果", sse);
       }
 
+      // E2E-CMD-SEND: 轮0 write_file 生成文件 → 轮1 send_file 发送 → 轮2 最终
+      if (all.includes("E2E-CMD-SEND")) {
+        if (rounds === 1)
+          return respond(res, '文件已生成，发送给你：[{"tool":"send_file","params":{"path":"./.e2e-send.txt","note":"E2E 交付文件"}}]', sse);
+        const sent = /"sent"\s*:\s*true/.test(fb);
+        if (sent) return respond(res, "E2E-FINAL-SEND: 文件已发送", sse);
+        return respond(res, "E2E-FINAL-SEND failed: send_file 无有效结果", sse);
+      }
+
       // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）
       const stdouts = messages
         .filter((m) => m.role === "tool")
@@ -214,6 +223,14 @@ const server = http.createServer((req, res) => {
       ]);
       return respond(res, `我先创建一个翻倍工具。\n${calls}`, sse);
     }
+
+    // 发送文件场景：先 write_file 生成，反馈轮里 send_file 发给用户
+    if (last.includes("E2E-CMD-SEND"))
+      return respond(
+        res,
+        '生成一个交付文件：\n[{"tool":"write_file","params":{"path":"./.e2e-send.txt","content":"hello from BIT e2e"}}]',
+        sse
+      );
 
     if (last.includes("E2E-CMD-MARKUP"))
       // v0.1.9 兼容场景：自创标记 + 裸对象（非数组）

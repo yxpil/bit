@@ -160,6 +160,21 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "skill",
         ),
+        // 7. 发送文件给用户（聊天里出现可打开的文件卡片）
+        mk(
+            "builtin.send_file",
+            "send_file",
+            "把一个现成文件发送给用户：聊天里会出现可点击打开的文件卡片。适合交付你生成的报告/HTML/图片/数据文件等成果",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "要发送的文件绝对路径" },
+                    "note": { "type": "string", "description": "一句话说明（可选）" }
+                },
+                "required": ["path"]
+            }),
+            "send_file",
+        ),
     ]
 }
 
@@ -456,6 +471,28 @@ async fn builtin_invoke(
             }
             std::fs::write(path, content).map_err(|e| format!("写入失败: {e}"))?;
             Ok(serde_json::json!({ "path": path, "bytes": content.len() }))
+        }
+        // ── 2.5 发送文件给用户 ──
+        "send_file" => {
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
+            let p = std::path::Path::new(path);
+            let meta = std::fs::metadata(p).map_err(|_| format!("文件不存在: {path}"))?;
+            if meta.is_dir() {
+                return Err(format!("`{path}` 是文件夹，send_file 只能发送单个文件"));
+            }
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| path.to_string());
+            let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(serde_json::json!({
+                "sent": true,
+                "path": path,
+                "name": name,
+                "bytes": meta.len(),
+                "note": note,
+            }))
         }
         // ── 3. 制定计划（目标 + 待办）──
         "plan" => {

@@ -17,6 +17,7 @@ import {
   IconQueue,
 } from "../components/Icons.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
+import FileCard from "../components/FileCard.jsx";
 import Markdown from "../components/Markdown.jsx";
 
 // AI 对话：多会话分组 + 工具调用可视化
@@ -661,22 +662,38 @@ export default function ChatPage({ onStats, visible }) {
             {/* 流式实时区：已完成轮次的工具卡片 + 本轮增量文本 */}
             {live && (
               <div className="mr-auto flex max-w-[85%] flex-col gap-2">
-                {live.cards.map((c, i) => (
-                  <div key={i} className="flex flex-col gap-2">
-                    {c.calls.length > 0 && (
-                      <div className="flex flex-col gap-1.5">
-                        {c.calls.map((call, j) => (
-                          <ToolCallCard key={j} call={call} />
-                        ))}
-                      </div>
-                    )}
-                    {c.visible && c.visible.trim() && (
-                      <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
-                        <Markdown>{c.visible}</Markdown>
-                      </div>
-                    )}
-                  </div>
-                ))}
+                {live.cards.map((c, i) => {
+                  const fileCalls = (c.calls || []).filter((x) => x.tool === "send_file" && x.ok);
+                  const toolCalls = (c.calls || []).filter((x) => !(x.tool === "send_file" && x.ok));
+                  return (
+                    <div key={i} className="flex flex-col gap-2">
+                      {fileCalls.length > 0 && (
+                        <div className="flex flex-col gap-1.5">
+                          {fileCalls.map((call, j) => (
+                            <FileCard
+                              key={j}
+                              path={call.params?.path}
+                              bytes={call.result?.bytes}
+                              note={call.params?.note}
+                            />
+                          ))}
+                        </div>
+                      )}
+                      {toolCalls.length > 0 && (
+                        <div className="flex flex-col gap-1.5">
+                          {toolCalls.map((call, j) => (
+                            <ToolCallCard key={j} call={call} />
+                          ))}
+                        </div>
+                      )}
+                      {c.visible && c.visible.trim() && (
+                        <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
+                          <Markdown>{c.visible}</Markdown>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
                 {live.text ? (
                   <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
                     <Markdown>{live.text}</Markdown>
@@ -1137,9 +1154,12 @@ export default function ChatPage({ onStats, visible }) {
 }
 
 // 单条消息气泡：user / assistant，assistant 可携带工具调用卡片
+// send_file 成功的调用渲染为文件卡片（如同收文件），不出工具卡
 function MessageBubble({ message }) {
   const isUser = message.role === "user";
   const calls = message.tool_calls || [];
+  const fileCalls = calls.filter((c) => c.tool === "send_file" && c.ok);
+  const toolCalls = calls.filter((c) => !(c.tool === "send_file" && c.ok));
   const hasText = message.content && message.content.trim().length > 0;
 
   if (isUser) {
@@ -1152,9 +1172,21 @@ function MessageBubble({ message }) {
 
   return (
     <div className="mr-auto flex max-w-[85%] flex-col gap-2">
-      {calls.length > 0 && (
+      {fileCalls.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          {calls.map((c, i) => (
+          {fileCalls.map((c, i) => (
+            <FileCard
+              key={i}
+              path={c.params?.path}
+              bytes={c.result?.bytes}
+              note={c.params?.note}
+            />
+          ))}
+        </div>
+      )}
+      {toolCalls.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          {toolCalls.map((c, i) => (
             <ToolCallCard key={i} call={c} />
           ))}
         </div>

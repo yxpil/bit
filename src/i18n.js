@@ -148,6 +148,10 @@ const dict = {
     "chat.busyPlaceholder": "本对话执行中，可切换其他对话继续…",
     "chat.inputPlaceholder": "输入消息，Enter 换行，Ctrl+Enter 发送",
     "chat.dropHint": "松开鼠标，插入文件 / 文件夹链接",
+    // 文件卡片（智能体 send_file 发来的文件）
+    "filecard.open": "打开",
+    "filecard.reveal": "所在文件夹",
+    "filecard.fromAgent": "智能体发来文件",
     // 工具页
     "tools.badTestParams": "测试参数不是合法 JSON",
     "tools.errNameRequired": "请填写工具名称",
@@ -444,6 +448,10 @@ const dict = {
     "chat.busyPlaceholder": "This conversation is running — switch to another to continue…",
     "chat.inputPlaceholder": "Type a message — Enter for newline, Ctrl+Enter to send",
     "chat.dropHint": "Release to insert file / folder links",
+    // File cards (files sent by the agent via send_file)
+    "filecard.open": "Open",
+    "filecard.reveal": "Reveal in folder",
+    "filecard.fromAgent": "File from agent",
     // Tools page
     "tools.badTestParams": "Test parameters are not valid JSON",
     "tools.errNameRequired": "Please enter a tool name",

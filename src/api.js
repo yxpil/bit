@@ -60,6 +60,8 @@ export const api = {
   },
   // 解析上传文件：Excel→Markdown 表格 / Word(.docx)→纯文本 / CSV→原文。data 为 base64（可含 data:URL 前缀）
   extractFile: (filename, data) => invoke("extract_file", { filename, data }),
+  // 用系统默认程序打开文件；reveal=true 时打开所在文件夹并定位
+  openPath: (path, reveal) => invoke("open_path", { path, reveal: !!reveal }),
   // 抓取网页正文，返回 { title, text }
   fetchWebpage: (url) => invoke("fetch_webpage", { url }),
   // 端口冲突检测：返回 { available, addr, reason? }

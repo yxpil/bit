@@ -253,6 +253,21 @@ function record(name, ok, detail) {
     record("T15 tool-overwrite", /E2E-FINAL-RETOOL tripled=15/.test(r.reply || ""), `reply=${(r.reply || "").slice(0, 100)}`);
   } catch (e) { record("T15 tool-overwrite", false, e.message); }
 
+  // T16 智能体发文件：write_file 生成 → send_file 发送 → 助手消息带文件卡片数据
+  {
+    const sendPaths = [".e2e-send.txt", "src-tauri/.e2e-send.txt"];
+    const delSend = () => sendPaths.forEach((p) => { try { fs.unlinkSync(p); } catch {} });
+    try {
+      delSend();
+      const r = await chat(sid(16), "E2E-CMD-SEND go");
+      const send = (r.messages || [])
+        .flatMap((m) => m.tool_calls || [])
+        .find((c) => c.tool === "send_file");
+      const okSend = !!send && send.ok && !!send.params?.path && send.result?.sent === true;
+      record("T16 agent-send-file", okSend, `reply=${(r.reply || "").slice(0, 60)} send=${JSON.stringify(send || null).slice(0, 140)}`);
+    } catch (e) { record("T16 agent-send-file", false, e.message); } finally { delSend(); }
+  }
+
   const pass = results.filter((x) => x.ok).length;
   console.log(`\n==== ${pass}/${results.length} passed ====`);
   process.exit(pass === results.length ? 0 : 1);
