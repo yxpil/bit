@@ -839,7 +839,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         - 工具4 · edit：增量补丁改文件，精确替换。参数 {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(可选)}}\n\
         - 工具5 · add_tool：给自己增加工具——用本机某解释器把一段代码沉淀为常驻工具。参数 {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}\n\
         - 工具6 · skill：技能库读写。写入技能 {{\"action\":\"save\",\"name\":string,\"summary\":string}}（同名覆盖）；搜索技能 {{\"action\":\"search\",\"query\":string}}（query 留空返回全部）\n\
-        - 工具7 · sub_agent：派生子智能体——新建独立会话执行自包含的大任务（调研/批量整理/写大文件），阻塞等待并返回其最终结论，子会话保留在侧栏可查看全过程。参数 {{\"task\":string,\"title\":string(可选)}}。注意 task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全\n\
+        - 工具7 · sub_agent：派生子智能体——新建独立会话执行自包含的大任务（调研/批量整理/写大文件），阻塞等待并把最终结论【原文完整】直接返回到当前对话（无需约定文件位置，直接基于返回内容继续），子会话保留在侧栏可查看全过程。参数 {{\"task\":string,\"title\":string(可选)}}。注意 task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全\n\
         {skill_examples}\n\
         \n\
         ## 自我扩展的扩展动作（同样作为 tool 调用）\n\

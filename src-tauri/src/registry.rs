@@ -132,7 +132,7 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.sub_agent",
             "sub_agent",
-            "派生子智能体：新建一个独立会话并把完整任务发过去，子智能体拥有你的全部工具，会自主多轮执行（含读写文件、执行命令）直到给出最终答案。适合把独立的大任务（调研、批量整理、写大文件、并行分支）交给子任务完成，本工具会阻塞等待并返回子智能体的最终结论。task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全",
+            "派生子智能体：新建一个独立会话并把完整任务发过去，子智能体拥有你的全部工具，会自主多轮执行（含读写文件、执行命令）直到给出最终答案。适合把独立的大任务（调研、批量整理、写大文件、并行分支）交给子任务完成。本工具阻塞等待，并把子智能体的最终结论【原文完整】直接返回到当前对话——无需约定任何文件位置，直接基于返回内容继续即可。task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -552,16 +552,30 @@ async fn builtin_invoke(
                     res = &mut run => {
                         break match res {
                             Ok(msgs) => {
+                                // 子代理结论直接完整返回给主会话（无需约定写文件/位置）。
+                                // 仅设超高安全上限，防止异常巨文撑爆主会话上下文
+                                const SUBANSWER_MAX: usize = 60_000;
                                 let final_answer = msgs
                                     .iter()
                                     .rev()
                                     .find(|m| m.role == "assistant" && !m.content.trim().is_empty())
                                     .map(|m| m.content.clone())
                                     .unwrap_or_default();
+                                let truncated = final_answer.chars().count() > SUBANSWER_MAX;
+                                let answer = if truncated {
+                                    safe_trunc(&final_answer, SUBANSWER_MAX)
+                                } else {
+                                    final_answer
+                                };
                                 Ok(serde_json::json!({
                                     "session_id": sid,
-                                    "final_answer": safe_trunc(&final_answer, 4000),
-                                    "note": "子会话已保留全部执行过程，可再次对其派发追问"
+                                    "final_answer": answer,
+                                    "truncated": truncated,
+                                    "note": if truncated {
+                                        "结论过长已截断，完整过程与结论见子会话（可对其派发追问）"
+                                    } else {
+                                        "子会话已保留全部执行过程，可再次对其派发追问"
+                                    }
                                 }))
                             }
                             Err(e) => Err(format!("子任务失败: {e}（子会话 {sid} 已保留过程记录）")),
