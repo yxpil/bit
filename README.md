@@ -24,11 +24,51 @@ BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、�
 
 ## 安装使用
 
-从 [Releases](https://github.com/yxpil/bit/releases) 下载最新的 **`BIT-Setup-x.y.z.exe`**（Inno Setup 安装包，已内置运行所需的 `WebView2Loader.dll`）并安装。
+从 [Releases](https://github.com/yxpil/bit/releases) 下载对应平台的安装包：
 
-> 本项目为 GNU (MinGW) 工具链构建，运行时需要 `WebView2Loader.dll` 与 `bit.exe` 位于同一目录。请通过安装包安装，**不要单独拷贝 exe 运行**。
+| 平台 | 安装包 | 说明 |
+|---|---|---|
+| Windows x64 | `*-setup.exe`（NSIS）或 `*.msi` | 双击安装；ARM64 笔记本（骁龙 X）选 `aarch64` 版 |
+| macOS Apple Silicon | `*_aarch64.dmg` | M 系列芯片 |
+| macOS Intel | `*_x64.dmg` | 拖入 Applications 安装 |
+| Linux x64 / ARM64 | `*.deb` / `*.AppImage` / `*.rpm` | 按发行版习惯选择 |
 
-首次使用：进入「AI 设置」→ 添加一个提供方（协议 / Base URL / API Key / 模型）→ 点击播放按钮激活 → 回到「对话」开始使用。
+### macOS 提示"已损坏，无法打开"？
+
+BIT 目前未购买 Apple 开发者证书（$99/年），采用 ad-hoc 签名。macOS 对**从网络下载**的应用默认拦截，新系统会直接报"已损坏"。以下任一方式即可正常使用：
+
+**方式一：移除隔离属性（最可靠，推荐）**
+
+```bash
+# 安装后执行一次即可
+xattr -cr /Applications/BIT.app
+```
+
+**方式二：系统设置放行**
+
+1. 双击 dmg 安装，首次打开若弹出警告，**先不要点"移到废纸篓"**
+2. 打开 系统设置 → 隐私与安全性 → 滚动到下方安全区 → 点击 **"仍要打开"**
+
+**方式三：右键打开（macOS 14 及更早版本）**
+
+按住 Control（或右键）点击 BIT → 选"打开" → 再点"打开"确认。
+
+> 原理：`xattr -cr` 删除文件的 quarantine 隔离标记；签名本身完整可校验，去掉隔离后 macOS 不再拦截。
+
+### Windows 首次运行提示 SmartScreen？
+
+安装包未做代码签名（EV 证书同样需付费）。SmartScreen 弹窗时点 **"更多信息" → "仍要运行"** 即可。
+
+### Linux 运行 AppImage
+
+```bash
+chmod +x BIT_0.4.2_amd64.AppImage
+./BIT_0.4.2_amd64.AppImage
+```
+
+### 首次使用
+
+进入「AI 设置」→ 添加一个提供方（协议 / Base URL / API Key / 模型，可点"从 API 获取"拉取模型列表）→ 点击播放按钮激活 → 回到「对话」开始使用。
 
 ## 开发
 
@@ -37,16 +77,7 @@ BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、�
 ```bash
 npm install          # 安装前端依赖
 npm run tauri dev    # 开发模式（热更新）
-npm run tauri build  # 构建 release（生成 exe 与 NSIS/MSI 安装包）
-```
-
-### 打包 Inno Setup 安装包
-
-`tauri build` 生成 release 二进制后，用 Inno Setup 打包（脚本已内置 WebView2 DLL）：
-
-```powershell
-& "C:\Program Files\Inno Setup 7\ISCC.exe" installer\bit.iss
-# 产物：installer\Output\BIT-Setup-<version>.exe
+npm run tauri build  # 构建 release（NSIS / MSI / dmg / AppImage / deb）
 ```
 
 ## 项目结构
