@@ -18,6 +18,11 @@ on:
         type: boolean
         required: false
         default: true
+      include_exotic:
+        description: "是否构建国产/新兴架构（riscv64 / loongarch64，QEMU 模拟编译较慢）"
+        type: boolean
+        required: false
+        default: true
   push:
     tags:
       - "v*"
@@ -223,4 +228,49 @@ jobs:
           gh release upload "$TAG" \
             src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
             src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+  linux-exotic:
+    needs: ensure-release
+    # 国产/新兴架构：龙芯 LoongArch64（3A5000/3A6000）与 RISC-V 64（VisionFive 2 等）。
+    # GitHub 无原生 runner，用 QEMU binfmt 跑对应架构 Debian 容器原生编译（模拟编译较慢，约 1~3 小时）。
+    # 产出 deb + 裸二进制 tar.gz（AppImageKit 不支持这两种架构）。
+    # 飞腾/鲲鹏/麒麟 ARM = linux-arm 的 aarch64 包；兆芯/海光 = linux 的 x86_64 包；申威 SW64 无 Rust 工具链，无法支持。
+    if: github.event_name == 'push' || inputs.include_exotic != false
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+          - arch: loongarch64
+            image: ghcr.io/loong64/debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 构建前端 dist（宿主机 x64 完成，容器内只编译 Rust）
+        run: npm ci && npm run build
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64,loongarch64
+      - name: 容器内构建（${{ matrix.arch }}）
+        run: |
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          docker run --rm --platform linux/${{ matrix.arch }} \
+            -v "$PWD":/repo -w /repo \
+            ${{ matrix.image }} \
+            bash packaging/exotic/build.sh ${{ matrix.arch }} "${VERSION#v}"
+      - name: 上传到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.ensure-release.outputs.tag }}"
+          gh release upload "$TAG" \
+            packaging/exotic/out/bit_*.deb \
+            packaging/exotic/out/bit_*.tar.gz \
             --clobber --repo "$GITHUB_REPOSITORY"
