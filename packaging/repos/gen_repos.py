@@ -197,6 +197,136 @@ def gen_pacman(debs, out: Path):
         print(f"pacman: {pkg_name} ({len(pkg_data)//1024} KB)")
 
 
+# ---------------- dnf / yum（RPM 仓库） ----------------
+
+RPM_STR, RPM_I18N, RPM_BIN = 6, 8, 7
+RPM_INT16, RPM_INT32, RPM_INT64 = 3, 4, 5
+TAG_NAME, TAG_VERSION, TAG_RELEASE = 1000, 1001, 1002
+TAG_SUMMARY, TAG_DESCRIPTION, TAG_BUILDTIME, TAG_SIZE = 1004, 1005, 1006, 1009
+TAG_VENDOR, TAG_LICENSE, TAG_URL, TAG_ARCH = 1011, 1014, 1020, 1022
+TAG_PROVIDENAME, TAG_REQUIRENAME = 1047, 1049
+
+
+def _read_header(data: bytes, pos: int):
+    nindex = int.from_bytes(data[pos + 8 : pos + 12], "big")
+    hsize = int.from_bytes(data[pos + 12 : pos + 16], "big")
+    idx = pos + 16
+    entries = []
+    for i in range(nindex):
+        off = idx + i * 16
+        entries.append(tuple(int.from_bytes(data[off + j * 4 : off + j * 4 + 4], "big") for j in range(4)))
+    return entries, data[idx + nindex * 16 : idx + nindex * 16 + hsize], idx + nindex * 16 + hsize
+
+
+def _header_entries(data: bytes, pos: int):
+    """解析 main header → {tag: 值}"""
+    region_entries, ddata, end = _read_header(data, pos)
+    values = {}
+
+    def val(tag):
+        for t, typ, off, cnt in region_entries:
+            if t == tag:
+                if typ in (RPM_STR, RPM_I18N):
+                    return ddata[off : ddata.index(b"\x00", off)].decode("utf-8", "replace")
+                if typ == RPM_INT32:
+                    return [int.from_bytes(ddata[off + i * 4 : off + i * 4 + 4], "big") for i in range(cnt)][0 if cnt == 1 else slice(None)]
+                if typ == RPM_INT16:
+                    return [int.from_bytes(ddata[off + i * 2 : off + i * 2 + 2], "big") for i in range(cnt)][0 if cnt == 1 else slice(None)]
+                if typ == RPM_BIN:
+                    return ddata[off : off + cnt]
+        return None
+
+    for t in (TAG_NAME, TAG_VERSION, TAG_RELEASE, TAG_SUMMARY, TAG_DESCRIPTION,
+              TAG_BUILDTIME, TAG_SIZE, TAG_VENDOR, TAG_LICENSE, TAG_URL, TAG_ARCH,
+              TAG_PROVIDENAME, TAG_REQUIRENAME):
+        v = val(t)
+        if v is not None:
+            values[t] = v
+    return values, end
+
+
+def rpm_fields(path: Path) -> dict:
+    """解析 rpm 头部关键字段"""
+    data = path.read_bytes()
+    pos = 96  # 跳过 lead
+    _, _, end = _read_header(data, pos)          # signature header
+    pad = (8 - ((end - 96) % 8)) % 8
+    pos = end + pad
+    # 对齐容错：若 magic 不符则逐 4 字节向后找
+    while data[pos : pos + 3] != b"\x8e\xad\xe8":
+        pos += 4
+    fields, _ = _header_entries(data, pos)
+    return fields
+
+
+def gen_dnf(rpms, out: Path):
+    """dnf 仓库: packages/*.rpm + repodata/repomd.xml + primary.xml.gz"""
+    rdir = out / "dnf"
+    (rdir / "packages").mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    pkgs_xml = []
+
+    for rpm, arch, _ in rpms:
+        f = rpm_fields(rpm)
+        name = f.get(TAG_NAME, "bit")
+        ver, rel = f.get(TAG_VERSION, VERSION), f.get(TAG_RELEASE, "1")
+        size = rpm.stat().st_size
+        sha = hashlib.sha256(rpm.read_bytes()).hexdigest()
+        dest = rdir / "packages" / rpm.name
+        dest.write_bytes(rpm.read_bytes())
+        requires = f.get(TAG_REQUIRENAME) or []
+        if isinstance(requires, str):
+            requires = [requires]
+        provides = f.get(TAG_PROVIDENAME) or []
+        if isinstance(provides, str):
+            provides = [provides]
+        req_xml = "".join(
+            f'<rpm:entry name="{r}"/>' for r in requires
+            if not r.startswith("rpmlib(") and not r.startswith("/")
+        )
+        prov_xml = "".join(f'<rpm:entry name="{p}"/>' for p in provides)
+        pkgs_xml.append(
+            f'<package type="rpm"><name>{name}</name><arch>{f.get(TAG_ARCH, arch)}</arch>'
+            f'<version epoch="0" ver="{ver}" rel="{rel}"/>'
+            f'<checksum type="sha256" pkgid="YES">{sha}</checksum>'
+            f"<summary>{f.get(TAG_SUMMARY, PKGDESC)}</summary>"
+            f"<description>{f.get(TAG_DESCRIPTION, PKGDESC)}</description>"
+            f"<packager>BIT Release</packager><url>{f.get(TAG_URL, PKGURL)}</url>"
+            f'<time file="{now}" build="{f.get(TAG_BUILDTIME, now)}"/>'
+            f'<size package="{size}" installed="{f.get(TAG_SIZE, size)}" archive="{size}"/>'
+            f'<location href="packages/{rpm.name}"/>'
+            f"<format>"
+            f"<rpm:license>{f.get(TAG_LICENSE, 'Apache-2.0')}</rpm:license>"
+            f"<rpm:vendor>{f.get(TAG_VENDOR, 'BIT')}</rpm:vendor>"
+            f"<rpm:group>Applications/Development</rpm:group>"
+            f"<rpm:buildhost>bit-release</rpm:buildhost>"
+            f"<rpm:sourcerpm>{name}-{ver}-{rel}.src.rpm</rpm:sourcerpm>"
+            f'<rpm:header-range start="372" end="{size - 1}"/>'
+            f"<rpm:provides>{prov_xml}</rpm:provides>"
+            f"<rpm:requires>{req_xml}</rpm:requires>"
+            f"</format></package>"
+        )
+        print(f"dnf: {rpm.name}  ({name}-{ver}-{rel} {f.get(TAG_ARCH, arch)})")
+
+    body = "\n".join(pkgs_xml).encode()
+    import gzip as _gz
+    primary_gz = _gz.compress(body)
+    psha = hashlib.sha256(primary_gz).hexdigest()
+    ptime, psize = now, len(primary_gz)
+    repomd = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">\n'
+        f"<revision>{now}</revision>\n"
+        f'<data type="primary">\n<checksum type="sha256">{psha}</checksum>\n'
+        f"<open-checksum type=\"sha256\">{hashlib.sha256(body).hexdigest()}</open-checksum>\n"
+        f"<location href=\"repodata/{psha}-primary.xml.gz\"/>\n<timestamp>{ptime}</timestamp>\n"
+        f"<size>{psize}</size>\n<open-size>{len(body)}</open-size>\n</data>\n</repomd>\n"
+    )
+    (rdir / "repodata").mkdir(exist_ok=True)
+    (rdir / "repodata" / "repomd.xml").write_text(repomd)
+    (rdir / "repodata" / f"{psha}-primary.xml.gz").write_bytes(primary_gz)
+
+
 def main():
     deb_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
     debs = []
@@ -211,6 +341,13 @@ def main():
         sys.exit("no deb found")
     gen_apt(debs, out)
     gen_pacman(debs, out)
+    rpms = []
+    for rpm in sorted(deb_dir.glob("*.rpm")):
+        arch = "x86_64" if "x86_64" in rpm.name else ("aarch64" if "aarch64" in rpm.name else None)
+        if arch:
+            rpms.append((rpm, arch, {}))
+    if rpms:
+        gen_dnf(rpms, out)
     print("done")
 
 

@@ -53,6 +53,46 @@ scoop bucket add bit https://github.com/yxpil/scoop-bit
 scoop install bit
 ```
 
+npm（跨平台，自动下载对应平台应用）：
+
+```bash
+npm install -g bit-agent
+bit-agent   # 启动 BIT
+```
+
+Windows（winget，审核中）：`winget install yxpil.bit`
+
+Debian / Ubuntu / UOS / 麒麟（APT 源）：
+
+```bash
+echo "deb [trusted=yes] https://yxpil.github.io/apt-repo stable main" | sudo tee /etc/apt/sources.list.d/bit.list
+sudo apt update && sudo apt install bit
+```
+
+Fedora / RHEL / openSUSE（dnf 源）：
+
+```bash
+sudo tee /etc/yum.repos.d/bit.repo <<'EOF'
+[bit]
+name=BIT
+baseurl=https://yxpil.github.io/dnf-repo
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install bit
+```
+
+Arch / Manjaro（pacman 源）：
+
+```bash
+echo "
+[bit]
+Server = https://yxpil.github.io/pacman-repo/\$arch
+SigLevel = Never" | sudo tee /etc/pacman.d/bit.conf
+# 在 /etc/pacman.conf 的 [core] 前加一行：Include = /etc/pacman.d/bit.conf
+sudo pacman -Sy bit
+```
+
 ### macOS 提示"已损坏，无法打开"？
 
 BIT 目前未购买 Apple 开发者证书（$99/年），采用 ad-hoc 签名。macOS 对**从网络下载**的应用默认拦截，新系统会直接报"已损坏"。以下任一方式即可正常使用：

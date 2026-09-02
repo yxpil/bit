@@ -1,0 +1,33 @@
+{
+  "name": "bit-agent",
+  "version": "0.4.5",
+  "description": "BIT - 本地优先的 AI Agent 工具集（MCP / 工具注册 / 技能）。安装后自动下载对应平台的 BIT 应用。",
+  "bin": {
+    "bit-agent": "bin/bit-agent.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "mcp",
+    "tauri",
+    "bit"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yxpil/bit.git"
+  },
+  "homepage": "https://github.com/yxpil/bit",
+  "bugs": "https://github.com/yxpil/bit/issues"
+}
