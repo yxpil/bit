@@ -37,6 +37,14 @@ fn estimate_context_tokens(ctx: &Arc<Ctx>, session_id: &str, convo: &[crate::ai:
 
 // ---------- 概览 ----------
 
+/// 无界面模式（BIT_HEADLESS=1）：E2E/专项测试用，窗口保持隐藏不弹到前台
+#[tauri::command]
+pub fn is_headless() -> bool {
+    std::env::var("BIT_HEADLESS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// 本进程内存占用（字节）：页眉仪表盘展示，前端每 3 秒轮询
 #[tauri::command]
 pub fn mem_usage() -> u64 {

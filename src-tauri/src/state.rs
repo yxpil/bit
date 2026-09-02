@@ -91,10 +91,14 @@ pub const CHAT_MAX: usize = 60;
 
 impl Ctx {
     pub fn load(app: tauri::AppHandle) -> Arc<Ctx> {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .expect("failed to resolve app data dir");
+        // BIT_DATA_DIR：测试/E2E 用的数据目录覆盖（隔离环境验证默认配置），未设置走 Tauri 标准 app_data_dir
+        let data_dir = match std::env::var("BIT_DATA_DIR") {
+            Ok(dir) if !dir.trim().is_empty() => std::path::PathBuf::from(dir),
+            _ => app
+                .path()
+                .app_data_dir()
+                .expect("failed to resolve app data dir"),
+        };
         fs::create_dir_all(&data_dir).ok();
 
         let config = crate::config::Config::load(&data_dir);

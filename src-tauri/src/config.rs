@@ -45,7 +45,8 @@ fn generate_access_password() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            remote_enabled: true,
+            // 远程访问默认关闭：仅当用户在设置里主动开启后才监听端口
+            remote_enabled: false,
             host: "127.0.0.1".into(),
             port: 8600,
             client_key: generate_client_key(),
@@ -111,5 +112,39 @@ impl Config {
 
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 远程访问默认必须关闭：新装环境不监听端口，除非用户在设置里主动开启
+    #[test]
+    fn test_default_remote_disabled() {
+        let cfg = Config::default();
+        assert!(!cfg.remote_enabled);
+        // 关闭默认不影响鉴权要素：Client Key 与访问密码照常生成
+        assert!(cfg.client_key.starts_with("bit_"));
+        assert!(cfg.access_password.as_deref().unwrap_or("").len() == 8);
+        assert!(cfg.password_enabled);
+    }
+
+    /// 已有配置文件里的 remote_enabled 必须原样保留（老用户已开启的不被静默关闭）
+    #[test]
+    fn test_load_preserves_enabled() {
+        let dir = std::env::temp_dir().join(format!("bit-cfg-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"remote_enabled":true,"host":"0.0.0.0","port":8600,"client_key":"bit_x","revision":3}"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&dir);
+        assert!(cfg.remote_enabled);
+        assert_eq!(cfg.port, 8600);
+        assert_eq!(cfg.revision, 3);
+        fs::remove_dir_all(&dir).ok();
     }
 }

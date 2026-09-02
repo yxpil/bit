@@ -75,6 +75,18 @@ function getJson(path) {
   });
 }
 
+// 自定义凭据的 GET：用于鉴权负例（期望 401/403，响应体不必是 JSON）
+function getStatus(path, headers) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: BASE, port: PORT, path, method: "GET", headers, timeout: 15000, agent },
+      (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b })); }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 const results = [];
 function record(name, ok, detail) {
   results.push({ name, ok, detail });
@@ -344,6 +356,19 @@ function record(name, ok, detail) {
         `call=${okCall} summary=${okSummary} len=${msgs.length} reply=${(r.reply || "").slice(0, 60)}`
       );
     } catch (e) { record("T19 compact-history", false, e.message); }
+  }
+
+  // T20 远程访问鉴权：缺失密码 / 错误密码 / 错误 Key 均拒绝（负例在路由前被 auth 中间件拦截）
+  {
+    try {
+      // 密码校验关闭时缺失/错误密码应放行（仅靠 Client Key）
+      const noPwdCode = cfg.password_enabled ? 401 : 200;
+      const noPwd = await getStatus("/api/tools", { Authorization: `Bearer ${KEY}` });
+      const badPwd = await getStatus("/api/tools", { Authorization: `Bearer ${KEY}`, "X-Access-Password": "00000000" });
+      const badKey = await getStatus("/api/tools", { Authorization: "Bearer bit_wrongkey_e2e", "X-Access-Password": PASSWORD });
+      const ok = noPwd.code === noPwdCode && badPwd.code === noPwdCode && badKey.code === 401;
+      record("T20 remote-auth", ok, `noPwd=${noPwd.code}(exp ${noPwdCode}) badPwd=${badPwd.code} badKey=${badKey.code}`);
+    } catch (e) { record("T20 remote-auth", false, e.message); }
   }
 
   const pass = results.filter((x) => x.ok).length;
