@@ -32,6 +32,26 @@ BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、�
 | macOS Apple Silicon | `*_aarch64.dmg` | M 系列芯片 |
 | macOS Intel | `*_x64.dmg` | 拖入 Applications 安装 |
 | Linux x64 / ARM64 | `*.deb` / `*.AppImage` / `*.rpm` | 按发行版习惯选择 |
+| 龙芯 LoongArch64（3A5000/3A6000） | `*_loongarch64.deb` / `*_loongarch64.tar.gz` | deb 双击安装；其他发行版解压二进制 |
+| RISC-V 64（VisionFive 2 等） | `*_riscv64.deb` / `*_riscv64.tar.gz` | 同上 |
+| 飞腾 / 鲲鹏 / 麒麟 ARM | `*_arm64.deb` / `*_arm64.AppImage` / `*_arm64.rpm` | 与 Linux ARM64 通用 |
+| 兆芯 / 海光 | `*_amd64.deb` / `*_amd64.AppImage` / `*_x86_64.rpm` | 与 Linux x64 通用 |
+
+### 包管理器安装
+
+macOS（Homebrew）：
+
+```bash
+brew tap yxpil/bit
+brew install --cask bit
+```
+
+Windows（Scoop）：
+
+```powershell
+scoop bucket add bit https://github.com/yxpil/scoop-bit
+scoop install bit
+```
 
 ### macOS 提示"已损坏，无法打开"？
 

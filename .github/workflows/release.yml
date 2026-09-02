@@ -244,8 +244,12 @@ jobs:
         include:
           - arch: riscv64
             image: debian:trixie
+            platform: linux/riscv64
+          # loong64 社区镜像的 manifest 架构名是非标准的 "loong64"，按 digest 固定拉取
+          # （digest 对应 trixie 版 loong64 变体），运行时靠 binfmt 的 qemu-loongarch64 处理
           - arch: loongarch64
-            image: ghcr.io/loong64/debian:trixie
+            image: ghcr.io/loong64/debian@sha256:df06b06128d3b935288d4f601bab42ba68fd61730fd0957b1ef197f1df79346c
+            platform: ""
     steps:
       - uses: actions/checkout@v4
         with:
@@ -255,13 +259,16 @@ jobs:
           node-version: 20
       - name: 构建前端 dist（宿主机 x64 完成，容器内只编译 Rust）
         run: npm ci && npm run build
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: riscv64,loongarch64
+      - name: 安装 QEMU 模拟器（riscv64 + loongarch64）
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt:master --install loongarch64,riscv64 || \
+            docker run --privileged --rm tonistiigi/binfmt:qemu-v8.1.5 --install loongarch64,riscv64
+          ls /proc/sys/fs/binfmt_misc/ | grep -E "qemu-(loongarch64|riscv64)"
       - name: 容器内构建（${{ matrix.arch }}）
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
-          docker run --rm --platform linux/${{ matrix.arch }} \
+          PLATFORM="${{ matrix.platform }}"
+          docker run --rm ${PLATFORM:+--platform $PLATFORM} \
             -v "$PWD":/repo -w /repo \
             ${{ matrix.image }} \
             bash packaging/exotic/build.sh ${{ matrix.arch }} "${VERSION#v}"
