@@ -172,13 +172,46 @@ pub fn register(
     kind: ToolKind,
     actor: &str,
 ) -> Result<ToolDef, String> {
+    register_opts(ctx, name, description, parameters, kind, actor, false)
+}
+
+/// 注册或覆盖。overwrite=true 时允许更新 AI 自建的解释器/脚本工具（同 id 原位更新）。
+pub fn register_opts(
+    ctx: &Arc<crate::state::Ctx>,
+    name: &str,
+    description: &str,
+    parameters: serde_json::Value,
+    kind: ToolKind,
+    actor: &str,
+    overwrite: bool,
+) -> Result<ToolDef, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("工具名称不能为空".into());
     }
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut tools = ctx.tools.lock().unwrap();
-    if tools.iter().any(|t| t.name.eq_ignore_ascii_case(name)) {
-        return Err(format!("工具 `{name}` 已存在"));
+    if let Some(existing) = tools.iter_mut().find(|t| t.name.eq_ignore_ascii_case(name)) {
+        if !overwrite {
+            return Err(format!("工具 `{name}` 已存在"));
+        }
+        // 仅允许覆盖 AI 自建的工具（解释器 / 脚本）；内置、远程、MCP 工具不可覆盖
+        if !matches!(existing.kind, ToolKind::Interpreter { .. } | ToolKind::Script { .. }) {
+            return Err(format!("工具 `{name}` 是系统/远程工具，不允许覆盖，请换一个名字"));
+        }
+        existing.description = description.trim().to_string();
+        existing.parameters = if parameters.is_null() {
+            serde_json::json!({"type": "object", "properties": {}})
+        } else {
+            parameters
+        };
+        existing.kind = kind;
+        existing.created_by = actor.to_string();
+        existing.created_at = now;
+        let updated = existing.clone();
+        drop(tools);
+        ctx.save_tools();
+        return Ok(updated);
     }
     let tool = ToolDef {
         id: format!("tool-{}", uuid::Uuid::new_v4().simple()),
@@ -191,7 +224,7 @@ pub fn register(
         },
         kind,
         created_by: actor.to_string(),
-        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        created_at: now,
         enabled: true,
     };
     tools.push(tool.clone());
@@ -608,13 +641,14 @@ async fn builtin_invoke(
                 Some(rt) if !rt.enabled => return Err(format!("解释器 `{runtime}` 已暂停，无法用于新工具")),
                 _ => {}
             }
-            let tool = register(
+            let tool = register_opts(
                 ctx,
                 &name,
                 &desc,
                 serde_json::json!({"type": "object", "properties": {}, "additionalProperties": true}),
                 ToolKind::Interpreter { runtime: runtime.clone(), code },
                 actor,
+                true, // 同名工具若为 AI 自建则覆盖更新（修正错误实现）
             )?;
             Ok(serde_json::json!({ "registered": tool.name, "id": tool.id, "runtime": runtime }))
         }

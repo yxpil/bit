@@ -745,12 +745,7 @@ export default function ChatPage({ onStats, visible }) {
                   </button>
                 )}{" "}
                 tokens
-                {usageKnown &&
-                  ` · ${t("chat.cacheHit")} ${Math.round((usage.hit_rate || 0) * 100)}% · ${fmtK(
-                    usage.cache_read_tokens,
-                  )} / ${fmtK(usage.prompt_tokens)} tokens · ${t("chat.cacheOut")} ${fmtK(
-                    usage.completion_tokens,
-                  )} · ${usage.requests} ${t("chat.cacheRequests")}`}
+                {usageKnown && ` · ${t("chat.cacheHit")} ${Math.round((usage.hit_rate || 0) * 100)}%`}
               </span>
               {(ctxPct >= 1 || compressing) && (
                 <button

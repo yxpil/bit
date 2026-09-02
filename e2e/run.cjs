@@ -220,6 +220,39 @@ function record(name, ok, detail) {
     record("T12 mcp-error-branches", okErr, `unknown=${unknown.code}:${unknown.body.slice(0, 60)} noTool=${noTool.code}:${noTool.body.slice(0, 60)}`);
   } catch (e) { record("T12 mcp-error-branches", false, e.message); }
 
+  // T13 视觉：/api/chat 携带图片（data URL），mock 上游确认看到图片
+  try {
+    const r = await call("/api/chat", {
+      session_id: sid(13),
+      message: "E2E-CMD-IMG 描述这张图片",
+      images: ["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="],
+    });
+    const reply = r.code === 200 ? (JSON.parse(r.body).reply || "") : r.body;
+    record("T13 image-via-remote-chat", /E2E-IMAGE-SEEN count=1/.test(reply), `code=${r.code} reply=${reply.slice(0, 80)}`);
+  } catch (e) { record("T13 image-via-remote-chat", false, e.message); }
+
+  // T14 视觉：OpenAI 兼容端点 /v1/chat/completions 多模态 content 数组
+  try {
+    const r = await call("/v1/chat/completions", {
+      model: "mock-model-a",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "E2E-CMD-IMG-V1 这是什么" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==" } },
+        ],
+      }],
+    });
+    const reply = r.code === 200 ? (JSON.parse(r.body).choices?.[0]?.message?.content || "") : r.body;
+    record("T14 image-via-openai-endpoint", /E2E-IMAGE-SEEN count=1/.test(reply), `code=${r.code} reply=${reply.slice(0, 80)}`);
+  } catch (e) { record("T14 image-via-openai-endpoint", false, e.message); }
+
+  // T15 工具覆盖：AI 同名覆盖更新自建工具（翻倍 → 三倍），立即调用验证新代码生效
+  try {
+    const r = await chat(sid(15), "E2E-CMD-RETOOL start");
+    record("T15 tool-overwrite", /E2E-FINAL-RETOOL tripled=15/.test(r.reply || ""), `reply=${(r.reply || "").slice(0, 100)}`);
+  } catch (e) { record("T15 tool-overwrite", false, e.message); }
+
   const pass = results.filter((x) => x.ok).length;
   console.log(`\n==== ${pass}/${results.length} passed ====`);
   process.exit(pass === results.length ? 0 : 1);

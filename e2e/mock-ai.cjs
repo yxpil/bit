@@ -4,9 +4,31 @@ const http = require("http");
 
 const PORT = 9901;
 
+function contentText(m) {
+  // 多模态：content 可能是 [{type:"text",text}, {type:"image_url",...}] 数组
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content)) return m.content.map((p) => (p.type === "text" ? p.text : "")).join("\n");
+  return "";
+}
+
+// 检测消息里是否带图片（OpenAI image_url / Claude source / Gemini inline_data）
+function imageCount(messages) {
+  let n = 0;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const p of m.content) {
+      if (p.type === "image_url" && p.image_url?.url) n++;
+      else if (p.type === "image" && p.source?.type === "base64") n++;
+      else if (p.type === "image_url" && p.source) n++;
+      else if (p.type === "image" && (p.inline_data || p.inlineData)) n++;
+    }
+  }
+  return n;
+}
+
 function pickLastUser(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") return messages[i].content || "";
+    if (messages[i].role === "user") return contentText(messages[i]);
   }
   return "";
 }
@@ -30,7 +52,7 @@ function feedbackText(messages) {
 
 // 模拟 token 用量：输入随历史增长；工具反馈轮之后命中缓存（前缀一致）→ cached_tokens 约 80%
 function usageFor(messages) {
-  const chars = messages.reduce((n, m) => n + String(m.content || "").length, 0);
+  const chars = messages.reduce((n, m) => n + contentText(m).length, 0);
   const prompt = Math.max(120, Math.floor(chars / 4));
   const cached = toolResultCount(messages) > 0 ? Math.floor(prompt * 0.8) : 0;
   return {
@@ -90,8 +112,12 @@ const server = http.createServer((req, res) => {
     const rounds = toolResultCount(messages);
     const fb = feedbackText(messages);
     // 场景标记可能出现在任意轮的用户消息里，用全历史匹配
-    const all = messages.map((m) => String(m.content || "")).join("\n");
+    const all = messages.map((m) => contentText(m)).join("\n");
     const isFeedback = rounds > 0;
+
+    // ── 图片场景：多模态消息到达即确认看见（在工具轮判断之前，图片消息无工具反馈） ──
+    const imgs = imageCount(messages);
+    if (imgs > 0) return respond(res, `E2E-IMAGE-SEEN count=${imgs}`, sse);
 
     // ── 工具反馈轮：按场景与轮次决定继续调用还是给最终答案 ──
     if (isFeedback) {
@@ -129,6 +155,24 @@ const server = http.createServer((req, res) => {
         return respond(res, "E2E-FINAL-ADDTOOL failed: 新工具调用无有效结果", sse);
       }
 
+      // E2E-CMD-RETOOL: 轮0 注册工具 → 轮1 同名覆盖更新（改成三倍） → 轮2 调用 → 轮3 最终
+      if (all.includes("E2E-CMD-RETOOL")) {
+        if (rounds === 1) {
+          const code2 =
+            "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const p=JSON.parse(d||'{}');console.log(JSON.stringify({tripled:(p.a||0)*3}))});";
+          return respond(
+            res,
+            `发现之前实现有误，覆盖更新同名工具：[{"tool":"add_tool","params":{"name":"e2e-doubler","description":"E2E 覆盖更新为三倍","runtime":"node","code":"${code2.replace(/"/g, '\\"')}"}}]`,
+            sse
+          );
+        }
+        if (rounds === 2)
+          return respond(res, '覆盖成功，调用验证：[{"tool":"e2e-doubler","params":{"a":5}}]', sse);
+        const tripled = (fb.match(/"tripled"\s*:\s*(\d+)/) || [])[1];
+        if (tripled !== undefined) return respond(res, `E2E-FINAL-RETOOL tripled=${tripled}`, sse);
+        return respond(res, "E2E-FINAL-RETOOL failed: 覆盖后调用无有效结果", sse);
+      }
+
       // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）
       const stdouts = messages
         .filter((m) => m.role === "tool")
@@ -159,6 +203,16 @@ const server = http.createServer((req, res) => {
         },
       ]);
       return respond(res, `我来给自己创建一个翻倍工具。\n${calls}`, sse);
+    }
+
+    // 覆盖更新场景：先注册翻倍工具，反馈轮里同名覆盖为三倍
+    if (last.includes("E2E-CMD-RETOOL")) {
+      const code =
+        "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const p=JSON.parse(d||'{}');console.log(JSON.stringify({doubled:(p.a||0)*2}))});";
+      const calls = JSON.stringify([
+        { tool: "add_tool", params: { name: "e2e-doubler", description: "E2E 测试：把数字翻倍", runtime: "node", code } },
+      ]);
+      return respond(res, `我先创建一个翻倍工具。\n${calls}`, sse);
     }
 
     if (last.includes("E2E-CMD-MARKUP"))

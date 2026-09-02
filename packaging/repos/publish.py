@@ -8,8 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-MAP = [("apt", "yxpil/apt-repo"), ("pacman", "yxpil/pacman-repo")]
-README = {"apt": "/tmp/apt-repo-readme.md", "pacman": "/tmp/pacman-repo-readme.md"}
+MAP = [("apt", "yxpil/apt-repo"), ("pacman", "yxpil/pacman-repo"), ("dnf", "yxpil/dnf-repo")]
+README = {"apt": "/tmp/apt-repo-readme.md", "pacman": "/tmp/pacman-repo-readme.md", "dnf": "/tmp/dnf-repo-readme.md"}
 
 
 def gh(*args, input_data=None):
@@ -26,8 +26,11 @@ def upload(repo, rel, local: Path):
     existing = gh(f"repos/{repo}/contents/{rel}")
     payload = {"message": f"publish {rel}", "content": b64}
     if existing:
-        payload["sha"] = json.loads(existing)["sha"]
-    gh("-X", "PUT", f"repos/{repo}/contents/{rel}",
+        try:
+            payload["sha"] = json.loads(existing)["sha"]
+        except Exception:
+            pass
+    gh("-X", "PUT", f"repos/{repo}/contents/{rel}", "--input", "-",
        input_data=json.dumps(payload))
     print(f"  {repo}/{rel}  ({local.stat().st_size} bytes)")
 

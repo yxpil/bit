@@ -112,7 +112,12 @@ export default function ToolsPage({ onStats }) {
     reload();
     // 启动时解释器在后台探测，完成后刷新列表
     const un = listen("runtimes-updated", () => reload());
-    return () => un.then((f) => f());
+    // 热加载：AI 注册/更新/删除工具或 MCP 接入后即时刷新清单（免重启）
+    const un2 = listen("tools-updated", () => reload());
+    return () => {
+      un.then((f) => f());
+      un2.then((f) => f());
+    };
   }, []);
 
   const refreshRt = async () => {

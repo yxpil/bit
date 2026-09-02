@@ -357,6 +357,12 @@ async fn remote_chat(
         .unwrap_or_else(|| "agent:unknown".into());
 
     let message = body.get("message").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    // 可选图片：data URL（data:image/png;base64,...）数组，仅支持视觉的模型能看到
+    let images: Vec<String> = body
+        .get("images")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
     // 远程可指定会话；未指定则写入当前激活会话
     let session_id = body.get("session_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     if message.trim().is_empty() {
@@ -372,7 +378,7 @@ async fn remote_chat(
         ctx.sessions.lock().unwrap().get_or_create_mut(&session_id);
     }
 
-    match crate::agent::chat_turn(&ctx, &session_id, &message, Vec::new()).await {
+    match crate::agent::chat_turn(&ctx, &session_id, &message, images).await {
         Ok(messages) => {
             let last = messages
                 .iter()

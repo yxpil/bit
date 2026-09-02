@@ -214,6 +214,10 @@ impl Ctx {
             self.data_dir.join("tools.json"),
             serde_json::to_string_pretty(&*tools).unwrap(),
         );
+        drop(tools);
+        // 热加载：通知前端工具清单已变化（AI 注册/更新/删除/启停工具后页面即时刷新）
+        use tauri::Emitter;
+        let _ = self.app.emit("tools-updated", ());
     }
 
     pub fn save_runtimes(&self) {

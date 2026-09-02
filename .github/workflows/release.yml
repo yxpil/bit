@@ -206,7 +206,7 @@ jobs:
             codesign --force --deep --sign - "$APP"
             codesign --verify --deep --strict "$APP"
           done
-      - name: 重打 dmg（包含签名修复后的 .app）
+      - name: 重打 dmg + 打包便携版 .app zip（包含签名修复后的 .app）
         run: |
           VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
           for T in aarch64-apple-darwin x86_64-apple-darwin; do
@@ -219,6 +219,9 @@ jobs:
             rm -f "$DMGDIR"/BIT_*.dmg
             hdiutil create -volname "BIT" -srcfolder "$STAGE" -ov -format UDZO -fs HFS+ "$DMGDIR/BIT_${VERSION}_${DMGARCH}.dmg"
             rm -rf "$STAGE"
+            # 便携版：免安装 .app zip（对齐 Windows portable 产物）
+            # 必须用 ditto 保留代码签名与扩展属性，普通 zip 会破坏签名导致"已损坏"
+            ditto -c -k --keepParent --sequesterRsrc "$APP" "$DMGDIR/BIT_${VERSION}_${DMGARCH}-app.zip"
           done
       - name: 上传到 Release
         env:
@@ -228,6 +231,8 @@ jobs:
           gh release upload "$TAG" \
             src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
             src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg \
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*-app.zip \
+            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*-app.zip \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   linux-exotic:

@@ -232,13 +232,14 @@ pub async fn execute_tool_call(
                 Some(rt) if !rt.enabled => return Err(format!("解释器 `{runtime}` 已暂停，无法用于新工具")),
                 _ => {}
             }
-            let tool = crate::registry::register(
+            let tool = crate::registry::register_opts(
                 ctx,
                 &tname,
                 &desc,
                 json!({"type": "object", "properties": {}, "additionalProperties": true}),
                 crate::registry::ToolKind::Interpreter { runtime: runtime.clone(), code },
                 "ai-self",
+                true, // 同名自建工具覆盖更新（修正错误实现）
             )?;
             crate::audit::record(ctx, "ai-self", "tool.write", &tool.name, json!({ "runtime": runtime }), true);
             Ok(json!({ "registered": tool.name, "id": tool.id }))
