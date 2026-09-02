@@ -22,6 +22,19 @@ finish-args:
   - --filesystem=home
   - --socket=pulseaudio
 modules:
+  # Vala 编译器：ayatana-ido 的 CMake 构建依赖（freedesktop 24.08 SDK 未含）
+  - name: vala
+    buildsystem: simple
+    build-commands:
+      - ./configure --prefix=/app --disable-valadoc
+      - make -j$(nproc)
+      - make install
+    cleanup:
+      - "*"
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/vala/0.56/vala-0.56.17.tar.xz
+        sha256: 26100c4e4ef0049c619275f140d97cf565883d00c7543c82bcce5a426934ed6a
   # libayatana-ido：ayatana-indicator 的缺失上游依赖（共享模块链未包含，runtime 亦无）
   - name: ayatana-ido
     buildsystem: cmake-ninja
