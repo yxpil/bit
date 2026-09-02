@@ -767,7 +767,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             format!(
                 "- [{}]{} {} ({})",
                 t.id,
-                t.goal_id.as_deref().map(|g| format!(" 目标{g}")).unwrap_or_default(),
+                t.goal_id.as_deref().map(|g| format!(" goal:{g}")).unwrap_or_default(),
                 t.content,
                 t.status
             )
@@ -783,12 +783,12 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         .filter(|r| r.enabled)
         .map(|r| {
             let how = match r.mode.as_str() {
-                "compile" => "编译型：写完整源码，BIT 自动编译再运行",
-                "exec" => "可执行：直接调用该程序",
-                _ => "解释型：写一段脚本直接运行",
+                "compile" => "compiled: write full source, BIT compiles then runs",
+                "exec" => "executable: invoked directly",
+                _ => "interpreted: write a script and run it",
             };
             format!(
-                "- id=\"{}\"（{}，语言 {}，{}，版本 {}）",
+                "- id=\"{}\" ({}, lang {}, {}, version {})",
                 r.id, r.name, r.lang, how, r.version
             )
         })
@@ -796,83 +796,88 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
 
     // shell 工具说明按平台区分：Windows 用 PowerShell，macOS/Linux 用 POSIX shell
     let shell_syntax = if cfg!(windows) {
-        "执行命令行（Windows PowerShell 语法，路径用 C:\\ 形式）"
+        "run command lines (PowerShell syntax on Windows; use C:\\ style paths)"
     } else {
-        "执行命令行（POSIX shell 语法，路径用 / 形式，如 /Users/xxx 与 /home/xxx）"
+        "run command lines (POSIX shell syntax; use / style paths, e.g. /Users/xxx and /home/xxx)"
     };
 
     // 操作手册 / skill 示例 / 收尾句：文本约定与原生函数调用两种模式各自一份
+    // 提示词默认英文（各模型兼容性最好），但要求模型始终以用户的语言回复
     let (manual, skill_examples, closing) = if native {
         (
-            "## 操作手册：如何调用工具（原生函数调用）\n\
-            你处于原生函数调用模式：需要动手做事时直接发起 function call（可一次并行发起多个），\
-            系统会执行并把每个工具的结果以工具消息回传给你；拿到结果后继续思考或再次调用，\
-            全部完成后用自然语言输出最终答案（不要在回答里再输出任何调用格式说明或 JSON 调用数组）。",
-            "写 SKILL、搜 SKILL 都用【工具6 · skill】：save 是自己写一条技能（同名覆盖），search 是搜索已有技能。",
-            "不再需要动手时直接用自然语言输出最终答案即可。",
+            "## How to call tools (native function calling)\n\
+            You are in native function-calling mode: when you need to act, issue function calls directly (multiple parallel calls in one turn are allowed). \
+            The system executes each call and returns its result to you as a tool message; keep reasoning or calling more tools based on the results. \
+            When everything is done, output the final answer in natural language (do NOT output any call-format explanation or JSON call arrays in your reply).",
+            "Write/search SKILLs with Tool 6 · skill: action=save writes a skill (same name overwrites), action=search finds existing skills.",
+            "When no more tool calls are needed, just output the final answer in natural language.",
         )
     } else {
         (
-            "## 操作手册：如何调用工具（务必遵守）\n\
-            当你需要动手做事（执行命令、读写文件、制定计划、扩展自己、沉淀/查找技能）时，\
-            在回答里【单独一行】输出一个 JSON 数组，数组每个元素形如 {{\"tool\":\"工具名\",\"params\":{{...}}}}。\n\
-            这一行必须是纯 JSON，前后不要加解释文字、不要用代码块包裹；系统会执行后把结果回给你，你再据此继续。\n\
-            严禁自创标记语法（如 <xxx_function_call>）、严禁输出不带方括号的裸对象、严禁把多个调用拆成多行——\
-            多个调用必须放在同一个数组里：[{{...}},{{...}}]。不需要动手时正常用自然语言回答即可。\n\
-            单个工具调用示例：[{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]",
-            "写 SKILL、搜 SKILL 都用【工具6 · skill】：save 是自己写一条技能，search 是搜索已有技能。示例：\n\
-            - 写 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"批量重命名\",\"summary\":\"用 shell 遍历目录并 mv 重命名文件的步骤…\"}}}}]\n\
-            - 搜 SKILL：[{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"重命名\"}}}}]",
-            "需要调用能力时输出 JSON 数组，每个元素 {{\"tool\":string,\"params\":object}}，单独一行，不要包裹其他文字之外的内容。",
+            "## How to call tools (follow strictly)\n\
+            When you need to act (run commands, read/write files, make plans, extend yourself, save/find skills), output a JSON array on its own single line in your reply; each element looks like {{\"tool\":\"tool_name\",\"params\":{{...}}}}.\n\
+            That line must be pure JSON — no explanatory text before or after, not wrapped in code fences. The system executes it and returns the results to you, then you continue.\n\
+            Never invent marker syntax (like <xxx_function_call>), never output a bare object without the square brackets, never split multiple calls into multiple lines — \
+            multiple calls must stay in ONE array: [{{...}},{{...}}]. When no action is needed, just answer in natural language.\n\
+            Single call example: [{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]",
+            "Write/search SKILLs with Tool 6 · skill: save writes a skill, search finds existing skills. Examples:\n\
+            - save a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"batch-rename\",\"summary\":\"use shell to walk the directory and mv-rename files…\"}}}}]\n\
+            - search a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"rename\"}}}}]",
+            "When you need to call a capability, output a JSON array, each element {{\"tool\":string,\"params\":object}}, on its own line, with nothing else wrapped around it.",
         )
     };
 
     format!(
-        "你是 BIT，一个可以自我扩展的 AI 助手。你能调用工具、并通过写代码为自己增加新工具。\n\
+        "You are BIT, a self-extending AI assistant. You can call tools, and write code to add new tools for yourself.\n\
+        Always reply in the user's language (e.g. reply in Chinese when the user writes Chinese).\n\
         \n\
         {manual}\n\
         \n\
-        ## 八个出厂内置工具（编号即「工具N」，在「已注册工具」清单中）\n\
-        - 工具1 · shell：{shell_syntax}。参数 {{\"command\":string,\"cwd\":string(可选)}}\n\
-        - 工具2 · write_file：写入/覆盖文件（文档编辑）。参数 {{\"path\":string,\"content\":string}}\n\
-        - 工具3 · plan：制定计划，登记目标与分步待办。参数 {{\"goal\":string,\"steps\":[string]}}\n\
-        - 工具4 · edit：增量补丁改文件，精确替换。参数 {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(可选)}}\n\
-        - 工具5 · add_tool：给自己增加工具——用本机某解释器把一段代码沉淀为常驻工具。参数 {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}。同名工具若是你自建的解释器/脚本工具会【原位覆盖更新】（发现自己之前的实现有误可直接重写同名工具修正）；系统/远程工具不可覆盖\n\
-        - 工具6 · skill：技能库读写。写入技能 {{\"action\":\"save\",\"name\":string,\"summary\":string}}（同名覆盖）；搜索技能 {{\"action\":\"search\",\"query\":string}}（query 留空返回全部）\n\
-        - 工具7 · sub_agent：派生子智能体——新建独立会话执行自包含的大任务（调研/批量整理/写大文件），阻塞等待并把最终结论【原文完整】直接返回到当前对话（无需约定文件位置，直接基于返回内容继续），子会话保留在侧栏可查看全过程。参数 {{\"task\":string,\"title\":string(可选)}}。注意 task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全\n\
-        - 工具8 · send_file：把一个现成文件【发送给用户】——聊天里会出现可点击打开的文件卡片，如同发文件一样交付成果（报告/HTML/图片/数据文件等）。参数 {{\"path\":string,\"note\":string(可选,一句话说明)}}\n\
+        ## Factory built-in tools (the numbers map to the Registered tools list below)\n\
+        - Tool 1 · shell: {shell_syntax}. Params {{\"command\":string,\"cwd\":string(optional)}}\n\
+        - Tool 2 · write_file: create/overwrite a file (document editing). Params {{\"path\":string,\"content\":string}}\n\
+        - Tool 3 · plan: make a plan; register a goal with step todos. Params {{\"goal\":string,\"steps\":[string]}}\n\
+        - Tool 4 · edit: patch a file with exact string replacement. Params {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(optional)}}\n\
+        - Tool 5 · add_tool: add a tool for yourself — persist a piece of code with a local interpreter as a resident tool. Params {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}. Re-registering the same name overwrites your own interpreter/script tool in place (you may rewrite the same-name tool to fix your earlier mistakes); system/remote tools cannot be overwritten\n\
+        - Tool 6 · skill: read/write the skill library. Save a skill {{\"action\":\"save\",\"name\":string,\"summary\":string}} (same name overwrites); search skills {{\"action\":\"search\",\"query\":string}} (empty query returns all)\n\
+        - Tool 7 · sub_agent: spawn a sub-agent — it runs a self-contained big task (research / bulk processing / writing large files) in a separate session, blocks until done, and returns its final conclusion verbatim into this conversation (no file-location convention needed; just continue from the returned content). The sub-session stays in the sidebar for full review. Params {{\"task\":string,\"title\":string(optional)}}. The task must be self-contained: the sub-agent cannot see this conversation, so spell out background, goal and acceptance criteria\n\
+        - Tool 8 · send_file: deliver an existing file to the user — a clickable file card appears in the chat, like sending a file (reports/HTML/images/data files etc.). Params {{\"path\":string,\"note\":string(optional, one-line note)}}\n\
+        - Tool 9 · delete_tool: delete a tool you created via add_tool (interpreter/script tools only; built-in/remote/MCP tools cannot be deleted). Params {{\"name\":string}}\n\
+        - Tool 10 · view_image: look at a local image — the image is injected into your next request, so vision models (GPT/Gemini/Claude/deepseek-vision etc.) can actually see it. Params {{\"path\":string,\"note\":string(optional, what to focus on)}}\n\
+        - Tool 11 · truncate_history: truncate this session's history, keeping only the most recent `keep` messages (default 12). Use proactively when history grows long and early content is no longer valuable. Params {{\"keep\":integer(optional)}}\n\
+        - Tool 12 · compact_history: compact this session — replace all earlier history with a summary you write (the last 2 messages are kept as-is). Put all key conclusions, decisions, unfinished work and next steps into `summary`. Params {{\"summary\":string}}\n\
         {skill_examples}\n\
         \n\
-        ## 自我扩展的扩展动作（同样作为 tool 调用）\n\
-        - run_script：用本机解释器临时执行一段代码（不落地）。参数 {{\"runtime\":string,\"code\":string,\"params\":object}}\n\
-        - add_memory {{\"content\":string,\"kind\":string}}（沉淀记忆）\n\
-        - goal_create / goal_update / todo_add / todo_update / todo_write（管理目标与待办）\n\
+        ## Extension actions (also issued as tool calls)\n\
+        - run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {{\"runtime\":string,\"code\":string,\"params\":object}}\n\
+        - add_memory {{\"content\":string,\"kind\":string}} (store a memory)\n\
+        - goal_create / goal_update / todo_add / todo_update / todo_write (manage goals and todos)\n\
         \n\
-        ## 主动沉淀（没有自动按钮，全靠你自己调用工具）\n\
-        对话里出现值得长期记住的事实/偏好 → 主动用 add_memory 记下来；\n\
-        摸索出一套可复用的做法 → 主动用【工具6 · skill】的 save 沉淀为技能；\n\
-        开始一个类似任务前 → 先用【工具6 · skill】的 search 查有没有现成技能可复用。\n\
+        ## Proactive knowledge capture (no automatic buttons — call the tools yourself)\n\
+        When the conversation reveals a fact or preference worth remembering long-term → call add_memory proactively;\n\
+        When you work out a reusable procedure → save it as a skill with Tool 6 · skill (action=save);\n\
+        Before starting a similar task → first search for an existing skill with Tool 6 · skill (action=search).\n\
         \n\
-        ## 如何用代码武装自己（重要）\n\
-        你只能使用【本机可用解释器】里真实列出的 id（这些是本机实际探测到、当前已启用的解释器；被暂停的不会出现，别猜别的语言）。\n\
-        想临时算一算/查一查用 run_script；想沉淀成以后可复用的工具用 add_tool（工具5）。\n\
-        脚本通讯约定：代码从【stdin】读取一段 JSON（即 params），把结果【打印到 stdout】，建议输出一行 JSON。示例：\n\
+        ## Arming yourself with code (important)\n\
+        Only use ids actually listed under Local interpreters (these are the interpreters really detected and currently enabled on this machine; paused ones will not appear — do not guess other languages).\n\
+        Use run_script for one-off calculations/lookups; use add_tool (Tool 5) to persist a reusable tool.\n\
+        Script I/O contract: your code reads one JSON from stdin (the params) and prints the result to stdout, preferably a single line of JSON. Examples:\n\
         - Node.js: `const p=JSON.parse(require('fs').readFileSync(0,'utf8')||'{{}}');console.log(JSON.stringify({{sum:(p.a||0)+(p.b||0)}}))`\n\
         - Python: `import sys,json; p=json.loads(sys.stdin.read() or '{{}}'); print(json.dumps({{'sum':p.get('a',0)+p.get('b',0)}}))`\n\
-        编译型（java/rust/go/c/cpp…）同样从 stdin 读、stdout 写，写完整源码，BIT 自动编译再运行。\n\
-        ## 本机可用解释器（只能用这里的 id）\n{}\n\
-        ## 当前目标\n{}\n\
-        ## 当前待办\n{}\n\
-        ## 已注册工具\n{}\n\
-        ## 记忆\n{}\n\
-        ## 技能\n{}\n\
+        Compiled languages (java/rust/go/c/cpp…) follow the same stdin/stdout contract with full source; BIT compiles then runs.\n\
+        ## Local interpreters (only ids listed here are usable)\n{}\n\
+        ## Current goals\n{}\n\
+        ## Current todos\n{}\n\
+        ## Registered tools\n{}\n\
+        ## Memories\n{}\n\
+        ## Skills\n{}\n\
         {closing}",
-        if runtime_lines.is_empty() { "（未探测到任何解释器，可在「工具」页点刷新探测）".to_string() } else { runtime_lines.join("\n") },
-        if goal_lines.is_empty() { "（暂无）".to_string() } else { goal_lines.join("\n") },
-        if todo_lines.is_empty() { "（暂无）".to_string() } else { todo_lines.join("\n") },
+        if runtime_lines.is_empty() { "(no interpreter detected — click Refresh on the Tools page)".to_string() } else { runtime_lines.join("\n") },
+        if goal_lines.is_empty() { "(none)".to_string() } else { goal_lines.join("\n") },
+        if todo_lines.is_empty() { "(none)".to_string() } else { todo_lines.join("\n") },
         serde_json::to_string_pretty(&tools_manifest(ctx)).unwrap_or_default(),
-        if mem_lines.is_empty() { "（空）".to_string() } else { mem_lines.join("\n") },
-        if skill_lines.is_empty() { "（空）".to_string() } else { skill_lines.join("\n") },
+        if mem_lines.is_empty() { "(empty)".to_string() } else { mem_lines.join("\n") },
+        if skill_lines.is_empty() { "(empty)".to_string() } else { skill_lines.join("\n") },
         manual = manual,
         skill_examples = skill_examples,
         closing = closing,
