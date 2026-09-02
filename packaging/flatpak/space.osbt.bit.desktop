@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=BIT
+GenericName=AI Agent Hub
+Comment=Local-first AI agent hub with tools, skills, and MCP support
+Comment[zh_CN]=本地优先的 AI Agent 工具中枢，支持工具、技能与 MCP
+Exec=bit
+Icon=space.osbt.bit
+Terminal=false
+Categories=Development;Utility;Network;
+Keywords=AI;Agent;LLM;MCP;Chat;
+StartupWMClass=BIT

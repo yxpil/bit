@@ -1,0 +1,54 @@
+app-id: space.osbt.bit
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.node22
+command: bit
+separate-locales: false
+finish-args:
+  # 联网：AI 提供方 / 远程访问 API
+  - --share=network
+  - --share=ipc
+  # 图形显示（X11 与 Wayland，Crostini 下走 Wayland）
+  - --socket=x11
+  - --socket=wayland
+  - --device=dri
+  # 系统托盘与通知
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.Notifications
+  # Agent 工具需要执行命令 / 读写文件（Shell / 文件 / 技能）
+  - --filesystem=home
+  - --socket=pulseaudio
+modules:
+  # 系统托盘（libayatana-appindicator，与原生 deb 依赖一致）
+  - name: libappindicator
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DENABLE_BINDINGS_MONO=OFF
+      - -DENABLE_GTK_DOC=OFF
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - /lib/*.la
+    sources:
+      - type: archive
+        url: https://github.com/AyatanaIndicators/libayatana-appindicator/archive/refs/tags/0.5.93.tar.gz
+        sha256: cbefed7a918a227bf71286246e237fcd3a9c8499b3eaac4897811a869409edf0
+  - name: bit
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+      env:
+        npm_config_yes: 'true'
+    build-commands:
+      - npm install --no-audit --no-fund
+      - npm run tauri build -- --no-bundle
+      - install -Dm755 src-tauri/target/release/bit /app/bin/bit
+      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/space.osbt.bit.png
+      - install -Dm644 packaging/flatpak/space.osbt.bit.desktop /app/share/applications/space.osbt.bit.desktop
+      - install -Dm644 packaging/flatpak/space.osbt.bit.metainfo.xml /app/share/metainfo/space.osbt.bit.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..

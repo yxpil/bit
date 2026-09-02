@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>space.osbt.bit</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>BIT</name>
+  <summary>Local-first AI agent hub with tools, skills, and MCP support</summary>
+  <summary xml:lang="zh_CN">本地优先的 AI Agent 工具中枢，支持工具、技能与 MCP</summary>
+  <description>
+    <p>
+      BIT is a local-first AI agent desktop application. Chat with any
+      OpenAI / Gemini / Claude protocol provider, let the AI run shell
+      commands, read and write files, make plans, and grow its own toolset
+      by writing and registering scripts as first-class tools.
+    </p>
+    <p xml:lang="zh_CN">
+      BIT 是一个本地优先的 AI Agent 桌面应用：接入任意 OpenAI / Gemini /
+      Claude 协议的模型提供方，让 AI 执行 Shell 命令、读写文件、制定计划，
+      还能自己编写脚本注册为常驻工具，越用越顺手。
+    </p>
+    <ul>
+      <li>Built-in tool registry: shell, files, plans, memory, skills, images</li>
+      <li>MCP client &amp; server — connect external MCP servers, or expose your tools at POST /mcp</li>
+      <li>OpenAI-compatible /v1 API with client-key + access-password auth (off by default)</li>
+      <li>Full audit log of every tool invocation</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">space.osbt.bit.desktop</launchable>
+  <developer id="space.osbt">
+    <name>yxpil</name>
+  </developer>
+  <url type="homepage">https://osbt.space</url>
+  <url type="bugtracker">https://github.com/yxpil/bit/issues</url>
+  <url type="vcs-browser">https://github.com/yxpil/bit</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.4.9" date="2026-09-02">
+      <description>
+        <p>Remote access now defaults to off; headless mode for E2E testing; theme accent fixes; 8-platform native packages including ChromeOS (Crostini) via the Linux packages.</p>
+      </description>
+    </release>
+  </releases>
+</component>
