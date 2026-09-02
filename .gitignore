@@ -11,3 +11,4 @@ Thumbs.db
 commit-msg.txt
 release-notes.md
 tmp/
+__pycache__/
