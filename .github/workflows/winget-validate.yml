@@ -27,12 +27,15 @@ jobs:
         env:
           REF: ${{ inputs.fork_ref || 'master' }}
           VER: ${{ inputs.version || '0.4.9' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # 走 GitHub contents API（带 token 直读 blob），绕开 raw.githubusercontent 的 CDN 缓存
           New-Item -ItemType Directory -Force manifest | Out-Null
-          $base = "https://raw.githubusercontent.com/yxpil/winget-pkgs/$($env:REF)/manifests/y/yxpil/bit/$($env:VER)"
           foreach ($f in @("yxpil.bit.yaml", "yxpil.bit.locale.en-US.yaml", "yxpil.bit.installer.yaml")) {
-            Invoke-WebRequest "$base/$f" -OutFile "manifest/$f"
-            Write-Host "downloaded $f"
+            $h = @{ Authorization = "token $($env:GH_TOKEN)"; Accept = "application/vnd.github+json" }
+            $r = Invoke-RestMethod -Headers $h -Uri "https://api.github.com/repos/yxpil/winget-pkgs/contents/manifests/y/yxpil/bit/$($env:VER)/$f?ref=$($env:REF)"
+            [IO.File]::WriteAllBytes("manifest/$f", [Convert]::FromBase64String($r.content))
+            Write-Host "downloaded $f ($($r.sha[0..6] -join ''))"
           }
       - name: winget validate
         shell: pwsh
