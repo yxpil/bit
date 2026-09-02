@@ -24,12 +24,9 @@
   #root {
     height: 100%;
   }
-  /* 触摸屏/触摸板滚动修复：
-     - 所有元素 contain：内层滚动容器到边界后不把滚动链传给外层（防整页被带走）
-     - 根元素 none：禁止 WebView 根滚动视图的超视距回弹（rubber-band） */
-  * {
-    overscroll-behavior: contain;
-  }
+  /* 触摸屏/触摸板滚动修复：根元素 none 禁止 WebView 根滚动视图的超视距回弹（rubber-band）。
+     注意不能全局给 * 加 contain：内层滚动容器到边界后滚动链被切断，
+     指针悬停其上时滚轮会"间歇失效"（外层不再接力滚动） */
   html,
   body {
     overscroll-behavior: none;

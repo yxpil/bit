@@ -46,7 +46,7 @@ export default function AuditPage() {
 
       <div className="card flex-1 overflow-y-auto p-0">
         <table className="w-full text-left text-xs">
-          <thead className="sticky top-0 bg-white border-b border-neutral-200">
+          <thead className="sticky top-0 border-b border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900">
             <tr className="text-neutral-500">
               <th className="px-4 py-3 font-medium">{t("audit.time")}</th>
               <th className="px-4 py-3 font-medium">{t("audit.actor")}</th>
@@ -58,7 +58,7 @@ export default function AuditPage() {
           </thead>
           <tbody>
             {shown.map((e) => (
-              <tr key={e.id} className="border-b border-neutral-100 last:border-0 hover:bg-neutral-50">
+              <tr key={e.id} className="border-b border-neutral-100 last:border-0 hover:bg-neutral-50 dark:border-neutral-800/60 dark:hover:bg-neutral-800/60">
                 <td className="whitespace-nowrap px-4 py-2.5 text-neutral-400">{e.ts}</td>
                 <td className="whitespace-nowrap px-4 py-2.5">{e.actor}</td>
                 <td className="whitespace-nowrap px-4 py-2.5 font-medium">{e.action}</td>

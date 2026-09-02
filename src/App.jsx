@@ -69,6 +69,20 @@ export default function App() {
     getVersion().then(setAppVersion).catch(() => {});
   }, []);
 
+  // 全局捕获右键：屏蔽 WebView 默认菜单；输入框保留原生气泡（复制/粘贴仍可用）
+  useEffect(() => {
+    const onCtx = (e) => {
+      const el = e.target;
+      const editable =
+        el instanceof HTMLInputElement ||
+        el instanceof HTMLTextAreaElement ||
+        el?.isContentEditable;
+      if (!editable) e.preventDefault();
+    };
+    window.addEventListener("contextmenu", onCtx, true);
+    return () => window.removeEventListener("contextmenu", onCtx, true);
+  }, []);
+
   const refresh = () => api.overview().then(setStats).catch(() => {});
   useEffect(() => {
     refresh();

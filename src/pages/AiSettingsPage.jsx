@@ -277,7 +277,7 @@ export default function AiSettingsPage({ onStats, stats }) {
                 onClick={() => saveParams({ ...params, reasoning_effort: v })}
                 className={`flex-1 rounded-full px-3 py-2 text-xs font-medium transition-all ${
                   params.reasoning_effort === v
-                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    ? "accent-solid"
                     : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
                 }`}
               >
@@ -297,7 +297,7 @@ export default function AiSettingsPage({ onStats, stats }) {
                 onClick={() => params.temperature !== null && saveParams({ ...params, temperature: null })}
                 className={`rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
                   params.temperature === null
-                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    ? "accent-solid"
                     : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
                 }`}
               >
@@ -308,7 +308,7 @@ export default function AiSettingsPage({ onStats, stats }) {
                 onClick={() => (params.temperature === null ? saveParams({ ...params, temperature: 0.7 }) : saveParams({ ...params, temperature: Math.min(2, Math.max(0, params.temperature)) }))}
                 className={`rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
                   params.temperature !== null
-                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    ? "accent-solid"
                     : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
                 }`}
               >
@@ -362,7 +362,7 @@ export default function AiSettingsPage({ onStats, stats }) {
                 onClick={() => pickPreset(preset)}
                 className={`rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
                   form.model === preset.model && form.base_url === preset.base
-                    ? "border-neutral-900 bg-neutral-900 text-white dark:border-white dark:bg-white dark:text-black"
+                    ? "accent-solid"
                     : "border-neutral-200 text-neutral-500 hover:border-neutral-400 hover:text-neutral-900 dark:border-neutral-700 dark:hover:border-neutral-500 dark:hover:text-white"
                 }`}
               >
@@ -382,7 +382,7 @@ export default function AiSettingsPage({ onStats, stats }) {
                 onClick={() => pickProtocol(proto.id)}
                 className={`flex-1 rounded-full px-3 py-2 text-xs font-medium transition-all ${
                   form.protocol === proto.id
-                    ? "bg-neutral-900 text-white dark:bg-white dark:text-black"
+                    ? "accent-solid"
                     : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700"
                 }`}
               >

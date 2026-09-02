@@ -281,7 +281,7 @@ export default function ToolsPage({ onStats }) {
   const kindTag = (kind) => {
     switch (kind?.kind) {
       case "builtin":
-        return { text: t("tools.kindBuiltin"), cls: "border-neutral-900 bg-neutral-900 text-white dark:border-white dark:bg-white dark:text-black" };
+        return { text: t("tools.kindBuiltin"), cls: "accent-solid" };
       case "remote":
         return { text: t("tools.kindRemote"), cls: "" };
       case "script":
@@ -551,7 +551,7 @@ export default function ToolsPage({ onStats }) {
           <div className="mt-3">
             <div className="mb-1.5 flex items-center gap-2">
               <span className="text-xs font-semibold">{t("tools.runResult")}</span>
-              <span className={`chip ${result.ok ? "border-neutral-900 bg-neutral-900 text-white dark:border-white dark:bg-white dark:text-black" : "text-red-600"}`}>
+              <span className={`chip ${result.ok ? "accent-solid" : "text-red-600"}`}>
                 {result.loading ? t("common.running") : result.ok ? t("common.success") : t("common.failed")}
               </span>
             </div>
@@ -606,9 +606,11 @@ export default function ToolsPage({ onStats }) {
                   />
                 </div>
                 <div className="flex w-8 justify-center">
-                  <button onClick={() => remove(tool.id)} className="icon-btn shrink-0" title={t("common.delete")}>
-                    <IconTrash size={13} />
-                  </button>
+                  {tool.kind !== "builtin" && (
+                    <button onClick={() => remove(tool.id)} className="icon-btn shrink-0" title={t("common.delete")}>
+                      <IconTrash size={13} />
+                    </button>
+                  )}
                 </div>
               </div>
             );

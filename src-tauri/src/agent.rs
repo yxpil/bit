@@ -63,21 +63,15 @@ fn record_and_payload(ctx: &Arc<Ctx>, session: &str, usage: &ai::TokenUsage) -> 
     })
 }
 
-/// 工具审批：
-/// - ask：每次询问用户（全局事件 tool-approval，前端弹卡片，等待应答，120 秒超时自动拒绝）
-/// - auto：记忆/技能/目标/待办沉淀与只读类查询自动通过，其余询问
-/// - allow_all：完全放行
+/// 工具审批：弹出询问卡片等待用户应答（120 秒超时自动拒绝）。
+/// 是否需要询问由 auto_pass() 在调用方判定，这里只负责"问"。
 /// 等待期间每 500ms 轮询一次会话中断标志：用户点「停止」可立即取消审批中的工具
-async fn approve_tool(
+async fn request_approval(
     ctx: &Arc<Ctx>,
     tool: &str,
     params: &serde_json::Value,
     session_id: Option<&str>,
 ) -> Result<(), String> {
-    let mode = ctx.config.lock().unwrap().tool_approval.clone();
-    if mode == "allow_all" || (mode == "auto" && is_safe_tool(tool)) {
-        return Ok(());
-    }
     use tauri::Emitter;
     let id = format!("ap-{}", ctx.approval_seq.fetch_add(1, Ordering::Relaxed));
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
@@ -136,6 +130,14 @@ async fn approve_tool(
 }
 
 /// auto 模式下自动通过的工具：沉淀类（记忆/技能/目标/待办/AI 自写工具）与只读类查询
+/// 审批判定：该模式下此工具是否免询问自动放行
+/// - allow_all：全部放行
+/// - auto：安全工具（沉淀类 / 只读类）放行，其余询问
+/// - ask（及其他值）：一律询问
+fn auto_pass(mode: &str, tool: &str) -> bool {
+    mode == "allow_all" || (mode == "auto" && is_safe_tool(tool))
+}
+
 fn is_safe_tool(tool: &str) -> bool {
     const SAFE: &[&str] = &[
         "add_memory",
@@ -165,7 +167,9 @@ pub async fn execute_tool_call(
     params: &serde_json::Value,
     session_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    approve_tool(ctx, name, params, session_id).await?;
+    if !auto_pass(&ctx.config.lock().unwrap().tool_approval.clone(), name) {
+        request_approval(ctx, name, params, session_id).await?;
+    }
     match name {
         // ---- AI 基础能力：为自己写插件并注册 ----
         "write_plugin" => {
@@ -377,6 +381,7 @@ pub async fn chat_turn(
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
     let mut native_exchanges: Vec<ai::ToolExchange> = Vec::new();
+    let mut pending_images: Vec<String> = Vec::new();
     let mut round = 0usize;
     loop {
         round += 1;
@@ -384,8 +389,8 @@ pub async fn chat_turn(
             clear_interrupt(ctx, &target);
             return Err("对话已中断".into());
         }
-        // 图片只在第一轮（真正的用户轮）随请求发送，工具反馈轮不再重复携带
-        let round_images: &[String] = if round == 1 { &images } else { &[] };
+        // 图片只在第一轮（真正的用户轮）随请求发送；view_image 看过的图从第二轮起随请求注入
+        let round_images: &[String] = if round == 1 { &images } else { &pending_images };
 
         // 拿到本轮回复：原生 function calling 优先，未探测过/已支持时尝试；失败降级文本约定
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
@@ -462,11 +467,24 @@ pub async fn chat_turn(
                     clear_interrupt(ctx, &target);
                     return Err("对话已中断".into());
                 }
+                let ok = outcome.is_ok();
+                let mut result = outcome.unwrap_or_else(|e| json!(e));
+                // view_image：把 data_url 抽出注入下一轮请求（视觉模型看图），记录本身脱敏（base64 不回喂不落库）
+                if call.name == "view_image" {
+                    if ok {
+                        if let Some(url) = result.get("data_url").and_then(|x| x.as_str()) {
+                            pending_images.push(url.to_string());
+                        }
+                    }
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.remove("data_url");
+                    }
+                }
                 records.push(crate::ai::ToolCallRecord {
                     tool: call.name.clone(),
                     params: call.args.clone(),
-                    ok: outcome.is_ok(),
-                    result: outcome.unwrap_or_else(|e| json!(e)),
+                    ok,
+                    result,
                 });
             }
 
@@ -639,6 +657,7 @@ pub async fn chat_turn_stream(
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
     // 端点不支持 tools 参数时立即降级文本约定；原生模式下本轮回复一次性下发
     let mut native_exchanges: Vec<ai::ToolExchange> = Vec::new();
+    let mut pending_images: Vec<String> = Vec::new();
     let mut round = 0usize;
     loop {
         round += 1;
@@ -650,8 +669,8 @@ pub async fn chat_turn_stream(
         }
         // 流式获取本轮回复，逐 token 推给前端
         emit(json!({ "type": "round_start" }));
-        // 图片只在第一轮随请求发送
-        let round_images: &[String] = if round == 1 { &images } else { &[] };
+        // 图片只在第一轮随请求发送；view_image 看过的图从第二轮起随请求注入
+        let round_images: &[String] = if round == 1 { &images } else { &pending_images };
 
         // 拿到本轮回复：原生 function calling 优先，失败降级文本约定
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
@@ -771,11 +790,24 @@ pub async fn chat_turn_stream(
                     emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
                     return Err(e);
                 }
+                let ok = outcome.is_ok();
+                let mut result = outcome.unwrap_or_else(|e| json!(e));
+                // view_image：把 data_url 抽出注入下一轮请求（视觉模型看图），记录本身脱敏（base64 不回喂不落库）
+                if call.name == "view_image" {
+                    if ok {
+                        if let Some(url) = result.get("data_url").and_then(|x| x.as_str()) {
+                            pending_images.push(url.to_string());
+                        }
+                    }
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.remove("data_url");
+                    }
+                }
                 records.push(crate::ai::ToolCallRecord {
                     tool: call.name.clone(),
                     params: call.args.clone(),
-                    ok: outcome.is_ok(),
-                    result: outcome.unwrap_or_else(|e| json!(e)),
+                    ok,
+                    result,
                 });
             }
 
@@ -1158,6 +1190,33 @@ mod tests {
         let calls = parse_tool_calls(reply).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["tool"], "shell");
+    }
+
+    /// 审批模式判定：allow_all 全放行 / auto 仅安全工具 / ask 一律询问
+    #[test]
+    fn test_approval_modes() {
+        // allow_all：任何工具（含危险操作）都放行
+        assert!(auto_pass("allow_all", "shell"));
+        assert!(auto_pass("allow_all", "edit"));
+        assert!(auto_pass("allow_all", "delete_tool"));
+        // auto：沉淀类与只读类放行，执行类询问
+        assert!(auto_pass("auto", "add_skill"));
+        assert!(auto_pass("auto", "add_memory"));
+        assert!(auto_pass("auto", "list_tools"));
+        assert!(auto_pass("auto", "view_image"));
+        // skill 工具含 save 分支（有写入语义），保守处理：询问
+        assert!(!auto_pass("auto", "skill"));
+        assert!(!auto_pass("auto", "shell"));
+        assert!(!auto_pass("auto", "edit"));
+        assert!(!auto_pass("auto", "write_file"));
+        assert!(!auto_pass("auto", "delete_tool"));
+        // ask：全部询问
+        assert!(!auto_pass("ask", "shell"));
+        assert!(!auto_pass("ask", "add_skill"));
+        assert!(!auto_pass("ask", "list_tools"));
+        // 未知模式按 ask 处理（保守）
+        assert!(!auto_pass("", "shell"));
+        assert!(!auto_pass("unknown", "add_memory"));
     }
 
     #[test]

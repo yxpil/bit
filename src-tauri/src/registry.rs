@@ -143,6 +143,47 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "sub_agent",
         ),
+        // 5.5 删除自己创建的工具（自建解释器/脚本可删；内置、远程、MCP 禁删）
+        mk(
+            "builtin.delete_tool",
+            "delete_tool",
+            "删除你自己创建的工具（add_tool 建的解释器/脚本工具）。内置工具、远程工具、MCP 工具不允许删除",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "要删除的工具名称" }
+                },
+                "required": ["name"]
+            }),
+            "delete_tool",
+        ),
+        // 5.6 截断历史：保留最近 N 条，其余丢弃
+        mk(
+            "builtin.truncate_history",
+            "truncate_history",
+            "截断当前会话的历史消息：只保留最近 keep 条（默认 12），更早的内容将不可恢复。当历史过长、早前内容已无价值时主动使用",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "keep": { "type": "integer", "description": "保留最近多少条消息（默认 12，最小 2）" }
+                }
+            }),
+            "truncate_history",
+        ),
+        // 5.7 压缩对话：用一段摘要替换全部历史（保留最近 2 条现场）
+        mk(
+            "builtin.compact_history",
+            "compact_history",
+            "压缩当前会话：把此前全部历史替换为你撰写的一段摘要（最近 2 条现场保留）。summary 里要写全：关键结论、重要决定、未完成事项、后续计划",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string", "description": "对既往对话的完整摘要" }
+                },
+                "required": ["summary"]
+            }),
+            "compact_history",
+        ),
         // 6. SKILL：写入 / 搜索技能
         mk(
             "builtin.skill",
@@ -174,6 +215,21 @@ pub fn builtin_tools() -> Vec<ToolDef> {
                 "required": ["path"]
             }),
             "send_file",
+        ),
+        // 7.5 看图：把本地图片喂给视觉模型（图片本体注入下一轮请求，不占工具结果文本）
+        mk(
+            "builtin.view_image",
+            "view_image",
+            "查看一张本地图片：图片会以图像形式注入下一轮对话，视觉模型（如 deepseek-v4-flash-vision-exp、GPT、Gemini、Claude）可以直接看到内容。支持 png/jpg/jpeg/webp/gif/bmp",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "图片文件绝对路径" },
+                    "note": { "type": "string", "description": "想重点看什么（可选，会作为看图提示）" }
+                },
+                "required": ["path"]
+            }),
+            "view_image",
         ),
     ]
 }
@@ -250,6 +306,13 @@ pub fn register_opts(
 
 pub fn remove(ctx: &Arc<crate::state::Ctx>, id: &str) -> Result<String, String> {
     let mut tools = ctx.tools.lock().unwrap();
+    // 内置工具是 BIT 出厂能力，不允许删除（用户 UI 与 AI delete_tool 都走这里）
+    if tools
+        .iter()
+        .any(|t| t.id == id && matches!(t.kind, ToolKind::Builtin { .. }))
+    {
+        return Err("内置工具不允许删除".into());
+    }
     let before = tools.len();
     tools.retain(|t| t.id != id);
     if tools.len() == before {
@@ -494,6 +557,44 @@ async fn builtin_invoke(
                 "note": note,
             }))
         }
+        // ── 2.6 看图：读取本地图片，data_url 由 agent 循环注入下一轮请求（视觉模型） ──
+        "view_image" => {
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
+            let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
+            let p = std::path::Path::new(path);
+            let meta = std::fs::metadata(p).map_err(|_| format!("文件不存在: {path}"))?;
+            if meta.is_dir() {
+                return Err(format!("`{path}` 是文件夹，view_image 需要单个图片文件"));
+            }
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "webp" => "image/webp",
+                "gif" => "image/gif",
+                "bmp" => "image/bmp",
+                other => return Err(format!("不支持的图片格式 `.{other}`，支持 png/jpg/jpeg/webp/gif/bmp")),
+            };
+            if meta.len() > 20 * 1024 * 1024 {
+                return Err(format!("图片过大（{} MB），上限 20 MB", meta.len() / 1024 / 1024));
+            }
+            let bytes = std::fs::read(p).map_err(|e| format!("读取失败: {e}"))?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(serde_json::json!({
+                "seen": true,
+                "path": path,
+                "mime": mime,
+                "bytes": meta.len(),
+                "note": note,
+                // agent 循环会把 data_url 抽出注入下一轮请求，并把本结果脱敏后再回喂模型
+                "data_url": format!("data:{mime};base64,{b64}"),
+            }))
+        }
         // ── 3. 制定计划（目标 + 待办）──
         "plan" => {
             let goal = params.get("goal").and_then(|v| v.as_str()).ok_or("缺少参数 goal")?;
@@ -688,6 +789,86 @@ async fn builtin_invoke(
                 true, // 同名工具若为 AI 自建则覆盖更新（修正错误实现）
             )?;
             Ok(serde_json::json!({ "registered": tool.name, "id": tool.id, "runtime": runtime }))
+        }
+        // ── 5.5 删除自己创建的工具 ──
+        "delete_tool" => {
+            let name = params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("delete_tool 需要 name 参数")?;
+            let target = {
+                let tools = ctx.tools.lock().unwrap();
+                tools
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(name))
+                    .cloned()
+            };
+            let tool = target.ok_or_else(|| format!("工具 `{name}` 不存在"))?;
+            // 仅允许删除 AI/用户自建的解释器与脚本工具；内置、远程、MCP 禁删
+            if !matches!(tool.kind, ToolKind::Interpreter { .. } | ToolKind::Script { .. }) {
+                return Err(format!("工具 `{name}` 是系统/远程工具，不允许删除"));
+            }
+            remove(ctx, &tool.id)?;
+            Ok(serde_json::json!({ "deleted": tool.name, "id": tool.id }))
+        }
+        // ── 5.6 截断历史：只保留最近 keep 条 ──
+        "truncate_history" => {
+            let sid = session.ok_or("无法确定当前会话")?.to_string();
+            let keep = params.get("keep").and_then(|v| v.as_u64()).unwrap_or(12).max(2) as usize;
+            let (dropped, kept) = {
+                let mut store = ctx.sessions.lock().unwrap();
+                let sess = store.get_mut(&sid).ok_or("会话不存在")?;
+                let total = sess.messages.len();
+                if total > keep {
+                    let cut = total - keep;
+                    sess.messages.drain(0..cut);
+                    sess.touch();
+                    (cut, keep)
+                } else {
+                    (0, total)
+                }
+            };
+            if dropped > 0 {
+                crate::session::persist(ctx);
+                use tauri::Emitter;
+                let _ = ctx.app.emit("sessions-updated", &sid);
+            }
+            Ok(serde_json::json!({ "truncated": true, "dropped": dropped, "kept": kept }))
+        }
+        // ── 5.7 压缩对话：摘要替换历史，保留最近 2 条现场 ──
+        "compact_history" => {
+            let sid = session.ok_or("无法确定当前会话")?.to_string();
+            let summary = params
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("compact_history 需要 summary 参数（对既往对话的完整摘要）")?;
+            let (dropped, kept) = {
+                let mut store = ctx.sessions.lock().unwrap();
+                let sess = store.get_mut(&sid).ok_or("会话不存在")?;
+                let total = sess.messages.len();
+                let keep_tail = 2.min(total);
+                // 尾部现场先摘出来，历史整体替换为一条摘要消息
+                let mut kept_msgs: Vec<crate::ai::ChatMessage> =
+                    sess.messages.split_off(total - keep_tail);
+                kept_msgs.insert(
+                    0,
+                    crate::ai::ChatMessage::user(format!(
+                        "（此前对话已压缩为摘要，请基于摘要与后续对话继续）\n历史摘要：{summary}"
+                    )),
+                );
+                let dropped = total - keep_tail;
+                sess.messages = kept_msgs;
+                sess.touch();
+                (dropped, keep_tail + 1)
+            };
+            crate::session::persist(ctx);
+            use tauri::Emitter;
+            let _ = ctx.app.emit("sessions-updated", &sid);
+            Ok(serde_json::json!({ "compacted": true, "dropped": dropped, "kept": kept }))
         }
         // ── 6. SKILL：写入 / 搜索技能 ──
         "skill" => {

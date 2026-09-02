@@ -169,6 +169,13 @@ export const IconCheck = (p) => (
   </I>
 );
 
+export const IconCopy = (p) => (
+  <I {...p}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  </I>
+);
+
 export const IconX = (p) => (
   <I {...p}>
     <line x1="5" y1="5" x2="19" y2="19" />

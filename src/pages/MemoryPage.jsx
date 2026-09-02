@@ -151,7 +151,7 @@ export default function MemoryPage({ onStats }) {
                   <span
                     className={`chip ${
                       g.status === "achieved"
-                        ? "border-neutral-900 bg-neutral-900 text-white"
+                        ? "accent-solid"
                         : g.status === "abandoned"
                           ? "border-red-200 text-red-500"
                           : ""
@@ -199,7 +199,7 @@ export default function MemoryPage({ onStats }) {
                     <span
                       className={`chip ${
                         td.status === "completed"
-                          ? "border-neutral-900 bg-neutral-900 text-white"
+                          ? "accent-solid"
                           : td.status === "in_progress"
                             ? ""
                             : "border-neutral-200 text-neutral-500"
@@ -281,7 +281,7 @@ export default function MemoryPage({ onStats }) {
             />
             <div className="min-w-0 flex-1">
               <div className="mb-1.5 flex items-center gap-2">
-                <span className={`chip ${m.kind === "summary" ? "border-neutral-900 bg-neutral-900 text-white" : ""}`}>
+                <span className={`chip ${m.kind === "summary" ? "accent-solid" : ""}`}>
                   {m.kind === "summary" ? t("memory.chipSummary") : t("memory.chipRaw")}
                 </span>
                 <span className="text-xs text-neutral-400">

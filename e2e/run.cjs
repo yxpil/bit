@@ -63,6 +63,18 @@ async function chat(sid, msg) {
   return JSON.parse(r.body);
 }
 
+function getJson(path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: BASE, port: PORT, path, method: "GET",
+        headers: { Authorization: `Bearer ${KEY}`, "X-Access-Password": PASSWORD }, timeout: 15000, agent },
+      (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve(JSON.parse(b))); }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 const results = [];
 function record(name, ok, detail) {
   results.push({ name, ok, detail });
@@ -266,6 +278,72 @@ function record(name, ok, detail) {
       const okSend = !!send && send.ok && !!send.params?.path && send.result?.sent === true;
       record("T16 agent-send-file", okSend, `reply=${(r.reply || "").slice(0, 60)} send=${JSON.stringify(send || null).slice(0, 140)}`);
     } catch (e) { record("T16 agent-send-file", false, e.message); } finally { delSend(); }
+  }
+
+  // T17 AI 自管理工具：add_tool 自建 → delete_tool 删内置（被拒） → delete_tool 删自建（成功）
+  {
+    try {
+      const r = await chat(sid(17), "E2E-CMD-DELTOOL go");
+      const calls = (r.messages || []).flatMap((m) => m.tool_calls || []);
+      const blockedCall = calls.find((c) => c.tool === "delete_tool" && c.params?.name === "shell");
+      const delCall = calls.find((c) => c.tool === "delete_tool" && c.params?.name === "e2e-temp-tool");
+      const okBlocked = !!blockedCall && blockedCall.ok === false && /不允许删除/.test(JSON.stringify(blockedCall.result || ""));
+      const okDeleted = !!delCall && delCall.ok === true && delCall.result?.deleted === "e2e-temp-tool";
+      // 清单校验：自建工具已消失，内置 shell 仍在，delete_tool 本身在内置清单里
+      const q = await getJson("/api/tools");
+      const names = (q.tools || []).map((x) => x.name);
+      const okManifest = !names.includes("e2e-temp-tool") && names.includes("shell") && names.includes("delete_tool");
+      record(
+        "T17 ai-delete-tool",
+        okBlocked && okDeleted && okManifest,
+        `blocked=${okBlocked} deleted=${okDeleted} manifest=${okManifest} reply=${(r.reply || "").slice(0, 80)}`
+      );
+    } catch (e) { record("T17 ai-delete-tool", false, e.message); }
+  }
+
+  // T18 看图工具：view_image 读取本地图片 → 图片注入下一轮请求（mock 确认收到 image_url）→ 记录脱敏无 base64
+  {
+    const PNG_B64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const viewPaths = [".e2e-view.png", "src-tauri/.e2e-view.png"];
+    const delView = () => viewPaths.forEach((p) => { try { fs.unlinkSync(p); } catch {} });
+    try {
+      delView();
+      // BIT 进程工作目录为 src-tauri，相对路径 ./ 解析在那里；两处都放一份兜底
+      fs.writeFileSync("src-tauri/.e2e-view.png", Buffer.from(PNG_B64, "base64"));
+      fs.writeFileSync(".e2e-view.png", Buffer.from(PNG_B64, "base64"));
+      const r = await chat(sid(18), "E2E-CMD-VIEWIMG go");
+      const v = (r.messages || [])
+        .flatMap((m) => m.tool_calls || [])
+        .find((c) => c.tool === "view_image");
+      const okCalled = !!v && v.ok === true && v.result?.seen === true;
+      const okSanitized = !!v && !("data_url" in (v.result || {}));
+      const okSeen = /E2E-IMAGE-SEEN count=1/.test(r.reply || "");
+      record(
+        "T18 view-image",
+        okCalled && okSanitized && okSeen,
+        `called=${okCalled} sanitized=${okSanitized} seen=${okSeen} reply=${(r.reply || "").slice(0, 60)}`
+      );
+    } catch (e) { record("T18 view-image", false, e.message); } finally { delView(); }
+  }
+
+  // T19 主动压缩对话：compact_history 用摘要替换全部历史（保留尾部现场）
+  {
+    try {
+      const r = await chat(sid(19), "E2E-CMD-COMPACT go");
+      const c = (r.messages || [])
+        .flatMap((m) => m.tool_calls || [])
+        .find((x) => x.tool === "compact_history");
+      const msgs = r.messages || [];
+      const okCall = !!c && c.ok === true;
+      const okSummary = msgs.length >= 1 && String(msgs[0].content || "").includes("E2E-SUMMARY-MARK");
+      const okShrunk = msgs.length <= 4;
+      record(
+        "T19 compact-history",
+        okCall && okSummary && okShrunk,
+        `call=${okCall} summary=${okSummary} len=${msgs.length} reply=${(r.reply || "").slice(0, 60)}`
+      );
+    } catch (e) { record("T19 compact-history", false, e.message); }
   }
 
   const pass = results.filter((x) => x.ok).length;

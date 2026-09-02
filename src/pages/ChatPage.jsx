@@ -15,6 +15,8 @@ import {
   IconEye,
   IconShield,
   IconQueue,
+  IconCopy,
+  IconCheck,
 } from "../components/Icons.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
 import FileCard from "../components/FileCard.jsx";
@@ -372,9 +374,9 @@ export default function ChatPage({ onStats, visible }) {
     const bubble =
       (text || "") +
       (hasAttachments
-        ? `${text ? "\n\n" : ""}📎 ${images.length ? t("chat.attachImages") + ` ×${images.length}` : ""}${
+        ? `${text ? "\n\n" : ""}[${images.length ? t("chat.attachImages") + ` ×${images.length}` : ""}${
             images.length && docs.length ? t("chat.attachSep") : ""
-          }${docs.length ? t("chat.attachDocs") + ` ×${docs.length}` : ""}`
+          }${docs.length ? t("chat.attachDocs") + ` ×${docs.length}` : ""}]`
         : "");
     const item = { composed, bubble: bubble || text, imgData };
 
@@ -389,7 +391,7 @@ export default function ChatPage({ onStats, visible }) {
       queuesRef.current = next;
       setQueues(next);
       if (activeRef.current === sid) {
-        setMessages((msgs) => [...msgs, { role: "user", content: `${item.bubble}\n\n⏳` }]);
+        setMessages((msgs) => [...msgs, { role: "user", content: item.bubble }]);
       }
       return;
     }
@@ -454,11 +456,17 @@ export default function ChatPage({ onStats, visible }) {
             endLive();
             break;
           case "error":
-            if (ev.interrupted) setPausedFor(sid, true); // 中断后队列暂停，不自动续发
-            if (activeRef.current === sid) {
-              setMessages((msgs) => [...msgs, { role: "assistant", content: t("chat.callFailed") + ev.error }]);
+            if (ev.interrupted) {
+              // 中断：中间过程（工具调用等）已逐轮落库，重新加载完整历史而非清空现场
+              setPausedFor(sid, true); // 队列暂停，不自动续发
+              if (activeRef.current === sid) loadMessages(sid);
+              endLive();
+            } else {
+              if (activeRef.current === sid) {
+                setMessages((msgs) => [...msgs, { role: "assistant", content: t("chat.callFailed") + ev.error }]);
+              }
+              endLive();
             }
-            endLive();
             break;
           default:
             break;
@@ -1153,6 +1161,28 @@ export default function ChatPage({ onStats, visible }) {
   );
 }
 
+// 复制按钮：复制消息原文，成功短暂打勾（悬停气泡时浮现）
+function CopyBtn({ text }) {
+  const { t } = useLang();
+  const [done, setDone] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setDone(true);
+      setTimeout(() => setDone(false), 1200);
+    } catch {}
+  };
+  return (
+    <button
+      onClick={copy}
+      title={done ? t("common.copied") : t("common.copy")}
+      className="icon-btn h-6 w-6 rounded-full opacity-0 transition-opacity group-hover:opacity-100"
+    >
+      {done ? <IconCheck size={12} /> : <IconCopy size={12} />}
+    </button>
+  );
+}
+
 // 单条消息气泡：user / assistant，assistant 可携带工具调用卡片
 // send_file 成功的调用渲染为文件卡片（如同收文件），不出工具卡
 function MessageBubble({ message }) {
@@ -1164,8 +1194,11 @@ function MessageBubble({ message }) {
 
   if (isUser) {
     return (
-      <div className="accent-solid ml-auto max-w-[80%] whitespace-pre-wrap rounded-3xl rounded-br-lg px-4 py-2.5 text-sm leading-relaxed">
-        {message.content}
+      <div className="group ml-auto flex max-w-[80%] flex-col items-end gap-0.5">
+        <div className="accent-solid whitespace-pre-wrap rounded-3xl rounded-br-lg px-4 py-2.5 text-sm leading-relaxed">
+          {message.content}
+        </div>
+        <CopyBtn text={message.content || ""} />
       </div>
     );
   }
@@ -1192,8 +1225,11 @@ function MessageBubble({ message }) {
         </div>
       )}
       {hasText && (
-        <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
-          <Markdown>{message.content}</Markdown>
+        <div className="group flex flex-col gap-0.5">
+          <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
+            <Markdown>{message.content}</Markdown>
+          </div>
+          <CopyBtn text={message.content || ""} />
         </div>
       )}
     </div>

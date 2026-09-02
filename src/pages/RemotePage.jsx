@@ -150,7 +150,9 @@ export default function RemotePage({ onStats }) {
               setTestState(null);
             }}
             className={`relative h-7 w-14 rounded-full border transition-colors ${
-              enabled ? "border-neutral-900 bg-neutral-900" : "border-neutral-300 bg-neutral-200"
+              enabled
+                ? "accent-solid"
+                : "border-neutral-300 bg-neutral-200 dark:border-neutral-700 dark:bg-neutral-800"
             }`}
           >
             <span
@@ -190,7 +192,7 @@ export default function RemotePage({ onStats }) {
         </div>
 
         {/* 访问密码（第二重认证） */}
-        <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4">
+        <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 dark:border-neutral-800 dark:bg-neutral-900">
           <div className="mb-3 flex items-center justify-between">
             <div>
               <p className="font-medium">{t("remote.pwdTitle")}</p>
@@ -202,7 +204,9 @@ export default function RemotePage({ onStats }) {
             <button
               onClick={() => setPwdEnabled((v) => !v)}
               className={`relative h-7 w-14 shrink-0 rounded-full border transition-colors ${
-                pwdEnabled ? "border-neutral-900 bg-neutral-900" : "border-neutral-300 bg-white"
+                pwdEnabled
+                  ? "accent-solid"
+                  : "border-neutral-300 bg-white dark:border-neutral-700 dark:bg-neutral-800"
               }`}
             >
               <span

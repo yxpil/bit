@@ -182,6 +182,28 @@ const server = http.createServer((req, res) => {
         return respond(res, "E2E-FINAL-SEND failed: send_file 无有效结果", sse);
       }
 
+      // E2E-CMD-DELTOOL: 轮0 add_tool 自建工具 → 轮1 删内置工具（应被拒） → 轮2 删自建工具 → 轮3 最终
+      if (all.includes("E2E-CMD-DELTOOL")) {
+        if (rounds === 1)
+          return respond(res, '先试试删内置工具：[{"tool":"delete_tool","params":{"name":"shell"}}]', sse);
+        if (rounds === 2) {
+          const blocked = /不允许删除/.test(fb) && /"ok"\s*:\s*false/.test(fb);
+          return respond(
+            res,
+            `内置删除被拒=${blocked}，接着删自建工具：[{"tool":"delete_tool","params":{"name":"e2e-temp-tool"}}]`,
+            sse
+          );
+        }
+        const deleted = /"deleted"\s*:\s*"e2e-temp-tool"/.test(fb);
+        return respond(res, `E2E-FINAL-DELTOOL builtin-blocked=true deleted=${deleted}`, sse);
+      }
+
+      // E2E-CMD-COMPACT: 轮0 compact_history 压缩 → 轮1 最终
+      if (all.includes("E2E-CMD-COMPACT")) {
+        const compacted = /"compacted"\s*:\s*true/.test(fb);
+        return respond(res, `E2E-FINAL-COMPACT compacted=${compacted}`, sse);
+      }
+
       // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）
       const stdouts = messages
         .filter((m) => m.role === "tool")
@@ -229,6 +251,35 @@ const server = http.createServer((req, res) => {
       return respond(
         res,
         '生成一个交付文件：\n[{"tool":"write_file","params":{"path":"./.e2e-send.txt","content":"hello from BIT e2e"}}]',
+        sse
+      );
+
+    // 删除工具场景：先 add_tool 自建，反馈轮里先删内置（被拒）再删自建（成功）
+    if (last.includes("E2E-CMD-DELTOOL")) {
+      const code =
+        "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const p=JSON.parse(d||'{}');console.log(JSON.stringify({echo:p}))});";
+      return respond(
+        res,
+        `我先创建一个临时工具。\n${JSON.stringify([
+          { tool: "add_tool", params: { name: "e2e-temp-tool", description: "E2E 临时工具", runtime: "node", code } },
+        ])}`,
+        sse
+      );
+    }
+
+    // 看图场景：让 BIT 调 view_image，第二轮请求应带上注入的图片（imgs>0 分支回 IMAGE-SEEN）
+    if (last.includes("E2E-CMD-VIEWIMG"))
+      return respond(
+        res,
+        '我来看一下这张图：\n[{"tool":"view_image","params":{"path":"./.e2e-view.png"}}]',
+        sse
+      );
+
+    // 压缩历史场景：让 BIT 调 compact_history，用摘要替换全部历史
+    if (last.includes("E2E-CMD-COMPACT"))
+      return respond(
+        res,
+        '我先把历史压缩成摘要。\n[{"tool":"compact_history","params":{"summary":"E2E-SUMMARY-MARK 用户要求压缩历史；关键结论：E2E 压缩测试"}}]',
         sse
       );
 
