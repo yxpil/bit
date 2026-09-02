@@ -22,20 +22,12 @@ finish-args:
   - --filesystem=home
   - --socket=pulseaudio
 modules:
-  # 系统托盘（libayatana-appindicator，与原生 deb 依赖一致）
-  - name: libappindicator
-    buildsystem: cmake-ninja
-    config-opts:
-      - -DENABLE_BINDINGS_MONO=OFF
-      - -DENABLE_GTK_DOC=OFF
-    cleanup:
-      - /include
-      - /lib/pkgconfig
-      - /lib/*.la
-    sources:
-      - type: archive
-        url: https://github.com/AyatanaIndicators/libayatana-appindicator/archive/refs/tags/0.5.93.tar.gz
-        sha256: cbefed7a918a227bf71286246e237fcd3a9c8499b3eaac4897811a869409edf0
+  # Flathub 官方共享模块：libdbusmenu → libindicator → libayatana-appindicator 链式构建
+  - name: shared-modules
+    type: git
+    url: https://github.com/flathub/shared-modules.git
+    commit: 6eed6448215ff322f3567f2fba53ea444f5861df
+  - shared-modules/libappindicator/libappindicator-gtk3-intro.json
   - name: bit
     buildsystem: simple
     build-options:
