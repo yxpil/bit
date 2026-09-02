@@ -261,9 +261,11 @@ jobs:
         run: npm ci && npm run build
       - name: 安装 QEMU 模拟器（riscv64 + loongarch64）
         run: |
-          docker run --privileged --rm tonistiigi/binfmt:master --install loongarch64,riscv64 || \
-            docker run --privileged --rm tonistiigi/binfmt:qemu-v8.1.5 --install loongarch64,riscv64
-          ls /proc/sys/fs/binfmt_misc/ | grep -E "qemu-(loongarch64|riscv64)"
+          # tonistiigi/binfmt 不含 loongarch64，改用 Ubuntu 自带 qemu-user-static（qemu 8.2，含 loongarch64）
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+          ls /proc/sys/fs/binfmt_misc/ | grep -qx "qemu-loongarch64"
+          ls /proc/sys/fs/binfmt_misc/ | grep -qx "qemu-riscv64"
       - name: 容器内构建（${{ matrix.arch }}）
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
