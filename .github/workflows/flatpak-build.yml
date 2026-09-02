@@ -28,6 +28,9 @@ jobs:
             org.freedesktop.Sdk.Extension.rust-stable//24.08 \
             org.freedesktop.Sdk.Extension.node22//24.08
 
+      - name: 拉取 Flathub 共享模块（manifest include 相对路径所需）
+        run: git clone --depth 1 https://github.com/flathub/shared-modules.git packaging/flatpak/shared-modules
+
       - name: 构建 Flatpak
         run: flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/space.osbt.bit.yml
 
