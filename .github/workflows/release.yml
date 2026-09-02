@@ -183,6 +183,31 @@ jobs:
           npm ci
           npx tauri build --target aarch64-apple-darwin
           npx tauri build --target x86_64-apple-darwin
+      - name: 补全 ad-hoc bundle 签名（避免 Gatekeeper 报"已损坏"）
+        run: |
+          # tauri bundler 只对二进制做 linker 签名，bundle 缺 CodeResources/PkgInfo，
+          # 下载后带 quarantine 属性时 macOS 会判定签名不自洽 → "已损坏，无法打开"。
+          # 此处补 PkgInfo 并对整个 .app 做 ad-hoc 深签名，使 bundle 签名自洽。
+          for T in aarch64-apple-darwin x86_64-apple-darwin; do
+            APP="src-tauri/target/$T/release/bundle/macos/BIT.app"
+            printf 'APPL????' > "$APP/Contents/PkgInfo"
+            codesign --force --deep --sign - "$APP"
+            codesign --verify --deep --strict "$APP"
+          done
+      - name: 重打 dmg（包含签名修复后的 .app）
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          for T in aarch64-apple-darwin x86_64-apple-darwin; do
+            case $T in aarch64*) DMGARCH=aarch64;; *) DMGARCH=x64;; esac
+            APP="src-tauri/target/$T/release/bundle/macos/BIT.app"
+            DMGDIR="src-tauri/target/$T/release/bundle/dmg"
+            STAGE=$(mktemp -d)
+            cp -R "$APP" "$STAGE/BIT.app"
+            ln -s /Applications "$STAGE/Applications"
+            rm -f "$DMGDIR"/BIT_*.dmg
+            hdiutil create -volname "BIT" -srcfolder "$STAGE" -ov -format UDZO -fs HFS+ "$DMGDIR/BIT_${VERSION}_${DMGARCH}.dmg"
+            rm -rf "$STAGE"
+          done
       - name: 上传到 Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
