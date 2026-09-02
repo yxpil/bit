@@ -28,13 +28,11 @@ jobs:
           REF: ${{ inputs.fork_ref || 'master' }}
           VER: ${{ inputs.version || '0.4.9' }}
         run: |
-          # 走 GitHub contents API 匿名直读公开仓库，绕开 raw.githubusercontent 的 CDN 缓存
-          New-Item -ItemType Directory -Force manifest | Out-Null
-          foreach ($f in @("yxpil.bit.yaml", "yxpil.bit.locale.en-US.yaml", "yxpil.bit.installer.yaml")) {
-            $r = Invoke-RestMethod -Uri "https://api.github.com/repos/yxpil/winget-pkgs/contents/manifests/y/yxpil/bit/$($env:VER)/$f?ref=$($env:REF)"
-            [IO.File]::WriteAllBytes("manifest/$f", [Convert]::FromBase64String($r.content))
-            Write-Host "downloaded $f ($($r.sha))"
-          }
+          # sparse clone 精确检出清单目录（runner 对 api.github.com 直连不稳定，git 协议最可靠）
+          git clone --depth 1 --filter=blob:none --sparse --branch $env:REF https://github.com/yxpil/winget-pkgs.git wg
+          git -C wg sparse-checkout set "manifests/y/yxpil/bit/$env:VER"
+          Copy-Item "wg/manifests/y/yxpil/bit/$env:VER" manifest -Recurse -Force
+          Get-ChildItem manifest
       - name: winget validate
         shell: pwsh
         run: |
