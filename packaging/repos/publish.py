@@ -53,7 +53,8 @@ def main():
         for f in sorted((root / sub).rglob("*")):
             if f.is_file():
                 upload(repo, f.relative_to(root / sub).as_posix(), f)
-        upload(repo, "README.md", Path(README[sub]))
+        if Path(README[sub]).exists():
+            upload(repo, "README.md", Path(README[sub]))
         enable_pages(repo)
     print("done")
 

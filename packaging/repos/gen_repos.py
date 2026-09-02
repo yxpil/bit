@@ -17,7 +17,7 @@ import tarfile
 import time
 from pathlib import Path
 
-VERSION = "0.4.5"
+VERSION = "0.4.9"
 DEB_TO_DEB_ARCH = {"amd64": "amd64", "arm64": "arm64", "riscv64": "riscv64", "loongarch64": "loongarch64"}
 DEB_TO_PAC_ARCH = {"amd64": "x86_64", "arm64": "aarch64", "riscv64": "riscv64", "loongarch64": "loongarch64"}
 PKGDESC = "BIT - 本地优先的 AI Agent 工具集（MCP / 工具注册 / 技能）"
