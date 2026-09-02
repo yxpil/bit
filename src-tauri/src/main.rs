@@ -127,6 +127,7 @@ fn main() {
             commands::set_ai_params,
             commands::list_provider_models,
             commands::context_preview,
+            commands::context_metrics,
             commands::list_sessions,
             commands::get_session,
             commands::create_session,

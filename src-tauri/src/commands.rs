@@ -9,6 +9,32 @@ fn ctx<'a>(state: State<'a, Arc<Ctx>>) -> Arc<Ctx> {
     state.inner().clone()
 }
 
+fn resolve_session_id(ctx: &Arc<Ctx>, session_id: &str) -> String {
+    if session_id.is_empty() {
+        ctx.sessions.lock().unwrap().active.clone()
+    } else {
+        session_id.to_string()
+    }
+}
+
+fn estimate_context_tokens(ctx: &Arc<Ctx>, session_id: &str, convo: &[crate::ai::ChatMessage]) -> usize {
+    let target = resolve_session_id(ctx, session_id);
+    let native_mode = ctx.native_probe.lock().unwrap().get(&target).copied() != Some(false);
+    let convo_chars: usize = convo
+        .iter()
+        .map(|m| m.role.chars().count() + m.content.chars().count() + 8)
+        .sum();
+    let tool_chars = if native_mode {
+        serde_json::to_string(&crate::ai::native_tool_defs(ctx))
+            .unwrap_or_default()
+            .chars()
+            .count()
+    } else {
+        0
+    };
+    (convo_chars + tool_chars).div_ceil(2)
+}
+
 // ---------- 概览 ----------
 
 /// 本进程内存占用（字节）：页眉仪表盘展示，前端每 3 秒轮询
@@ -772,8 +798,7 @@ pub async fn list_provider_models(
 pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     let (convo, tools) = crate::agent::build_context(&ctx, &session_id)?;
-    // 粗略 token 估算（约 2 字符/token）
-    let chars: usize = convo.iter().map(|m| m.content.chars().count()).sum();
+    let est_tokens = estimate_context_tokens(&ctx, &session_id, &convo);
     let messages: Vec<serde_json::Value> = convo
         .iter()
         .enumerate()
@@ -802,9 +827,18 @@ pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> 
         "system": convo.first().map(|m| m.content.clone()).unwrap_or_default(),
         "messages": messages,
         "tools": tools_list,
-        "est_tokens": chars / 2,
+        "est_tokens": est_tokens,
         "approval_mode": ctx.config.lock().unwrap().tool_approval.clone(),
     }))
+}
+
+/// 当前会话上下文用量估算：与预览口径一致，包含 system prompt / 历史消息 /
+/// 原生函数调用模式下额外发送的 tool definitions。
+#[tauri::command]
+pub async fn context_metrics(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let (convo, _) = crate::agent::build_context(&ctx, &session_id)?;
+    Ok(json!({ "est_tokens": estimate_context_tokens(&ctx, &session_id, &convo) }))
 }
 
 /// 解析上传的文件（Excel→Markdown 表格 / Word(.docx)→纯文本 / CSV→原文）。

@@ -81,6 +81,7 @@ export const api = {
   setToolApproval: (mode) => invoke("set_tool_approval", { mode }),
   getToolApproval: () => invoke("get_tool_approval"),
   contextPreview: (session_id) => invoke("context_preview", { sessionId: session_id || "" }),
+  contextMetrics: (session_id) => invoke("context_metrics", { sessionId: session_id || "" }),
   listSessions: () => invoke("list_sessions"),
   getSession: (session_id) => invoke("get_session", { sessionId: session_id || "" }),
   createSession: (title) => invoke("create_session", { title: title || "" }),

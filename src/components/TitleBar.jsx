@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { PhysicalPosition, currentMonitor, getCurrentWindow, primaryMonitor } from "@tauri-apps/api/window";
 import { IconMinus, IconSquare, IconX } from "./Icons.jsx";
 import { useLang } from "../i18n.js";
 
@@ -24,6 +24,53 @@ export default function TitleBar() {
   const [ver, setVer] = useState("");
   const [dash, setDash] = useState({ sessions: 0, tokens: 0, limitK: 128 });
   const [memMB, setMemMB] = useState(null);
+
+  useEffect(() => {
+    let timer = null;
+    let unlisten = null;
+    const clampIntoView = async () => {
+      try {
+        const w = win();
+        if (await w.isMaximized()) return;
+        const [pos, size, monitor] = await Promise.all([
+          w.outerPosition(),
+          w.outerSize(),
+          currentMonitor().catch(() => null),
+        ]);
+        const target = monitor || (await primaryMonitor().catch(() => null));
+        const area = target?.workArea;
+        if (!area) return;
+        const minVisibleX = Math.min(160, Math.max(72, Math.round(size.width * 0.2)));
+        const titleBarHeight = 36;
+        const minX = area.position.x - size.width + minVisibleX;
+        const maxX = area.position.x + area.size.width - minVisibleX;
+        const minY = area.position.y;
+        const maxY = area.position.y + area.size.height - titleBarHeight;
+        const nextX = Math.min(maxX, Math.max(minX, pos.x));
+        const nextY = Math.min(maxY, Math.max(minY, pos.y));
+        if (nextX !== pos.x || nextY !== pos.y) {
+          await w.setPosition(new PhysicalPosition(nextX, nextY));
+        }
+      } catch {
+        /* 忽略：旧权限或平台差异时保持原生行为 */
+      }
+    };
+    const scheduleClamp = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(clampIntoView, 140);
+    };
+    clampIntoView();
+    win()
+      .onMoved(scheduleClamp)
+      .then((f) => {
+        unlisten = f;
+      })
+      .catch(() => {});
+    return () => {
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     getVersion().then(setVer).catch(() => {});
@@ -80,6 +127,14 @@ export default function TitleBar() {
         <span>
           {fmtK(dash.tokens)} / {dash.limitK}K tok
         </span>
+        {dash.showCache && (
+          <>
+            <span className="opacity-50">·</span>
+            <span>
+              {t("chat.cacheHit")} {Math.round((dash.cacheHitRate || 0) * 100)}%
+            </span>
+          </>
+        )}
         {memMB !== null && (
           <>
             <span className="opacity-50">·</span>

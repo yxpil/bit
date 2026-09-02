@@ -69,6 +69,7 @@ export default function ChatPage({ onStats, visible }) {
   // AI 接收内容预览（system / 消息 / 工具清单）
   const [preview, setPreview] = useState(null);
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [contextMeta, setContextMeta] = useState({ est_tokens: 0 });
 
   // 审批模式初始化 + 全局审批请求监听 + 非流式对话的用量统计监听
   useEffect(() => {
@@ -130,7 +131,8 @@ export default function ChatPage({ onStats, visible }) {
   const live = liveMap[activeId] || null;
   const runningCount = Object.keys(busyMap).length;
 
-  // 上下文用量估算（粗略：中英混合约 2 字符/token），仅用于预警，不阻断对话
+  // 上下文用量估算：优先使用后端按真实上下文构造得到的统一口径，
+  // 前端仅在结果返回前用消息长度做兜底估算。
   // 阈值默认 128K，用户可点击用量条上的数字自行设置（localStorage 持久化）
   const [ctxLimitK, setCtxLimitK] = useState(() => {
     const v = parseInt(localStorage.getItem("bit.ctxLimitK"));
@@ -141,12 +143,12 @@ export default function ChatPage({ onStats, visible }) {
   const CONTEXT_LIMIT = ctxLimitK * 1024;
   const [compressing, setCompressing] = useState(false);
   const estimateTokens = (text) => Math.ceil((text || "").length / 2);
-  const contextTokens = (() => {
+  const localContextTokens = (() => {
     let n = 4; // system prompt 基数
     for (const m of messages) n += estimateTokens(m.content) + 4;
-    if (live) n += estimateTokens(live.text);
     return n;
   })();
+  const contextTokens = Math.max(contextMeta.est_tokens || 0, localContextTokens) + (live ? estimateTokens(live.text) : 0);
   const ctxPct = contextTokens / CONTEXT_LIMIT;
   const fmtK = (n) => (n >= 1024 ? `${(n / 1024).toFixed(1)}K` : String(n));
   const saveLimit = () => {
@@ -157,6 +159,29 @@ export default function ChatPage({ onStats, visible }) {
       localStorage.setItem("bit.ctxLimitK", String(v));
     }
   };
+  const usage = usageMap[activeId] || null;
+  const usageKnown = !!usage?.prompt_tokens;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeId) {
+      setContextMeta({ est_tokens: 0 });
+      return;
+    }
+    setContextMeta((prev) => (prev.est_tokens ? { est_tokens: 0 } : prev));
+    const timer = setTimeout(async () => {
+      try {
+        const r = await api.contextMetrics(activeId);
+        if (!cancelled) setContextMeta(r || { est_tokens: 0 });
+      } catch {
+        if (!cancelled) setContextMeta({ est_tokens: 0 });
+      }
+    }, 120);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [activeId, messages]);
 
   // 页眉仪表盘数据广播（版本/内存由页眉自取）
   useEffect(() => {
@@ -167,10 +192,12 @@ export default function ChatPage({ onStats, visible }) {
           tokens: contextTokens,
           limitK: ctxLimitK,
           running: runningCount > 0,
+          cacheHitRate: usage?.hit_rate || 0,
+          showCache: usageKnown,
         },
       }),
     );
-  }, [sessions.length, contextTokens, ctxLimitK, runningCount]);
+  }, [sessions.length, contextTokens, ctxLimitK, runningCount, usage?.hit_rate, usageKnown]);
 
   useEffect(() => {
     activeRef.current = activeId;
@@ -669,16 +696,19 @@ export default function ChatPage({ onStats, visible }) {
         </div>
 
         <div className="flex flex-col gap-2">
-          {/* 上下文用量条：常显灰色 → 70% 黄色预警 → 128K 红色并出现压缩按钮（不阻断对话） */}
-          {visibleMessages.length > 0 && (
+          {/* 合并状态条：统一展示上下文用量与缓存命中，避免两处口径漂移 */}
+          {(visibleMessages.length > 0 || usageKnown) && (
             <div
               className={`flex items-center gap-2 self-start rounded-full px-3 py-1 text-[11px] ${
                 ctxPct >= 1
                   ? "bg-red-500/10 text-red-600 dark:text-red-400"
-                  : ctxPct >= 0.7
+                  : ctxPct >= 0.7 || (usageKnown && (usage.hit_rate || 0) < 0.5)
                     ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                    : usageKnown && (usage.hit_rate || 0) >= 0.8
+                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
                     : "text-neutral-400"
               }`}
+              title={usageKnown ? t("chat.cacheTip") : undefined}
             >
               <span>
                 {ctxPct >= 1
@@ -715,6 +745,12 @@ export default function ChatPage({ onStats, visible }) {
                   </button>
                 )}{" "}
                 tokens
+                {usageKnown &&
+                  ` · ${t("chat.cacheHit")} ${Math.round((usage.hit_rate || 0) * 100)}% · ${fmtK(
+                    usage.cache_read_tokens,
+                  )} / ${fmtK(usage.prompt_tokens)} tokens · ${t("chat.cacheOut")} ${fmtK(
+                    usage.completion_tokens,
+                  )} · ${usage.requests} ${t("chat.cacheRequests")}`}
               </span>
               {(ctxPct >= 1 || compressing) && (
                 <button
@@ -726,27 +762,6 @@ export default function ChatPage({ onStats, visible }) {
                   {compressing ? t("chat.compressing") : t("chat.compress")}
                 </button>
               )}
-            </div>
-          )}
-
-          {/* 缓存命中率条：≥80% 绿色（前缀稳定）→ <50% 黄色（前缀漂移，缓存命中偏低） */}
-          {usageMap[activeId]?.prompt_tokens > 0 && (
-            <div
-              className={`flex items-center gap-2 self-start rounded-full px-3 py-1 text-[11px] ${
-                usageMap[activeId].hit_rate >= 0.8
-                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                  : usageMap[activeId].hit_rate >= 0.5
-                    ? "text-neutral-400"
-                    : "bg-amber-500/10 text-amber-600 dark:text-amber-400"
-              }`}
-              title={t("chat.cacheTip")}
-            >
-              <span>
-                {t("chat.cacheHit") + ` ${Math.round((usageMap[activeId].hit_rate || 0) * 100)}% · `}
-                {`${fmtK(usageMap[activeId].cache_read_tokens)} / ${fmtK(usageMap[activeId].prompt_tokens)} tokens · `}
-                {t("chat.cacheOut") + ` ${fmtK(usageMap[activeId].completion_tokens)} · `}
-                {`${usageMap[activeId].requests} ${t("chat.cacheRequests")}`}
-              </span>
             </div>
           )}
 
