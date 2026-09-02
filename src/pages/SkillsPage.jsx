@@ -50,7 +50,6 @@ export default function SkillsPage({ onStats }) {
     setSelected(allChecked ? new Set() : new Set(skills.map((s) => s.id)));
 
   const removeOne = async (id) => {
-    if (!window.confirm(t("common.confirmDelete"))) return;
     setBusy(true);
     try {
       await api.deleteSkills([id]);
@@ -64,7 +63,7 @@ export default function SkillsPage({ onStats }) {
   };
 
   const removeSelected = async () => {
-    if (!selected.size || !window.confirm(t("common.confirmDelete"))) return;
+    if (!selected.size) return;
     setBusy(true);
     try {
       await api.deleteSkills([...selected]);

@@ -62,7 +62,6 @@ export default function MemoryPage({ onStats }) {
     setSelected(allChecked ? new Set() : new Set(memories.map((m) => m.id)));
 
   const removeOne = async (id) => {
-    if (!window.confirm(t("common.confirmDelete"))) return;
     setBusy(true);
     setError("");
     try {
@@ -77,7 +76,7 @@ export default function MemoryPage({ onStats }) {
   };
 
   const removeSelected = async () => {
-    if (!selected.size || !window.confirm(t("common.confirmDelete"))) return;
+    if (!selected.size) return;
     setBusy(true);
     setError("");
     try {
@@ -93,7 +92,6 @@ export default function MemoryPage({ onStats }) {
   };
 
   const removeGoal = async (id) => {
-    if (!window.confirm(t("common.confirmDelete"))) return;
     setBusy(true);
     setError("");
     try {
@@ -108,7 +106,6 @@ export default function MemoryPage({ onStats }) {
   };
 
   const removeTodo = async (id) => {
-    if (!window.confirm(t("common.confirmDelete"))) return;
     setBusy(true);
     setError("");
     try {
