@@ -31,6 +31,8 @@ pub fn create(app: &tauri::AppHandle, ctx: &Arc<Ctx>) -> tauri::Result<()> {
             "quit" => {
                 if let Some(ctx) = app.try_state::<Arc<Ctx>>() {
                     crate::audit::record(&ctx, "local-app", "app.quit", "BIT", json!({ "via": "tray" }), true);
+                    // 已下载更新：退出前静默换装，下次启动即新版本（关闭时自动更新）
+                    let _ = crate::update::apply_update(&ctx, false);
                 }
                 app.exit(0);
             }

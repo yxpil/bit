@@ -286,6 +286,65 @@ async function main() {
     record("T17 垃圾响应容错", garbOk, `exit=${code}`);
   }
 
+  // ── T18 AI 行为模拟：真实模型的高频调用习惯 ──
+  {
+    const tui = launchTui(DIR);
+    // 18a 参数缺失 → 错误反馈 → 自我纠正
+    tui.send("E2E-AI-RETRY");
+    for (let i = 0; i < 60 && !tui.out.includes("E2E-AI-RETRY-OK"); i++) await sleep(500);
+    const retryOk = tui.out.includes("E2E-AI-RETRY-OK") && tui.out.includes("失败");
+    record("T18a 参数缺失自纠", retryOk, retryOk ? "" : tail(tui.out));
+    // 18b 幻觉工具 → 错误反馈 → 换真实工具
+    tui.send("E2E-AI-NOTOOL");
+    for (let i = 0; i < 60 && !tui.out.includes("E2E-AI-NOTOOL-OK"); i++) await sleep(500);
+    const notoolOk = tui.out.includes("E2E-AI-NOTOOL-OK") && tui.out.includes("失败");
+    record("T18b 幻觉工具自纠", notoolOk, notoolOk ? "" : tail(tui.out));
+    // 18c 围栏 + 散文包裹的工具调用
+    tui.send("E2E-AI-FENCED");
+    for (let i = 0; i < 60 && !tui.out.includes("E2E-AI-FENCED-OK"); i++) await sleep(500);
+    const fencedOk = tui.out.includes("E2E-AI-FENCED-OK");
+    record("T18c 围栏调用识别", fencedOk, fencedOk ? "" : tail(tui.out));
+    // 18d 一回合三个工具调用（并发上限 16 内全执行，结果按序回显）
+    tui.send("E2E-AI-MULTI");
+    for (let i = 0; i < 60 && !tui.out.includes("E2E-AI-MULTI-C"); i++) await sleep(500);
+    const multiOk = ["E2E-AI-MULTI-A", "E2E-AI-MULTI-B", "E2E-AI-MULTI-C"].every((m) => tui.out.includes(m));
+    record("T18d 一回合多调用", multiOk, multiOk ? "" : tail(tui.out));
+    tui.send("/quit");
+    await tui.waitExit(60000);
+  }
+
+  // ── T19 流式边界：多字节跨 chunk / 200 小块 / 流中输入模拟 / 立即 500 ──
+  {
+    const tui = launchTui(DIR);
+    // 19a 多字节字符被 TCP 从中间切开：解码必须按完整行进行，emoji/中文不得损坏
+    tui.send("E2E-STREAM-MULTIBYTE");
+    for (let i = 0; i < 60 && !tui.out.includes("BIT-STREAM-OK"); i++) await sleep(500);
+    await sleep(300);
+    const mbOk = tui.out.includes("你好🌍BIT-STREAM-OK") && !tui.out.includes("�");
+    record("T19a 多字节跨 chunk 流式", mbOk, mbOk ? "" : tail(tui.out));
+    // 19b 200 个小 chunk 连发：内容必须完整有序
+    tui.send("E2E-STREAM-MANY");
+    for (let i = 0; i < 90 && !tui.out.includes("c199;"); i++) await sleep(500);
+    const manyOk = Array.from({ length: 40 }, (_, k) => `c${k * 5};`).every((m) => tui.out.includes(m)) && tui.out.includes("c199;");
+    record("T19b 200 chunk 完整性", manyOk, manyOk ? "" : tail(tui.out));
+    // 19c 流中输入模拟：长流式输出进行中用户继续输入 → 两条消息都得到处理
+    tui.send("E2E-CMD-LONG");
+    await sleep(120); // 长流刚启动
+    tui.send("E2E-CMD-SHELL");
+    let guard = 0;
+    for (; guard < 90 && !(tui.out.includes("L0049") && tui.out.includes("e2e-shell-ok")); guard++) await sleep(500);
+    const bothOk = tui.out.includes("L0049") && tui.out.includes("e2e-shell-ok") && !tui.out.includes("�");
+    record("T19c 流中输入模拟", bothOk, bothOk ? "" : tail(tui.out));
+    // 19d 流式请求立即 500：报错反馈，REPL 存活
+    tui.send("E2E-STREAM-ERR");
+    for (let i = 0; i < 60 && !tui.out.includes("错误："); i++) await sleep(500);
+    tui.send("/tools");
+    tui.send("/quit");
+    const code = await tui.waitExit(60000);
+    const errOk = code === 0 && tui.out.includes("HTTP 500") && tui.out.includes("Execute a shell command");
+    record("T19d 流式 500 容错", errOk, errOk ? "" : `exit=${code}`);
+  }
+
   // ── T7 桌面端 + TUI 同数据目录并行：互不干扰 ──
   {
     // 桌面端配置：开启远程访问（8611），TUI 启动不应抢掉该端口也不应被单实例顶掉

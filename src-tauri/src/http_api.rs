@@ -46,6 +46,10 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/tools/{id}/invoke", post(invoke_tool))
         .route("/api/chat", post(remote_chat))
         .route("/api/audit", get(list_audit))
+        // 自动更新：检测 / 状态 / 手动下载（启动后台任务已自动下，此处供远程管理用）
+        .route("/api/update/check", get(update_check))
+        .route("/api/update/status", get(update_status))
+        .route("/api/update/download", post(update_download_route))
         .route("/mcp", post(mcp_endpoint))
         // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
         .route("/v1/models", get(openai_models))
@@ -56,6 +60,45 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "ok": true, "service": "BIT", "time": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string() }))
+}
+
+/// 更新检测（同 check_updates 命令，远程管理/自动化测试用）
+async fn update_check() -> Response {
+    match crate::update::fetch_latest().await {
+        Ok(l) => {
+            let has_update = crate::commands::version_gt(&l.version, env!("CARGO_PKG_VERSION"));
+            Json(json!({
+                "current": env!("CARGO_PKG_VERSION"),
+                "latest": l.version,
+                "has_update": has_update,
+                "notes": l.notes,
+                "url": l.url,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// 本地升级状态：有没有已下载的更新包
+async fn update_status(State(ctx): State<Arc<Ctx>>) -> Response {
+    match crate::update::read_state(&ctx) {
+        Some(st) => Json(json!({
+            "current": env!("CARGO_PKG_VERSION"),
+            "downloaded": st["state"] == "downloaded",
+            "update": st,
+        }))
+        .into_response(),
+        None => Json(json!({ "current": env!("CARGO_PKG_VERSION"), "downloaded": false })).into_response(),
+    }
+}
+
+/// 触发下载当前平台更新包（幂等：已下载同版本直接返回）
+async fn update_download_route(State(ctx): State<Arc<Ctx>>) -> Response {
+    match crate::update::download_update(&ctx).await {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
 }
 
 /// BIT 自身作为 MCP 服务器（Streamable HTTP / JSON-RPC 2.0）：

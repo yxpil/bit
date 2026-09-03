@@ -437,7 +437,8 @@ pub async fn chat_turn(
                 Err(ai::NativeErr::Other(e)) => return Err(e),
             }
         } else {
-            let (reply, usage) = ai::chat_with_images(ctx, &convo, round_images).await?;
+            // 文本协议统一走 SSE 流式（与桌面端一致）：非流式请求会被仅支持流式的端点拒绝
+            let (reply, usage) = ai::chat_stream_with_images(ctx, &convo, round_images, |_| true).await?;
             // 记录本轮用量并推送缓存命中率统计
             let payload = record_and_payload(ctx, &target, &usage);
             let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));

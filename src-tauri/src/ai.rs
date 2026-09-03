@@ -237,6 +237,18 @@ pub async fn chat_stream_with_images<F: FnMut(&str) -> bool>(
     }
 }
 
+/// 喂入新到达的 SSE 字节，返回其中已完整的行；尾部不完整字节（可能是半个多字节字符）保留在 buf
+fn drain_complete_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    buf.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(&buf[..pos]).trim().to_string();
+        buf.drain(..=pos);
+        lines.push(line);
+    }
+    lines
+}
+
 /// 逐行处理 SSE 流：对每个 `data:` 行调用 `handle`，返回 true 表示遇到结束标记
 async fn read_sse<H: FnMut(&str) -> bool>(
     resp: reqwest::Response,
@@ -250,17 +262,14 @@ async fn read_sse<H: FnMut(&str) -> bool>(
         return Err(format!("HTTP {status}: {}", crate::registry::safe_trunc(&text, 400)));
     }
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    // 字节缓冲：多字节字符可能被 TCP 分块从中间截断，
+    // 必须按完整行再解码——逐 chunk 转 String 会把跨块字符打成 U+FFFD
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("流读取失败: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        // 以换行切分，保留最后不完整的一段
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].trim().to_string();
-            buf = buf[pos + 1..].to_string();
+        for line in drain_complete_lines(&mut buf, &chunk) {
             if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if handle(data) {
+                if handle(data.trim()) {
                     return Ok(());
                 }
             }
@@ -2018,5 +2027,53 @@ mod fuzzy_tests {
         for f in ["stop", "end_turn", "STOP", "tool_calls", "max_tokens_exceeded_ok", ""] {
             assert!(!finish_truncated(f), "{f} 不应判定为截断");
         }
+    }
+}
+
+/// SSE 字节缓冲切行测试：多字节字符跨 TCP chunk 截断时不得损坏
+#[cfg(test)]
+mod sse_tests {
+    use super::drain_complete_lines;
+
+    #[test]
+    fn multibyte_split_across_chunks() {
+        // 「你好🌍」的 UTF-8 字节被从中间切开，逐字节喂入
+        let line = format!("data: {}\n", "你好🌍BIT-OK");
+        let bytes = line.as_bytes();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut got = Vec::new();
+        for b in bytes {
+            got.extend(drain_complete_lines(&mut buf, &[*b]));
+        }
+        // 末尾 \n 喂入时切出完整一行，多字节字符逐字节喂入也不得损坏
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("你好🌍BIT-OK"), "内容损坏: {}", got[0]);
+    }
+
+    #[test]
+    fn multibyte_split_produces_intact_line() {
+        let payload = format!("data: {{\"a\":\"你好🌍\"}}");
+        let bytes = payload.as_bytes();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut got = Vec::new();
+        // 每 2 字节一切，模拟最恶劣的分块
+        for c in bytes.chunks(2) {
+            got.extend(drain_complete_lines(&mut buf, c));
+        }
+        got.extend(drain_complete_lines(&mut buf, b"\n"));
+        assert_eq!(got.len(), 1, "应切出一整行");
+        assert!(got[0].contains("你好🌍"), "多字节字符不得损坏: {}", got[0]);
+        assert!(!got[0].contains('\u{FFFD}'), "不得出现替换符");
+    }
+
+    #[test]
+    fn multiple_lines_and_crlf_safe() {
+        let mut buf: Vec<u8> = Vec::new();
+        let got = drain_complete_lines(&mut buf, b"data: a\ndata: b\ndata: c");
+        assert_eq!(got, vec!["data: a", "data: b"]);
+        // 尾部不完整行保留在 buf，下一块补上换行后切出
+        let got2 = drain_complete_lines(&mut buf, b"\n");
+        assert_eq!(got2, vec!["data: c"]);
+        assert!(buf.is_empty());
     }
 }

@@ -1591,10 +1591,12 @@ pub struct UpdateInfo {
     pub has_update: bool,
     pub notes: String,
     pub url: String,
+    /// 已下载到升级目录（可点击直接重启换装）
+    pub downloaded: bool,
 }
 
 /// 版本号比较：a 是否大于 b（按数字段逐位比较）
-fn version_gt(a: &str, b: &str) -> bool {
+pub fn version_gt(a: &str, b: &str) -> bool {
     let pa: Vec<u64> = a
         .trim_start_matches('v')
         .split('.')
@@ -1615,88 +1617,50 @@ fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-/// 自动更新检测：镜像 latest.json（GitHub Pages → osbt.space，国内直连可达），回退 GitHub API
+/// 自动更新检测：镜像 latest.json（GitHub Pages → osbt.space，国内直连可达），回退 GitHub API。
+/// BIT_FAKE_UPDATE_URL 环境变量可将检测源替换为测试注入的地址（e2e 用）。
 #[tauri::command]
 pub async fn check_updates(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
     let current = app.package_info().version.to_string();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(6))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut latest = String::new();
-    let mut notes = String::new();
-    let mut url = "https://osbt.space".to_string();
-    for src in [
-        "https://yxpil.github.io/bit/latest.json",
-        "https://osbt.space/latest.json",
-    ] {
-        let ok = match client.get(src).send().await {
-            Ok(resp) => match resp.json::<serde_json::Value>().await {
-                Ok(j) => match j.get("version").and_then(|x| x.as_str()) {
-                    Some(ver) => {
-                        latest = ver.to_string();
-                        notes = j
-                            .get("notes")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        url = j
-                            .get("url")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("https://osbt.space")
-                            .to_string();
-                        true
-                    }
-                    None => false,
-                },
-                Err(_) => false,
-            },
-            Err(_) => false,
-        };
-        if ok {
-            break;
-        }
-    }
-    if latest.is_empty() {
-        if let Ok(v) = client
-            .get("https://api.github.com/repos/yxpil/bit/releases/latest")
-            .header("User-Agent", "BIT-Agent")
-            .send()
-            .await
-        {
-            if let Ok(j) = v.json::<serde_json::Value>().await {
-                latest = j
-                    .get("tag_name")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .trim_start_matches('v')
-                    .to_string();
-                notes = j
-                    .get("body")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .chars()
-                    .take(300)
-                    .collect();
-                url = j
-                    .get("html_url")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("https://osbt.space")
-                    .to_string();
-            }
-        }
-    }
-    if latest.is_empty() {
-        return Err("暂时无法获取最新版本信息".into());
-    }
-    let has_update = version_gt(&latest, &current);
+    let latest = crate::update::fetch_latest().await?;
+    let has_update = version_gt(&latest.version, &current);
+    let downloaded = app
+        .try_state::<Arc<Ctx>>()
+        .map(|s| crate::update::read_state(&s))
+        .unwrap_or(None)
+        .is_some_and(|st| {
+            st["version"] == latest.version.as_str() && st["state"] == "downloaded"
+        });
     Ok(UpdateInfo {
         current,
-        latest,
+        latest: latest.version,
         has_update,
-        notes,
-        url,
+        notes: latest.notes,
+        url: latest.url,
+        downloaded,
     })
+}
+
+/// 手动触发下载当前平台更新包（启动后台任务会自动下；此处供 pill/远程 API 主动调用）
+#[tauri::command]
+pub async fn update_download(app: tauri::AppHandle, state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let status = crate::update::download_update(&ctx).await?;
+    let _ = app.emit("update-state", status.clone());
+    Ok(status)
+}
+
+/// 应用已下载的更新：换装并重启（托盘退出时由 quit 处理器静默换装，不重启）
+#[tauri::command]
+pub async fn update_apply(app: tauri::AppHandle, state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let msg = crate::update::apply_update(&ctx, true)?;
+    let _ = app.emit("update-applied", serde_json::json!({ "msg": msg }));
+    // 给事件一点送达时间后重启进程（macOS/Linux 已换装；Windows 安装器静默跑）
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    app.restart();
+    #[allow(unreachable_code)]
+    Ok(serde_json::json!({ "state": "restarting", "msg": msg }))
 }
 
 #[cfg(test)]

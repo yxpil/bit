@@ -20,6 +20,7 @@ mod session;
 mod state;
 mod tray;
 mod tui;
+mod update;
 
 use tauri::Manager;
 
@@ -102,6 +103,13 @@ fn main() {
                 autopilot::run(auto_ctx).await;
             });
 
+            // 自动更新：启动后静默检测 + 下载（下载完成发 update-state 事件）
+            let upd_ctx = ctx.clone();
+            let upd_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                update::auto_update_task(upd_app, upd_ctx).await;
+            });
+
             Ok(())
         })
         // 关闭窗口 = 最小化到托盘（后台继续运行 HTTP 服务与 Autopilot）
@@ -114,6 +122,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::is_headless,
             commands::check_updates,
+            commands::update_download,
+            commands::update_apply,
             commands::open_external,
             commands::install_cli,
             commands::mem_usage,

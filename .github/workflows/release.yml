@@ -313,8 +313,20 @@ jobs:
           VERSION="${TAG#v}"
           # notes 取 Release 说明前 300 字符，与客户端 GitHub API 回退路径的截断一致
           NOTES=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body | head -c 300)
+          # assets 映射：客户端自动更新按平台取直链（BIT 客户端 pick_asset 消费）
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
           jq -n --arg v "$VERSION" --arg n "$NOTES" --arg u "https://yxpil.github.io/bit/$VERSION/" \
-            '{version: $v, notes: $n, url: $u}' > latest.json
+            --arg w64 "$BASE/BIT_${VERSION}_x64-setup.exe" \
+            --arg war "$BASE/BIT_${VERSION}_aarch64-setup.exe" \
+            --arg maa "$BASE/BIT_${VERSION}_aarch64-app.zip" \
+            --arg max "$BASE/BIT_${VERSION}_x64-app.zip" \
+            --arg lx64 "$BASE/BIT_${VERSION}_amd64.AppImage" \
+            --arg larm "$BASE/BIT_${VERSION}_aarch64.AppImage" \
+            '{version: $v, notes: $n, url: $u, assets: {
+              "windows-x64": $w64, "windows-arm64": $war,
+              "macos-arm64": $maa, "macos-x64": $max,
+              "linux-x64": $lx64, "linux-arm64": $larm
+            }}' > latest.json
           cat latest.json
           gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
           gh workflow run mirror-pages.yml -f tag="$TAG" --repo "$GITHUB_REPOSITORY"

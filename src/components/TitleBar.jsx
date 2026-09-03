@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { PhysicalPosition, currentMonitor, getCurrentWindow, primaryMonitor } from "@tauri-apps/api/window";
 import { IconMinus, IconSquare, IconX } from "./Icons.jsx";
 import { useLang } from "../i18n.js";
@@ -26,7 +27,8 @@ export default function TitleBar() {
   const [memMB, setMemMB] = useState(null);
   const [update, setUpdate] = useState(null);
 
-  // 自动更新检测：启动 3 秒后查一次，之后每 6 小时复查（localStorage 节流跨重启生效）
+  // 自动更新：启动 3 秒后查一次，之后每 6 小时复查（localStorage 节流跨重启生效）。
+  // 后台下载完成 / 状态变化时由后端发 update-state 事件刷新 pill。
   useEffect(() => {
     const CHECK_KEY = "bit-last-update-check";
     const check = async () => {
@@ -40,16 +42,35 @@ export default function TitleBar() {
         /* 网络不可达时静默跳过 */
       }
     };
+    const un = listen("update-state", (e) => {
+      const s = e.payload || {};
+      if (s.state === "downloaded") {
+        setUpdate((prev) => ({
+          latest: s.version,
+          notes: s.notes || prev?.notes || "",
+          url: s.url || prev?.url || "",
+          has_update: true,
+          downloaded: true,
+        }));
+      }
+    });
     const t = setTimeout(check, 3000);
     const iv = setInterval(check, 6 * 3600 * 1000);
     return () => {
       clearTimeout(t);
       clearInterval(iv);
+      un.then((f) => f()).catch(() => {});
     };
   }, []);
 
+  // 已下载 → 点击直接换装重启（关闭时自动更新之外的手动路径）；
+  // 未下载 → 打开下载页
   const openUpdate = () => {
     if (!update) return;
+    if (update.downloaded) {
+      invoke("update_apply").catch(() => {});
+      return;
+    }
     invoke("open_external", { url: update.url }).catch(() => {});
   };
 
@@ -153,7 +174,7 @@ export default function TitleBar() {
             title={update.notes ? `${update.notes.slice(0, 120)}` : `可更新到 v${update.latest}`}
             className="accent-solid rounded-full px-2 py-0.5 text-[10px] font-semibold"
           >
-            {t("title.updateAvailable")} v{update.latest}
+            {update.downloaded ? t("title.updateApply") : t("title.updateAvailable")} v{update.latest}
           </button>
         )}
         <span className="opacity-50">·</span>

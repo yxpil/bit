@@ -111,6 +111,7 @@ const server = http.createServer((req, res) => {
     // 带上本次请求历史，便于模拟用量统计
     const respond = (r, p, s) => respondMsg(r, p, s, messages);
     const sse = !!parsed.stream;
+    console.log(`[mock] ${new Date().toISOString()} stream=${parsed.stream} tools=${!!parsed.tools} last=${JSON.stringify((messages[messages.length-1]||{}).content||"").slice(0,80)}`);
     const last = pickLastUser(messages);
     const rounds = toolResultCount(messages);
     const fb = feedbackText(messages);
@@ -205,6 +206,17 @@ const server = http.createServer((req, res) => {
       if (all.includes("E2E-CMD-COMPACT")) {
         const compacted = /"compacted"\s*:\s*true/.test(fb);
         return respond(res, `E2E-FINAL-COMPACT compacted=${compacted}`, sse);
+      }
+
+      // E2E-AI-RETRY: 轮0 shell 参数缺失（报错反馈）→ 轮1 自我纠正给出最终答案
+      // 用 last（原始指令）而非 all 匹配：同会话多场景时 all 会串扰
+      if (last.includes("E2E-AI-RETRY")) {
+        return respond(res, "E2E-AI-RETRY-OK（参数已纠正）", sse);
+      }
+
+      // E2E-AI-NOTOOL: 轮0 幻觉工具（报错反馈）→ 轮1 换真实工具完成
+      if (last.includes("E2E-AI-NOTOOL")) {
+        return respond(res, "E2E-AI-NOTOOL-OK（已改用真实工具）", sse);
       }
 
       // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）
@@ -340,6 +352,82 @@ const server = http.createServer((req, res) => {
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end("not-json-garbage{{{");
+    }
+
+    // ── AI 行为模拟：真实模型的高频调用习惯（参数纠错/幻觉工具/围栏包裹/一回合多调用） ──
+    // 首轮返回第一波工具调用；反馈轮在上方 isFeedback 块按 all.includes 处理
+
+    // 轮0：参数缺失（AI 常见失误），等错误反馈后自我纠正
+    if (last.includes("E2E-AI-RETRY")) {
+      return respond(res, '[{"tool":"shell","params":{"cwd":"/tmp"}}]', sse);
+    }
+
+    // 轮0：调用不存在的工具（幻觉），等错误反馈后换真实工具
+    if (last.includes("E2E-AI-NOTOOL")) {
+      return respond(res, '[{"tool":"no_such_tool_xyz","params":{}}]', sse);
+    }
+
+    // 围栏 + 前后散文包裹（AI 最常见的工具调用书写方式），一轮 shell 即完成
+    if (last.includes("E2E-AI-FENCED")) {
+      return respond(
+        res,
+        '好的，我来执行检查：\n```json\n[{"tool":"shell","params":{"command":"echo E2E-AI-FENCED-OK"}}]\n```\n执行完成后我会汇报结果。',
+        sse
+      );
+    }
+
+    // 一回合三个工具调用（批量模式，AI 处理多任务时的高频形态）
+    if (last.includes("E2E-AI-MULTI")) {
+      return respond(
+        res,
+        '[{"tool":"shell","params":{"command":"echo E2E-AI-MULTI-A"}},{"tool":"shell","params":{"command":"echo E2E-AI-MULTI-B"}},{"tool":"shell","params":{"command":"echo E2E-AI-MULTI-C"}}]',
+        sse
+      );
+    }
+
+    // ── 流式边界：多字节字符跨 chunk 拆分 / 大量小 chunk / 立即 500 ──
+    // 非 2xx 原生请求会让 BIT 静默降级到文本流式协议（read_json_native 分类 Unsupported），
+    // 400 空响应即强制后续轮次走 SSE，确保下面两个场景真正压到 read_sse
+
+    // SSE data 行整体按字节切成 3 字节一组逐组发送，多字节字符必被 TCP 分块从中间截断
+    if (last.includes("E2E-STREAM-MULTIBYTE") || last.includes("E2E-STREAM-MANY")) {
+      if (!sse) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "tools parameter not supported by this endpoint" } }));
+      }
+    }
+
+    // SSE data 行整体按字节切成 3 字节一组逐组发送，多字节字符必被 TCP 分块从中间截断
+    if (last.includes("E2E-STREAM-MULTIBYTE")) {
+      const text = "你好🌍BIT-STREAM-OK";
+      const raw = Buffer.from(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: text } }] })}\n\n`, "utf8");
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      let i = 0;
+      const timer = setInterval(() => {
+        for (let k = 0; k < 3 && i < raw.length; k++, i++) res.write(raw.slice(i, i + 1));
+        if (i >= raw.length) {
+          clearInterval(timer);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+      }, 4);
+      return;
+    }
+
+    // 200 个小 chunk 连发：丢块/漏块/乱序都会导致内容不完整
+    if (last.includes("E2E-STREAM-MANY")) {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      for (let i = 0; i < 200; i++) {
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: `c${i};` } }] })}\n\n`);
+      }
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    // 流式请求立即 500：错误必须以失败形式反馈，不能静默空回复
+    if (last.includes("E2E-STREAM-ERR")) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: { message: "mock upstream exploded" } }));
     }
 
     if (last.includes("E2E-CMD-SHELL"))
