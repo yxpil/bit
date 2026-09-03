@@ -41,6 +41,8 @@ modules:
     buildsystem: cmake-ninja
     config-opts:
       - -DENABLE_GTKDOC=OFF
+      # cmake 会装到 lib64，而 shared-modules 的 autotools 只查 /app/lib/pkgconfig，强制统一为 lib
+      - -DCMAKE_INSTALL_LIBDIR=lib
     cleanup:
       - /include
       - /lib/pkgconfig
