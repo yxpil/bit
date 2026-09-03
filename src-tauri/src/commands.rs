@@ -1463,6 +1463,151 @@ fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
     Err("不支持的平台".into())
 }
 
+/// 用系统默认浏览器打开外部链接（更新提示、官网等）
+#[tauri::command]
+pub fn open_external(url: String) -> Result<(), String> {
+    // 只允许 http(s)，防止任意命令注入
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("仅支持 http(s) 链接".into());
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(&url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", &url]);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(&url);
+        c
+    };
+    cmd.spawn().map_err(|e| format!("打开浏览器失败: {e}"))?;
+    Ok(())
+}
+
+/// 自动更新检测结果
+#[derive(serde::Serialize)]
+pub struct UpdateInfo {
+    pub current: String,
+    pub latest: String,
+    pub has_update: bool,
+    pub notes: String,
+    pub url: String,
+}
+
+/// 版本号比较：a 是否大于 b（按数字段逐位比较）
+fn version_gt(a: &str, b: &str) -> bool {
+    let pa: Vec<u64> = a
+        .trim_start_matches('v')
+        .split('.')
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    let pb: Vec<u64> = b
+        .trim_start_matches('v')
+        .split('.')
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    for i in 0..3 {
+        let x = pa.get(i).copied().unwrap_or(0);
+        let y = pb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// 自动更新检测：镜像 latest.json（GitHub Pages → osbt.space，国内直连可达），回退 GitHub API
+#[tauri::command]
+pub async fn check_updates(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+    let current = app.package_info().version.to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut latest = String::new();
+    let mut notes = String::new();
+    let mut url = "https://osbt.space".to_string();
+    for src in [
+        "https://yxpil.github.io/bit/latest.json",
+        "https://osbt.space/latest.json",
+    ] {
+        let ok = match client.get(src).send().await {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(j) => match j.get("version").and_then(|x| x.as_str()) {
+                    Some(ver) => {
+                        latest = ver.to_string();
+                        notes = j
+                            .get("notes")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        url = j
+                            .get("url")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("https://osbt.space")
+                            .to_string();
+                        true
+                    }
+                    None => false,
+                },
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if ok {
+            break;
+        }
+    }
+    if latest.is_empty() {
+        if let Ok(v) = client
+            .get("https://api.github.com/repos/yxpil/bit/releases/latest")
+            .header("User-Agent", "BIT-Agent")
+            .send()
+            .await
+        {
+            if let Ok(j) = v.json::<serde_json::Value>().await {
+                latest = j
+                    .get("tag_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim_start_matches('v')
+                    .to_string();
+                notes = j
+                    .get("body")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(300)
+                    .collect();
+                url = j
+                    .get("html_url")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("https://osbt.space")
+                    .to_string();
+            }
+        }
+    }
+    if latest.is_empty() {
+        return Err("暂时无法获取最新版本信息".into());
+    }
+    let has_update = version_gt(&latest, &current);
+    Ok(UpdateInfo {
+        current,
+        latest,
+        has_update,
+        notes,
+        url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     /// 外部集成测试：连接独立运行的 mock AI（e2e/mock-ai.cjs，默认 127.0.0.1:9901），

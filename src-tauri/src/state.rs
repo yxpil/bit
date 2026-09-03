@@ -87,7 +87,7 @@ pub struct Ctx {
 }
 
 pub const AUDIT_MAX: usize = 2000;
-pub const CHAT_MAX: usize = 60;
+pub const CHAT_MAX: usize = 200;
 
 impl Ctx {
     pub fn load(app: tauri::AppHandle) -> Arc<Ctx> {

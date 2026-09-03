@@ -24,6 +24,34 @@ export default function TitleBar() {
   const [ver, setVer] = useState("");
   const [dash, setDash] = useState({ sessions: 0, tokens: 0, limitK: 128 });
   const [memMB, setMemMB] = useState(null);
+  const [update, setUpdate] = useState(null);
+
+  // 自动更新检测：启动 3 秒后查一次，之后每 6 小时复查（localStorage 节流跨重启生效）
+  useEffect(() => {
+    const CHECK_KEY = "bit-last-update-check";
+    const check = async () => {
+      try {
+        const last = Number(localStorage.getItem(CHECK_KEY) || 0);
+        if (Date.now() - last < 6 * 3600 * 1000) return;
+        localStorage.setItem(CHECK_KEY, String(Date.now()));
+        const info = await invoke("check_updates");
+        if (info?.has_update) setUpdate(info);
+      } catch {
+        /* 网络不可达时静默跳过 */
+      }
+    };
+    const t = setTimeout(check, 3000);
+    const iv = setInterval(check, 6 * 3600 * 1000);
+    return () => {
+      clearTimeout(t);
+      clearInterval(iv);
+    };
+  }, []);
+
+  const openUpdate = () => {
+    if (!update) return;
+    invoke("open_external", { url: update.url }).catch(() => {});
+  };
 
   useEffect(() => {
     let timer = null;
@@ -119,6 +147,15 @@ export default function TitleBar() {
           }`}
         />
         {ver && <span className="font-semibold">v{ver}</span>}
+        {update && (
+          <button
+            onClick={openUpdate}
+            title={update.notes ? `${update.notes.slice(0, 120)}` : `可更新到 v${update.latest}`}
+            className="accent-solid rounded-full px-2 py-0.5 text-[10px] font-semibold"
+          >
+            {t("title.updateAvailable")} v{update.latest}
+          </button>
+        )}
         <span className="opacity-50">·</span>
         <span>
           {dash.sessions} {t("chat.unitSessions")}

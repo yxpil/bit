@@ -76,6 +76,7 @@ const dict = {
     // 标题栏
     "title.minimize": "最小化",
     "title.maximize": "最大化",
+    "title.updateAvailable": "新版本可用",
     // 工具调用卡片
     "toolcard.success": "成功",
     "toolcard.fail": "失败",
@@ -376,6 +377,7 @@ const dict = {
     // Title bar
     "title.minimize": "Minimize",
     "title.maximize": "Maximize",
+    "title.updateAvailable": "Update available",
     // Tool call card
     "toolcard.success": "Success",
     "toolcard.fail": "Failed",

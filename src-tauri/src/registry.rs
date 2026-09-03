@@ -514,15 +514,15 @@ async fn builtin_invoke(
                 cmd.kill_on_drop(true);
                 cmd.output().await
             });
-            let out = match tokio::time::timeout(std::time::Duration::from_secs(60), handle).await {
+            let out = match tokio::time::timeout(std::time::Duration::from_secs(600), handle).await {
                 Ok(res) => res.map_err(|e| format!("命令任务失败: {e}"))?,
-                Err(_) => return Err("命令执行超时（60 秒）".into()),
+                Err(_) => return Err("命令执行超时（600 秒）".into()),
             };
             let out = out.map_err(|e| format!("启动命令失败: {e}"))?;
             Ok(serde_json::json!({
                 "code": out.status.code(),
-                "stdout": safe_trunc(&String::from_utf8_lossy(&out.stdout), 6000),
-                "stderr": safe_trunc(&String::from_utf8_lossy(&out.stderr), 6000),
+                "stdout": safe_trunc(&String::from_utf8_lossy(&out.stdout), 60000),
+                "stderr": safe_trunc(&String::from_utf8_lossy(&out.stderr), 60000),
             }))
         }
         // ── 2. 文档编辑（写 / 覆盖）──

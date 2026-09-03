@@ -42,11 +42,13 @@ async fn wait_interrupt(ctx: &Arc<Ctx>, target: &str) {
 /// 历史窗口：总量超限时按 8 条为步长对齐回退（而非每轮滑动一条），
 /// 使相邻多轮请求的消息前缀逐字节一致 → 命中各家提示词缓存（openai/gemini 自动、deepseek/kimi 等兼容端同样有效）
 fn history_window<'a>(msgs: &'a [ChatMessage]) -> &'a [ChatMessage] {
+    // 96 条窗口（8 步对齐保缓存命中）：长任务不被过早截断历史
+    const WINDOW: usize = 96;
     let total = msgs.len();
-    if total <= 24 {
+    if total <= WINDOW {
         return msgs;
     }
-    let skip = ((total - 24).div_ceil(8)) * 8;
+    let skip = ((total - WINDOW).div_ceil(8)) * 8;
     &msgs[skip..]
 }
 
@@ -447,26 +449,28 @@ pub async fn chat_turn(
         };
 
         if !native_calls.is_empty() {
-            // 执行工具，收集可视化记录
-            let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
-            for call in native_calls.iter().take(6) {
-                if interrupted(ctx, &target) {
-                    clear_interrupt(ctx, &target);
-                    return Err("对话已中断".into());
-                }
-                // select!：长工具（编译/大脚本）同样可被中断即时打断
-                let outcome = if call.name.is_empty() {
-                    Err("缺少 tool 字段".to_string())
-                } else {
-                    tokio::select! {
-                        r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
-                        _ = wait_interrupt(ctx, &target) => Err(String::new()),
+            // 并发执行全部工具调用（上限 16）：互不依赖的工具同时跑，结果仍按调用顺序回喂
+            let calls: Vec<ai::NativeToolCall> = native_calls.iter().take(16).cloned().collect();
+            let outcomes = futures_util::future::join_all(calls.iter().map(|call| {
+                let target = target.clone();
+                async move {
+                    if call.name.is_empty() {
+                        Err("缺少 tool 字段".to_string())
+                    } else {
+                        tokio::select! {
+                            r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
+                            _ = wait_interrupt(ctx, &target) => Err(String::new()),
+                        }
                     }
-                };
-                if interrupted(ctx, &target) {
-                    clear_interrupt(ctx, &target);
-                    return Err("对话已中断".into());
                 }
+            }))
+            .await;
+            if interrupted(ctx, &target) {
+                clear_interrupt(ctx, &target);
+                return Err("对话已中断".into());
+            }
+            let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
+            for (call, outcome) in calls.iter().zip(outcomes.into_iter()) {
                 let ok = outcome.is_ok();
                 let mut result = outcome.unwrap_or_else(|e| json!(e));
                 // view_image：把 data_url 抽出注入下一轮请求（视觉模型看图），记录本身脱敏（base64 不回喂不落库）
@@ -767,29 +771,30 @@ pub async fn chat_turn_stream(
         }
 
         if !native_calls.is_empty() {
-            let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
-            for call in native_calls.iter().take(6) {
-                if interrupted(ctx, &target) {
-                    clear_interrupt(ctx, &target);
-                    let e = "对话已中断".to_string();
-                    emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
-                    return Err(e);
-                }
-                // select!：长工具执行同样可被中断即时打断
-                let outcome = if call.name.is_empty() {
-                    Err("缺少 tool 字段".to_string())
-                } else {
-                    tokio::select! {
-                        r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
-                        _ = wait_interrupt(ctx, &target) => Err(String::new()),
+            // 并发执行全部工具调用（上限 16）：互不依赖的工具同时跑，结果仍按调用顺序回喂
+            let calls: Vec<ai::NativeToolCall> = native_calls.iter().take(16).cloned().collect();
+            let outcomes = futures_util::future::join_all(calls.iter().map(|call| {
+                let target = target.clone();
+                async move {
+                    if call.name.is_empty() {
+                        Err("缺少 tool 字段".to_string())
+                    } else {
+                        tokio::select! {
+                            r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
+                            _ = wait_interrupt(ctx, &target) => Err(String::new()),
+                        }
                     }
-                };
-                if interrupted(ctx, &target) {
-                    clear_interrupt(ctx, &target);
-                    let e = "对话已中断".to_string();
-                    emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
-                    return Err(e);
                 }
+            }))
+            .await;
+            if interrupted(ctx, &target) {
+                clear_interrupt(ctx, &target);
+                let e = "对话已中断".to_string();
+                emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
+                return Err(e);
+            }
+            let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
+            for (call, outcome) in calls.iter().zip(outcomes.into_iter()) {
                 let ok = outcome.is_ok();
                 let mut result = outcome.unwrap_or_else(|e| json!(e));
                 // view_image：把 data_url 抽出注入下一轮请求（视觉模型看图），记录本身脱敏（base64 不回喂不落库）
