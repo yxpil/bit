@@ -53,12 +53,12 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.shell",
             "shell",
-            "执行一条命令行（系统 shell），返回 stdout/stderr 与退出码",
+            "Execute a shell command (system shell) and return stdout/stderr with exit code",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "要执行的命令" },
-                    "cwd": { "type": "string", "description": "工作目录（可选）" }
+                    "command": { "type": "string", "description": "The command to execute" },
+                    "cwd": { "type": "string", "description": "Working directory (optional)" }
                 },
                 "required": ["command"]
             }),
@@ -68,12 +68,12 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.write_file",
             "write_file",
-            "写入或覆盖一个文件（文档编辑）。用于创建文件或整体替换内容",
+            "Write or overwrite a file. Use it to create a file or replace the whole content",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "目标文件绝对路径" },
-                    "content": { "type": "string", "description": "文件完整内容" }
+                    "path": { "type": "string", "description": "Absolute path of the target file" },
+                    "content": { "type": "string", "description": "Full file content" }
                 },
                 "required": ["path", "content"]
             }),
@@ -83,12 +83,12 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.plan",
             "plan",
-            "制定计划：给出一个目标标题与若干步骤，自动登记为目标与待办清单",
+            "Create a plan: register a goal title with steps as a goal plus a todo list",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "goal": { "type": "string", "description": "计划总目标" },
-                    "steps": { "type": "array", "items": { "type": "string" }, "description": "分步待办" }
+                    "goal": { "type": "string", "description": "The overall goal of the plan" },
+                    "steps": { "type": "array", "items": { "type": "string" }, "description": "Todo items, one per step" }
                 },
                 "required": ["goal", "steps"]
             }),
@@ -98,14 +98,14 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.edit",
             "edit",
-            "增量补丁修改文件：把文件中的 old_string 精确替换为 new_string（不重写整份文件）",
+            "Patch a file in place: replace an exact old_string with new_string (no full rewrite)",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "目标文件绝对路径" },
-                    "old_string": { "type": "string", "description": "要被替换的原文（需唯一匹配）" },
-                    "new_string": { "type": "string", "description": "替换后的新文本" },
-                    "replace_all": { "type": "boolean", "description": "是否替换全部匹配（默认 false）" }
+                    "path": { "type": "string", "description": "Absolute path of the target file" },
+                    "old_string": { "type": "string", "description": "Exact original text to replace (must match uniquely)" },
+                    "new_string": { "type": "string", "description": "Replacement text" },
+                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)" }
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
@@ -115,14 +115,14 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.add_tool",
             "add_tool",
-            "给自己增加工具：用本机某个解释器把一段代码沉淀为常驻工具，之后可反复调用",
+            "Create a persistent tool from a code snippet executed by a local interpreter; reusable afterwards",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "新工具名称（唯一）" },
-                    "description": { "type": "string", "description": "工具用途描述" },
-                    "runtime": { "type": "string", "description": "解释器 id（见本机可用解释器清单）" },
-                    "code": { "type": "string", "description": "该语言代码：从 stdin 读参数 JSON，把结果打印到 stdout" }
+                    "name": { "type": "string", "description": "New tool name (unique)" },
+                    "description": { "type": "string", "description": "What the tool does" },
+                    "runtime": { "type": "string", "description": "Interpreter id (see the available runtimes list)" },
+                    "code": { "type": "string", "description": "Code in that language: read the params JSON from stdin and print the result JSON to stdout" }
                 },
                 "required": ["name", "runtime", "code"]
             }),
@@ -132,12 +132,12 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.sub_agent",
             "sub_agent",
-            "派生子智能体：新建一个独立会话并把完整任务发过去，子智能体拥有你的全部工具，会自主多轮执行（含读写文件、执行命令）直到给出最终答案。适合把独立的大任务（调研、批量整理、写大文件、并行分支）交给子任务完成。本工具阻塞等待，并把子智能体的最终结论【原文完整】直接返回到当前对话——无需约定任何文件位置，直接基于返回内容继续即可。task 必须自包含：子智能体看不到当前对话历史，请把背景、目标、验收标准写全",
+            "Spawn a sub-agent: opens an independent session with the full task. The sub-agent has ALL your tools and runs autonomously (multi-turn, including file read/write and shell) until it produces a final answer. Ideal for delegating independent large tasks (research, batch processing, writing large files, parallel branches). This tool blocks and returns the sub-agent's final answer VERBATIM into the current conversation - no file location conventions needed; just continue from the returned content. The task must be self-contained: the sub-agent cannot see the current conversation history, so include background, goal and acceptance criteria",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "task": { "type": "string", "description": "给子智能体的完整任务描述（自包含：背景 + 目标 + 验收标准）" },
-                    "title": { "type": "string", "description": "子会话标题（可选，默认「子任务」）" }
+                    "task": { "type": "string", "description": "Complete task description for the sub-agent (self-contained: background + goal + acceptance criteria)" },
+                    "title": { "type": "string", "description": "Sub-session title (optional)" }
                 },
                 "required": ["task"]
             }),
@@ -147,11 +147,11 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.delete_tool",
             "delete_tool",
-            "删除你自己创建的工具（add_tool 建的解释器/脚本工具）。内置工具、远程工具、MCP 工具不允许删除",
+            "Delete a tool you created via add_tool (interpreter/script tools). Builtin, remote and MCP tools cannot be deleted",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "要删除的工具名称" }
+                    "name": { "type": "string", "description": "Name of the tool to delete" }
                 },
                 "required": ["name"]
             }),
@@ -161,11 +161,11 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.truncate_history",
             "truncate_history",
-            "截断当前会话的历史消息：只保留最近 keep 条（默认 12），更早的内容将不可恢复。当历史过长、早前内容已无价值时主动使用",
+            "Truncate this session's history: keep only the most recent `keep` messages (default 12); earlier content is lost permanently. Use proactively when the history is long and earlier content is no longer valuable",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "keep": { "type": "integer", "description": "保留最近多少条消息（默认 12，最小 2）" }
+                    "keep": { "type": "integer", "description": "How many recent messages to keep (default 12, min 2)" }
                 }
             }),
             "truncate_history",
@@ -174,11 +174,11 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.compact_history",
             "compact_history",
-            "压缩当前会话：把此前全部历史替换为你撰写的一段摘要（最近 2 条现场保留）。summary 里要写全：关键结论、重要决定、未完成事项、后续计划",
+            "Compact this session: replace all prior history with a summary you write (the last 2 messages are kept verbatim). The summary must include: key conclusions, important decisions, unfinished items, next steps",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "summary": { "type": "string", "description": "对既往对话的完整摘要" }
+                    "summary": { "type": "string", "description": "Complete summary of the prior conversation" }
                 },
                 "required": ["summary"]
             }),
@@ -188,14 +188,14 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.skill",
             "skill",
-            "技能库：写入一条可复用技能（action=save）或按关键词搜索已有技能（action=search）",
+            "Skill library: save a reusable skill (action=save) or search existing skills by keyword (action=search)",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["save", "search"], "description": "save=写入，search=搜索" },
-                    "name": { "type": "string", "description": "action=save 时：技能名称（同名覆盖）" },
-                    "summary": { "type": "string", "description": "action=save 时：技能内容/步骤总结" },
-                    "query": { "type": "string", "description": "action=search 时：搜索关键词（留空返回全部）" }
+                    "action": { "type": "string", "enum": ["save", "search"], "description": "save=write, search=search" },
+                    "name": { "type": "string", "description": "For action=save: skill name (same name overwrites)" },
+                    "summary": { "type": "string", "description": "For action=save: skill content / step summary" },
+                    "query": { "type": "string", "description": "For action=search: search keyword (empty returns all)" }
                 },
                 "required": ["action"]
             }),
@@ -205,12 +205,12 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.send_file",
             "send_file",
-            "把一个现成文件发送给用户：聊天里会出现可点击打开的文件卡片。适合交付你生成的报告/HTML/图片/数据文件等成果",
+            "Deliver an existing file to the user: a clickable file card appears in the chat. Use for results you produced (reports, HTML, images, data files...)",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要发送的文件绝对路径" },
-                    "note": { "type": "string", "description": "一句话说明（可选）" }
+                    "path": { "type": "string", "description": "Absolute path of the file to send" },
+                    "note": { "type": "string", "description": "One-line note (optional)" }
                 },
                 "required": ["path"]
             }),
@@ -220,12 +220,12 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.view_image",
             "view_image",
-            "查看一张本地图片：图片会以图像形式注入下一轮对话，视觉模型（如 deepseek-v4-flash-vision-exp、GPT、Gemini、Claude）可以直接看到内容。支持 png/jpg/jpeg/webp/gif/bmp",
+            "View a local image: the image is injected into the next turn as visual content that vision models (GPT, Gemini, Claude, etc.) can see directly. Supports png/jpg/jpeg/webp/gif/bmp",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "图片文件绝对路径" },
-                    "note": { "type": "string", "description": "想重点看什么（可选，会作为看图提示）" }
+                    "path": { "type": "string", "description": "Absolute path of the image file" },
+                    "note": { "type": "string", "description": "What to focus on (optional, passed as a viewing hint)" }
                 },
                 "required": ["path"]
             }),
@@ -258,17 +258,17 @@ pub fn register_opts(
 ) -> Result<ToolDef, String> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("工具名称不能为空".into());
+        return Err("Tool name cannot be empty".into());
     }
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut tools = ctx.tools.lock().unwrap();
     if let Some(existing) = tools.iter_mut().find(|t| t.name.eq_ignore_ascii_case(name)) {
         if !overwrite {
-            return Err(format!("工具 `{name}` 已存在"));
+            return Err(format!("Tool `{name}` already exists"));
         }
         // 仅允许覆盖 AI 自建的工具（解释器 / 脚本）；内置、远程、MCP 工具不可覆盖
         if !matches!(existing.kind, ToolKind::Interpreter { .. } | ToolKind::Script { .. }) {
-            return Err(format!("工具 `{name}` 是系统/远程工具，不允许覆盖，请换一个名字"));
+            return Err(format!("Tool `{name}` is a system/remote tool and cannot be overwritten; choose a different name"));
         }
         existing.description = description.trim().to_string();
         existing.parameters = if parameters.is_null() {
@@ -311,12 +311,12 @@ pub fn remove(ctx: &Arc<crate::state::Ctx>, id: &str) -> Result<String, String> 
         .iter()
         .any(|t| t.id == id && matches!(t.kind, ToolKind::Builtin { .. }))
     {
-        return Err("内置工具不允许删除".into());
+        return Err("Builtin tools cannot be deleted".into());
     }
     let before = tools.len();
     tools.retain(|t| t.id != id);
     if tools.len() == before {
-        return Err(format!("工具 `{id}` 不存在"));
+        return Err(format!("Tool `{id}` does not exist"));
     }
     drop(tools);
     ctx.save_tools();
@@ -329,7 +329,7 @@ pub fn set_enabled(ctx: &Arc<crate::state::Ctx>, id: &str, enabled: bool) -> Res
     let tool = tools
         .iter_mut()
         .find(|t| t.id == id)
-        .ok_or_else(|| format!("工具 `{id}` 不存在"))?;
+        .ok_or_else(|| format!("Tool `{id}` does not exist"))?;
     tool.enabled = enabled;
     drop(tools);
     ctx.save_tools();
@@ -359,11 +359,11 @@ pub async fn invoke(
             .iter()
             .find(|t| t.id == id)
             .cloned()
-            .ok_or_else(|| format!("工具 `{id}` 不存在"))?
+            .ok_or_else(|| format!("Tool `{id}` does not exist"))?
     };
 
     if !tool.enabled {
-        return Err(format!("工具 `{}` 已暂停，请先在「工具」页启用", tool.name));
+        return Err(format!("Tool `{}` is paused; enable it on the Tools page first", tool.name));
     }
 
     let result = match &tool.kind {
@@ -383,11 +383,11 @@ pub async fn invoke(
                 }))
                 .send()
                 .await
-                .map_err(|e| format!("回调失败: {e}"))?;
+                .map_err(|e| format!("Callback failed: {e}"))?;
             let status = resp.status().as_u16();
             let value: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
             if status >= 400 {
-                Err(format!("回调返回 HTTP {status}: {value}"))
+                Err(format!("Callback returned HTTP {status}: {value}"))
             } else {
                 Ok(value)
             }
@@ -395,10 +395,10 @@ pub async fn invoke(
         ToolKind::Mcp { server_id, tool } => {
             // 服务器级暂停/继续：暂停后该服务器全部工具拒绝调用
             let server = crate::mcp::find(ctx, server_id)
-                .ok_or_else(|| format!("MCP 服务器 `{server_id}` 未接入"))?;
+                .ok_or_else(|| format!("MCP server `{server_id}` is not connected"))?;
             if !server.enabled {
                 return Err(format!(
-                    "MCP 服务器 `{}` 已暂停，请先在「工具」页启用",
+                    "MCP server `{}` is paused; enable it on the Tools page first",
                     server.name
                 ));
             }
@@ -412,8 +412,8 @@ pub async fn invoke(
                 crate::script::run(&code, params_owned)
             });
             match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
-                Ok(res) => res.map_err(|e| format!("脚本任务失败: {e}"))?,
-                Err(_) => Err("脚本执行超时（30 秒）".into()),
+                Ok(res) => res.map_err(|e| format!("Script task failed: {e}"))?,
+                Err(_) => Err("Script execution timed out (30s)".into()),
             }
         }
         ToolKind::Interpreter { runtime, code } => {
@@ -426,8 +426,8 @@ pub async fn invoke(
                 crate::script_runtime::run(&ctx_cloned, &runtime, &code, &params_owned)
             });
             match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
-                Ok(res) => res.map_err(|e| format!("脚本任务失败: {e}"))?,
-                Err(_) => Err("脚本执行超时（30 秒）".into()),
+                Ok(res) => res.map_err(|e| format!("Script task failed: {e}"))?,
+                Err(_) => Err("Script execution timed out (30s)".into()),
             }
         }
     };
@@ -487,7 +487,7 @@ async fn builtin_invoke(
             let command = params
                 .get("command")
                 .and_then(|v| v.as_str())
-                .ok_or("缺少参数 command")?
+                .ok_or("Missing parameter: command")?
                 .to_string();
             let cwd = params.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
             let handle = tauri::async_runtime::spawn(async move {
@@ -515,10 +515,10 @@ async fn builtin_invoke(
                 cmd.output().await
             });
             let out = match tokio::time::timeout(std::time::Duration::from_secs(600), handle).await {
-                Ok(res) => res.map_err(|e| format!("命令任务失败: {e}"))?,
-                Err(_) => return Err("命令执行超时（600 秒）".into()),
+                Ok(res) => res.map_err(|e| format!("Command task failed: {e}"))?,
+                Err(_) => return Err("Command execution timed out (600s)".into()),
             };
-            let out = out.map_err(|e| format!("启动命令失败: {e}"))?;
+            let out = out.map_err(|e| format!("Failed to spawn command: {e}"))?;
             Ok(serde_json::json!({
                 "code": out.status.code(),
                 "stdout": safe_trunc(&String::from_utf8_lossy(&out.stdout), 60000),
@@ -527,21 +527,21 @@ async fn builtin_invoke(
         }
         // ── 2. 文档编辑（写 / 覆盖）──
         "write_file" => {
-            let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
             let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(parent) = std::path::Path::new(path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::write(path, content).map_err(|e| format!("写入失败: {e}"))?;
+            std::fs::write(path, content).map_err(|e| format!("Failed to write: {e}"))?;
             Ok(serde_json::json!({ "path": path, "bytes": content.len() }))
         }
         // ── 2.5 发送文件给用户 ──
         "send_file" => {
-            let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
             let p = std::path::Path::new(path);
-            let meta = std::fs::metadata(p).map_err(|_| format!("文件不存在: {path}"))?;
+            let meta = std::fs::metadata(p).map_err(|_| format!("File not found: {path}"))?;
             if meta.is_dir() {
-                return Err(format!("`{path}` 是文件夹，send_file 只能发送单个文件"));
+                return Err(format!("`{path}` is a directory; send_file only accepts a single file"));
             }
             let name = p
                 .file_name()
@@ -559,12 +559,12 @@ async fn builtin_invoke(
         }
         // ── 2.6 看图：读取本地图片，data_url 由 agent 循环注入下一轮请求（视觉模型） ──
         "view_image" => {
-            let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
             let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
             let p = std::path::Path::new(path);
-            let meta = std::fs::metadata(p).map_err(|_| format!("文件不存在: {path}"))?;
+            let meta = std::fs::metadata(p).map_err(|_| format!("File not found: {path}"))?;
             if meta.is_dir() {
-                return Err(format!("`{path}` 是文件夹，view_image 需要单个图片文件"));
+                return Err(format!("`{path}` is a directory; view_image requires a single image file"));
             }
             let ext = p
                 .extension()
@@ -577,12 +577,12 @@ async fn builtin_invoke(
                 "webp" => "image/webp",
                 "gif" => "image/gif",
                 "bmp" => "image/bmp",
-                other => return Err(format!("不支持的图片格式 `.{other}`，支持 png/jpg/jpeg/webp/gif/bmp")),
+                other => return Err(format!("Unsupported image format `.{other}`; supported: png/jpg/jpeg/webp/gif/bmp")),
             };
             if meta.len() > 20 * 1024 * 1024 {
-                return Err(format!("图片过大（{} MB），上限 20 MB", meta.len() / 1024 / 1024));
+                return Err(format!("Image too large ({} MB); limit is 20 MB", meta.len() / 1024 / 1024));
             }
-            let bytes = std::fs::read(p).map_err(|e| format!("读取失败: {e}"))?;
+            let bytes = std::fs::read(p).map_err(|e| format!("Failed to read: {e}"))?;
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             Ok(serde_json::json!({
@@ -597,7 +597,7 @@ async fn builtin_invoke(
         }
         // ── 3. 制定计划（目标 + 待办）──
         "plan" => {
-            let goal = params.get("goal").and_then(|v| v.as_str()).ok_or("缺少参数 goal")?;
+            let goal = params.get("goal").and_then(|v| v.as_str()).ok_or("Missing parameter: goal")?;
             let steps: Vec<String> = params
                 .get("steps")
                 .and_then(|v| v.as_array())
@@ -615,13 +615,13 @@ async fn builtin_invoke(
         // ── 4. edit：增量补丁 ──
         "edit" => {
             let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
-            let old = params.get("old_string").and_then(|v| v.as_str()).ok_or("缺少参数 old_string")?;
+            let old = params.get("old_string").and_then(|v| v.as_str()).ok_or("Missing parameter: old_string")?;
             let new = params.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
             let replace_all = params.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
             if old.is_empty() {
-                return Err("old_string 不能为空".into());
+                return Err("old_string cannot be empty".into());
             }
-            let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+            let text = std::fs::read_to_string(path).map_err(|e| format!("Failed to read: {e}"))?;
             // 精确匹配失败时自动适配换行风格（文件 CRLF / 模型给 LF，或反过来）
             let mut count = text.matches(old).count();
             let mut old_eff = old.to_string();
@@ -647,19 +647,19 @@ async fn builtin_invoke(
                 let mut hint = String::new();
                 if let Some(first) = old.lines().map(str::trim).find(|l| !l.is_empty()) {
                     if let Some(n) = text.lines().enumerate().find(|(_, l)| l.trim() == first).map(|(i, _)| i + 1) {
-                        hint = format!("；文件第 {n} 行附近有首行相同的内容，差异可能在空格/缩进或后续行");
+                        hint = format!("; a line matching the first line exists near line {n}; the difference may be in spaces/indentation or the following lines");
                     }
                 }
                 return Err(format!(
-                    "未找到 old_string，无法替换{hint}。请先 read_file 查看该文件的当前内容，确保 old_string 与文件逐字符一致（含空格与换行），再重试或改用更大的上下文片段",
+                    "old_string not found; nothing replaced{hint}. Read the file first to get its current content, make old_string match the file exactly (including spaces and newlines), then retry or use a larger context snippet",
                 ));
             }
             if count > 1 && !replace_all {
-                return Err(format!("old_string 匹配到 {count} 处，请提供更精确的上下文，或设 replace_all=true"));
+                return Err(format!("old_string matched {count} locations; provide more precise context or set replace_all=true"));
             }
             let updated =
                 if replace_all { text.replace(&old_eff, &new_eff) } else { text.replacen(&old_eff, &new_eff, 1) };
-            std::fs::write(path, &updated).map_err(|e| format!("写回失败: {e}"))?;
+            std::fs::write(path, &updated).map_err(|e| format!("Failed to write back: {e}"))?;
             Ok(serde_json::json!({ "path": path, "replaced": if replace_all { count } else { 1 } }))
         }
         // ── 5. 子智能体：开新会话独立完成任务 ──
@@ -676,11 +676,11 @@ async fn builtin_invoke(
             let depth = SUBAGENT_DEPTH.fetch_add(1, Ordering::SeqCst);
             let _guard = DecGuard;
             if depth >= 3 {
-                return Err("子智能体嵌套过深（最多 3 层），请在当前会话直接完成任务".into());
+                return Err("Sub-agent nesting too deep (max 3 levels); complete the task directly in this session".into());
             }
-            let task = params.get("task").and_then(|v| v.as_str()).ok_or("缺少参数 task")?.to_string();
+            let task = params.get("task").and_then(|v| v.as_str()).ok_or("Missing parameter: task")?.to_string();
             if task.trim().is_empty() {
-                return Err("task 不能为空".into());
+                return Err("task cannot be empty".into());
             }
             let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("子任务").to_string();
             // 新建独立会话（用户可在侧栏看到全过程）
@@ -717,7 +717,7 @@ async fn builtin_invoke(
                 tokio::select! {
                     _ = &mut sleep => {
                         break Err(format!(
-                            "子任务超时（15 分钟）。子会话 {sid} 已保留中途进展，可继续等待或查看该会话"
+                            "Subtask timed out (15 min). Sub-session {sid} keeps the intermediate progress; you may keep waiting or inspect that session"
                         ));
                     }
                     res = &mut run => {
@@ -743,19 +743,19 @@ async fn builtin_invoke(
                                     "final_answer": answer,
                                     "truncated": truncated,
                                     "note": if truncated {
-                                        "结论过长已截断，完整过程与结论见子会话（可对其派发追问）"
+                                        "Answer truncated for length; see the sub-session for the full process and answer (you may send follow-up questions to it)"
                                     } else {
-                                        "子会话已保留全部执行过程，可再次对其派发追问"
+                                        "The sub-session keeps the full execution log; you may send follow-up questions to it"
                                     }
                                 }))
                             }
-                            Err(e) => Err(format!("子任务失败: {e}（子会话 {sid} 已保留过程记录）")),
+                            Err(e) => Err(format!("Subtask failed: {e} (sub-session {sid} keeps the process log)")),
                         };
                     }
                     _ = &mut watch => {
                         // 同时清掉子会话自己的中断标记，避免下次对话误报「已中断」
                         crate::agent::clear_interrupt(ctx, &sid);
-                        break Err(format!("主会话已中断，子任务已停止（子会话 {sid} 已保留进展）"));
+                        break Err(format!("Parent session interrupted; subtask stopped (sub-session {sid} keeps the progress)"));
                     }
                 }
             };
@@ -772,11 +772,11 @@ async fn builtin_invoke(
             let runtime = params.get("runtime").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             if name.is_empty() || runtime.is_empty() || code.is_empty() {
-                return Err("add_tool 需要 name / runtime / code 参数".into());
+                return Err("add_tool requires name / runtime / code parameters".into());
             }
             match crate::runtime::get(ctx, &runtime) {
-                None => return Err(format!("解释器 `{runtime}` 未注册，请先在「工具」页刷新探测")),
-                Some(rt) if !rt.enabled => return Err(format!("解释器 `{runtime}` 已暂停，无法用于新工具")),
+                None => return Err(format!("Interpreter `{runtime}` is not registered; refresh the runtime detection on the Tools page first")),
+                Some(rt) if !rt.enabled => return Err(format!("Interpreter `{runtime}` is paused; cannot be used for a new tool")),
                 _ => {}
             }
             let tool = register_opts(
@@ -797,7 +797,7 @@ async fn builtin_invoke(
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or("delete_tool 需要 name 参数")?;
+                .ok_or("delete_tool requires the name parameter")?;
             let target = {
                 let tools = ctx.tools.lock().unwrap();
                 tools
@@ -805,21 +805,21 @@ async fn builtin_invoke(
                     .find(|t| t.name.eq_ignore_ascii_case(name))
                     .cloned()
             };
-            let tool = target.ok_or_else(|| format!("工具 `{name}` 不存在"))?;
+            let tool = target.ok_or_else(|| format!("Tool `{name}` does not exist"))?;
             // 仅允许删除 AI/用户自建的解释器与脚本工具；内置、远程、MCP 禁删
             if !matches!(tool.kind, ToolKind::Interpreter { .. } | ToolKind::Script { .. }) {
-                return Err(format!("工具 `{name}` 是系统/远程工具，不允许删除"));
+                return Err(format!("Tool `{name}` is a system/remote tool and cannot be deleted"));
             }
             remove(ctx, &tool.id)?;
             Ok(serde_json::json!({ "deleted": tool.name, "id": tool.id }))
         }
         // ── 5.6 截断历史：只保留最近 keep 条 ──
         "truncate_history" => {
-            let sid = session.ok_or("无法确定当前会话")?.to_string();
+            let sid = session.ok_or("Cannot determine the current session")?.to_string();
             let keep = params.get("keep").and_then(|v| v.as_u64()).unwrap_or(12).max(2) as usize;
             let (dropped, kept) = {
                 let mut store = ctx.sessions.lock().unwrap();
-                let sess = store.get_mut(&sid).ok_or("会话不存在")?;
+                let sess = store.get_mut(&sid).ok_or("Session not found")?;
                 let total = sess.messages.len();
                 if total > keep {
                     let cut = total - keep;
@@ -839,16 +839,16 @@ async fn builtin_invoke(
         }
         // ── 5.7 压缩对话：摘要替换历史，保留最近 2 条现场 ──
         "compact_history" => {
-            let sid = session.ok_or("无法确定当前会话")?.to_string();
+            let sid = session.ok_or("Cannot determine the current session")?.to_string();
             let summary = params
                 .get("summary")
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or("compact_history 需要 summary 参数（对既往对话的完整摘要）")?;
+                .ok_or("compact_history requires the summary parameter (a complete summary of the prior conversation)")?;
             let (dropped, kept) = {
                 let mut store = ctx.sessions.lock().unwrap();
-                let sess = store.get_mut(&sid).ok_or("会话不存在")?;
+                let sess = store.get_mut(&sid).ok_or("Session not found")?;
                 let total = sess.messages.len();
                 let keep_tail = 2.min(total);
                 // 尾部现场先摘出来，历史整体替换为一条摘要消息
@@ -857,7 +857,7 @@ async fn builtin_invoke(
                 kept_msgs.insert(
                     0,
                     crate::ai::ChatMessage::user(format!(
-                        "（此前对话已压缩为摘要，请基于摘要与后续对话继续）\n历史摘要：{summary}"
+                        "(Prior conversation has been compacted into a summary; continue based on the summary and the messages below.)\nHistory summary: {summary}"
                     )),
                 );
                 let dropped = total - keep_tail;
@@ -878,7 +878,7 @@ async fn builtin_invoke(
                     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or_default();
                     let summary = params.get("summary").and_then(|v| v.as_str()).unwrap_or_default();
                     if name.trim().is_empty() || summary.trim().is_empty() {
-                        return Err("skill(save) 需要 name 与 summary".into());
+                        return Err("skill(save) requires name and summary".into());
                     }
                     let s = crate::memory::add_skill(ctx, name, summary, actor);
                     Ok(serde_json::json!({ "saved": s.name, "id": s.id }))
@@ -899,9 +899,9 @@ async fn builtin_invoke(
                         .collect();
                     Ok(serde_json::json!({ "count": hits.len(), "skills": hits }))
                 }
-                other => Err(format!("skill 的 action 只能是 save / search，收到 `{other}`")),
+                other => Err(format!("skill action must be save or search, got `{other}`")),
             }
         }
-        other => Err(format!("未知内置处理器 `{other}`")),
+        other => Err(format!("Unknown builtin handler `{other}`")),
     }
 }

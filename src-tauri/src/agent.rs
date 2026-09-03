@@ -97,8 +97,8 @@ async fn request_approval(
             r = &mut rx => {
                 break match r {
                     Ok(true) => Ok(()),
-                    Ok(false) => Err(format!("用户拒绝执行工具 `{tool}`")),
-                    Err(_) => Err("审批通道已关闭，已自动拒绝".into()),
+                    Ok(false) => Err(format!("User rejected the tool call `{tool}`")),
+                    Err(_) => Err("Approval channel closed; auto-rejected".into()),
                 };
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
@@ -110,7 +110,7 @@ async fn request_approval(
                     break Err("对话已中断".into());
                 }
                 if std::time::Instant::now() >= deadline {
-                    break Err("审批超时（120 秒），已自动拒绝".into());
+                    break Err("Approval timed out (120s); auto-rejected".into());
                 }
             }
         }
@@ -181,7 +181,7 @@ pub async fn execute_tool_call(
                 params.get("code").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             );
             if pname.is_empty() || code.is_empty() {
-                return Err("write_plugin 需要 name 与 code 参数".into());
+                return Err("write_plugin requires name and code parameters".into());
             }
             // 注册前先试运行一次，确保脚本可用
             crate::script::run(&code, json!({})).map_err(|e| format!("插件代码校验失败: {e}"))?;
@@ -209,7 +209,7 @@ pub async fn execute_tool_call(
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let script_params = params.get("params").cloned().unwrap_or(json!({}));
             if runtime.is_empty() || code.is_empty() {
-                return Err("run_script 需要 runtime 与 code 参数".into());
+                return Err("run_script requires runtime and code parameters".into());
             }
             let ctx_cloned = ctx.clone();
             let handle = tauri::async_runtime::spawn_blocking(move || {
@@ -217,7 +217,7 @@ pub async fn execute_tool_call(
             });
             let out = match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
                 Ok(res) => res.map_err(|e| format!("脚本任务失败: {e}"))?,
-                Err(_) => Err("脚本执行超时（30 秒）".into()),
+                Err(_) => Err("Script execution timed out (30s)".into()),
             };
             crate::audit::record(ctx, "ai-self", "script.run", "run_script", json!({ "ok": out.is_ok() }), out.is_ok());
             out
@@ -231,11 +231,11 @@ pub async fn execute_tool_call(
                 params.get("code").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             );
             if tname.is_empty() || runtime.is_empty() || code.is_empty() {
-                return Err("write_tool 需要 name / runtime / code 参数".into());
+                return Err("write_tool requires name / runtime / code parameters".into());
             }
             match crate::runtime::get(ctx, &runtime) {
-                None => return Err(format!("解释器 `{runtime}` 未注册")),
-                Some(rt) if !rt.enabled => return Err(format!("解释器 `{runtime}` 已暂停，无法用于新工具")),
+                None => return Err(format!("Interpreter `{runtime}` is not registered")),
+                Some(rt) if !rt.enabled => return Err(format!("Interpreter `{runtime}` is paused; cannot be used for a new tool")),
                 _ => {}
             }
             let tool = crate::registry::register_opts(
@@ -254,7 +254,7 @@ pub async fn execute_tool_call(
             let content = params.get("content").and_then(|v| v.as_str()).unwrap_or_default();
             let kind = params.get("kind").and_then(|v| v.as_str()).unwrap_or("raw");
             if content.is_empty() {
-                return Err("add_memory 需要 content 参数".into());
+                return Err("add_memory requires the content parameter".into());
             }
             crate::memory::add_memory(ctx, content, kind, "ai");
             Ok(json!({ "saved": content }))
@@ -264,7 +264,7 @@ pub async fn execute_tool_call(
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or_default();
             let summary = params.get("summary").and_then(|v| v.as_str()).unwrap_or_default();
             if name.is_empty() || summary.is_empty() {
-                return Err("add_skill 需要 name 与 summary 参数".into());
+                return Err("add_skill requires name and summary parameters".into());
             }
             crate::memory::add_skill(ctx, name, summary, "ai");
             Ok(json!({ "skill": name }))
@@ -455,7 +455,7 @@ pub async fn chat_turn(
                 let target = target.clone();
                 async move {
                     if call.name.is_empty() {
-                        Err("缺少 tool 字段".to_string())
+                        Err("Missing tool field".to_string())
                     } else {
                         tokio::select! {
                             r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
@@ -521,7 +521,7 @@ pub async fn chat_turn(
                 });
             } else {
                 let feedback = format!(
-                    "工具调用结果（继续你的回复，如已完成请直接输出最终答案）：\n{}",
+                    "Tool result(s) - continue your reply; if everything is done, output the final answer directly:\n{}",
                     serde_json::to_string_pretty(&records.iter().map(|r| json!({
                         "tool": r.tool, "ok": r.ok, "result": r.result
                     })).collect::<Vec<_>>()).unwrap_or_default()
@@ -777,7 +777,7 @@ pub async fn chat_turn_stream(
                 let target = target.clone();
                 async move {
                     if call.name.is_empty() {
-                        Err("缺少 tool 字段".to_string())
+                        Err("Missing tool field".to_string())
                     } else {
                         tokio::select! {
                             r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
@@ -846,7 +846,7 @@ pub async fn chat_turn_stream(
                 });
             } else {
                 let feedback = format!(
-                    "工具调用结果（继续你的回复，如已完成请直接输出最终答案）：\n{}",
+                    "Tool result(s) - continue your reply; if everything is done, output the final answer directly:\n{}",
                     serde_json::to_string_pretty(&records.iter().map(|r| json!({
                         "tool": r.tool, "ok": r.ok, "result": r.result
                     })).collect::<Vec<_>>()).unwrap_or_default()

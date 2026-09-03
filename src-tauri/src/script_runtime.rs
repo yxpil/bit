@@ -16,10 +16,10 @@ pub fn run(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let rt = crate::runtime::get(ctx, runtime_id)
-        .ok_or_else(|| format!("运行时 `{runtime_id}` 未注册，请先在「工具」页刷新探测"))?;
+        .ok_or_else(|| format!("Runtime `{runtime_id}` is not registered; refresh the runtime detection on the Tools page first"))?;
 
     if !rt.enabled {
-        return Err(format!("解释器 `{}` 已暂停，请先在「工具」页启用", rt.name));
+        return Err(format!("Interpreter `{}` is paused; enable it on the Tools page first", rt.name));
     }
 
     match rt.mode.as_str() {
@@ -51,7 +51,7 @@ fn run_interpreted(
         _ => "js",
     };
     let tmp = std::env::temp_dir().join(format!("bit_{}.{ext}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, code).map_err(|e| format!("写入临时脚本失败: {e}"))?;
+    std::fs::write(&tmp, code).map_err(|e| format!("Failed to write temp script: {e}"))?;
 
     let mut cmd = Command::new(&rt.path);
     if rt.id == "deno" {
@@ -74,13 +74,13 @@ fn run_compiled(
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let work = std::env::temp_dir().join(format!("bit_build_{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&work).map_err(|e| format!("创建临时目录失败: {e}"))?;
+    std::fs::create_dir_all(&work).map_err(|e| format!("Failed to create temp dir: {e}"))?;
 
     let result = match rt.lang.as_str() {
         // Java：JDK 11+ 支持 `java Main.java` 单文件源码直跑（内部自动编译）
         "java" => {
             let src = work.join("Main.java");
-            std::fs::write(&src, code).map_err(|e| format!("写入源码失败: {e}"))?;
+            std::fs::write(&src, code).map_err(|e| format!("Failed to write source: {e}"))?;
             let mut cmd = Command::new(&rt.path); // java
             cmd.arg(&src);
             spawn_with_stdin(cmd, params)
@@ -89,7 +89,7 @@ fn run_compiled(
         "rs" => {
             let src = work.join("main.rs");
             let bin = work.join(if cfg!(windows) { "main.exe" } else { "main" });
-            std::fs::write(&src, code).map_err(|e| format!("写入源码失败: {e}"))?;
+            std::fs::write(&src, code).map_err(|e| format!("Failed to write source: {e}"))?;
             let mut compile = Command::new(&rt.path); // rustc
             compile.arg(&src).arg("-O").arg("-o").arg(&bin);
             crate::registry::no_window(&mut compile);
@@ -102,15 +102,15 @@ fn run_compiled(
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr);
                     let err = if err.len() > 4000 { err[..4000].to_string() } else { err.to_string() };
-                    Err(format!("Rust 编译失败:\n{err}"))
+                    Err(format!("Rust compilation failed:\n{err}"))
                 }
-                Err(e) => Err(format!("启动 rustc 失败: {e}")),
+                Err(e) => Err(format!("Failed to start rustc: {e}")),
             }
         }
         // Go：go run 直接编译并运行单文件
         "go" => {
             let src = work.join("main.go");
-            std::fs::write(&src, code).map_err(|e| format!("写入源码失败: {e}"))?;
+            std::fs::write(&src, code).map_err(|e| format!("Failed to write source: {e}"))?;
             let mut cmd = Command::new(&rt.path); // go
             cmd.arg("run").arg(&src);
             spawn_with_stdin(cmd, params)
@@ -120,7 +120,7 @@ fn run_compiled(
             let ext = if rt.lang == "c" { "c" } else { "cpp" };
             let src = work.join(format!("main.{ext}"));
             let bin = work.join(if cfg!(windows) { "main.exe" } else { "main" });
-            std::fs::write(&src, code).map_err(|e| format!("写入源码失败: {e}"))?;
+            std::fs::write(&src, code).map_err(|e| format!("Failed to write source: {e}"))?;
             let mut compile = Command::new(&rt.path); // gcc / g++
             compile
                 .arg(&src)
@@ -136,12 +136,12 @@ fn run_compiled(
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr);
-                    Err(format!("编译失败:\n{}", crate::registry::safe_trunc(&err, 4000)))
+                    Err(format!("Compilation failed:\n{}", crate::registry::safe_trunc(&err, 4000)))
                 }
-                Err(e) => Err(format!("启动编译器失败: {e}")),
+                Err(e) => Err(format!("Failed to start compiler: {e}")),
             }
         }
-        other => Err(format!("暂不支持的编译型语言: {other}")),
+        other => Err(format!("Compiled language not supported yet: {other}")),
     };
 
     let _ = std::fs::remove_dir_all(&work);
@@ -174,12 +174,12 @@ fn spawn_with_stdin(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("启动运行时失败: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start runtime: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         let payload = serde_json::to_vec(params).unwrap_or_default();
         let _ = stdin.write_all(&payload);
     }
-    child.wait_with_output().map_err(|e| format!("等待进程结束失败: {e}"))
+    child.wait_with_output().map_err(|e| format!("Failed to wait for process: {e}"))
 }
 
 /// 统一处理输出：非零退出返回错误，否则优先解析 stdout 为 JSON
@@ -191,7 +191,7 @@ fn finalize(out: Result<std::process::Output, String>) -> Result<serde_json::Val
     if !output.status.success() {
         let msg = if stderr.is_empty() { stdout } else { stderr };
         let msg = crate::registry::safe_trunc(&msg, 4000);
-        return Err(format!("执行失败（退出码 {:?}）: {msg}", output.status.code()));
+        return Err(format!("Execution failed (exit code {:?}): {msg}", output.status.code()));
     }
 
     let out = crate::registry::safe_trunc(&stdout, 8000);

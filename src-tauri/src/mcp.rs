@@ -327,7 +327,7 @@ pub async fn call_tool(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if is_error {
-        return Err(if text.is_empty() { "MCP 工具返回错误".to_string() } else { text });
+        return Err(if text.is_empty() { "MCP tool returned an error".to_string() } else { text });
     }
     if text.is_empty() {
         return Ok(result);

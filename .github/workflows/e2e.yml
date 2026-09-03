@@ -1,0 +1,54 @@
+name: e2e
+
+# TUI 终端模式 E2E：三平台矩阵验证（ubuntu 需要 xvfb 供桌面端并行用例）
+on:
+  push:
+    branches: [main]
+    paths: ["src-tauri/**", "e2e/**", ".github/workflows/e2e.yml"]
+  workflow_dispatch:
+
+jobs:
+  tui-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux deps (webkit/gtk + xvfb)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev xvfb
+
+      - name: Build BIT
+        working-directory: src-tauri
+        run: cargo build --release
+
+      - name: Start mock-ai (unix)
+        if: runner.os != 'Windows'
+        run: |
+          node e2e/mock-ai.cjs &
+          sleep 2
+
+      - name: Start mock-ai (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "node" -ArgumentList "e2e/mock-ai.cjs" -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+
+      - name: Run TUI E2E (unix)
+        if: runner.os != 'Linux'
+        run: node e2e/tui.cjs "src-tauri/target/release/bit${{ runner.os == 'Windows' && '.exe' || '' }}"
+
+      - name: Run TUI E2E (linux, xvfb for desktop-parallel case)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a node e2e/tui.cjs "src-tauri/target/release/bit"

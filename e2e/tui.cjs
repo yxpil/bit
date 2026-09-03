@@ -140,6 +140,104 @@ async function main() {
     record("T6 /install-cli 符号链接", ok, detail);
   }
 
+  // ── T8 非法命令与用法错误：各自得到提示，REPL 存活继续 ──
+  {
+    const tui = launchTui(DIR);
+    tui.send("/foobar");
+    tui.send("/use");
+    tui.send("/use deadbeef-0000");
+    tui.send("/mem");
+    tui.send("/install-cli-extra"); // 带参数的未知命令
+    tui.send("/QUIT");              // 大小写不敏感退出
+    const code = await tui.waitExit();
+    const out = tui.out;
+    const ok =
+      out.includes("未知命令 /foobar") &&
+      out.includes("用法：/use") &&
+      out.includes("会话不存在") &&
+      out.includes("用法：/mem") &&
+      out.includes("未知命令 /install-cli-extra") &&
+      code === 0;
+    record("T8 非法命令/用法错误", ok, `exit=${code}`);
+  }
+
+  // ── T9 空行与纯空白被忽略；T16 /q 变体退出 ──
+  {
+    const tui = launchTui(DIR);
+    tui.send("");
+    tui.send("   ");
+    tui.send("\t");
+    tui.send("/q");
+    const code = await tui.waitExit();
+    // 空白行不应产生"错误"输出
+    const ok = code === 0 && !tui.out.split("BIT TUI")[1]?.includes("错误");
+    record("T9 空白输入忽略 + /q 退出", ok, `exit=${code}`);
+  }
+
+  // ── T10 超长单行（200KB）+ T11 多字节/emoji 混合 ──
+  {
+    const tui = launchTui(DIR);
+    tui.send("LONG-" + "A".repeat(200 * 1024) + "-END");
+    tui.send("你好 🌍 こんにちは 🚀 Привет مرحба");
+    tui.send("/quit");
+    const code = await tui.waitExit(120000);
+    // 回复正常 + 200KB 消息完整落库（TUI 不回显输入，从会话存储验证）
+    let longOk = false;
+    try {
+      const sessions = JSON.parse(fs.readFileSync(path.join(DIR, "sessions.json"), "utf8"));
+      const msgs = (sessions.sessions || sessions).flatMap((s) => s.messages || []);
+      longOk = msgs.some((m) => typeof m.content === "string" && /^LONG-A+-END$/.test(m.content) && m.content.length === 5 + 200 * 1024 + 4);
+    } catch {}
+    const ok = code === 0 && tui.out.includes("好的。") && longOk;
+    record("T10/11 超长行+多字节", ok, `exit=${code}`);
+  }
+
+  // ── T12 损坏的 ai_config.json：启动不崩，提示未配置，命令可用 ──
+  {
+    const BAD = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-bad-"));
+    fs.writeFileSync(path.join(BAD, "ai_config.json"), "{corrupted json!!!");
+    const tui = launchTui(BAD);
+    tui.send("/tools");
+    tui.send("/quit");
+    const code = await tui.waitExit();
+    const out = tui.out;
+    const ok = code === 0 && out.includes("AI 尚未配置") && out.includes("shell") && out.includes("Execute a shell command");
+    record("T12 损坏 ai_config 容错 + 工具描述英文", ok, `exit=${code}`);
+  }
+
+  // ── T13 AI 不可达：报错有提示、不崩溃、REPL 继续可用 ──
+  {
+    const DEAD = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-dead-"));
+    fs.writeFileSync(
+      path.join(DEAD, "ai_config.json"),
+      JSON.stringify({ providers: [{ id: "dead", name: "dead", protocol: "openai", base_url: "http://127.0.0.1:9888/v1", api_key: "x", model: "x", active: true }] })
+    );
+    const tui = launchTui(DEAD);
+    tui.send("TUI-DEAD-ENDPOINT");
+    tui.send("/tools"); // 报错后 REPL 必须仍然可用
+    tui.send("/quit");
+    const code = await tui.waitExit(120000);
+    const out = tui.out;
+    const ok = code === 0 && out.includes("错误：") && out.includes("shell");
+    record("T13 AI 不可达报错恢复", ok, `exit=${code}`);
+  }
+
+  // ── T14 EOF（无 /quit）干净退出；T15 命令风暴按序处理 ──
+  {
+    const tui = launchTui(DIR);
+    for (let i = 0; i < 30; i++) tui.send(`/new storm-${i}`);
+    tui.close(); // 不发 /quit，直接 EOF
+    const code = await tui.waitExit(120000);
+    let ok = code === 0;
+    // 30 条 /new 全部生效（sessions.json 落盘）
+    try {
+      const sessions = JSON.parse(fs.readFileSync(path.join(DIR, "sessions.json"), "utf8"));
+      const storms = (sessions.sessions || sessions).filter?.((s) => (s.title || "").startsWith("storm-")) || [];
+      ok = ok && storms.length >= 30;
+    } catch (e) { ok = false; }
+    record("T14/15 EOF 退出 + 30 连发风暴", ok, `exit=${code}`);
+  }
+
   // ── T7 桌面端 + TUI 同数据目录并行：互不干扰 ──
   {
     // 桌面端配置：开启远程访问（8611），TUI 启动不应抢掉该端口也不应被单实例顶掉
