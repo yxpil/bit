@@ -53,8 +53,10 @@ modules:
     buildsystem: cmake-ninja
     config-opts:
       - -DENABLE_GTKDOC=OFF
-      - -DENABLE_GIR=OFF
-      - -DENABLE_VAPI=OFF
+      - -DBUILD_VAPI=OFF
+    build-commands:
+      # 直接删除会生成的gir模板里的非法doc:format标签，从源头规避vapigen报错
+      - sed -i '/<doc:format name="unknown"\/>/d' src/AyatanaIdo3.gir.in
     cleanup:
       - /include
       - /lib/pkgconfig
