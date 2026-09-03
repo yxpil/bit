@@ -31,13 +31,37 @@ jobs:
       - name: 拉取 Flathub 共享模块（manifest include 相对路径所需）
         run: git clone --depth 1 https://github.com/flathub/shared-modules.git packaging/flatpak/shared-modules
 
+      # 共享模块链的 cmake 模块（ayatana-ido / libayatana-indicator / libayatana-appindicator）
+      # 未设 CMAKE_INSTALL_LIBDIR，freedesktop 24.08 上默认装进 lib64，
+      # 导致 ayatana-indicator3-0.4.pc 不在 PKG_CONFIG_PATH → appindicator 配置失败。
+      - name: 补丁共享模块（强制 lib 目录）
+        run: |
+          python3 - <<'PY'
+          import json
+          p = "packaging/flatpak/shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json"
+          d = json.load(open(p))
+          def fix(m):
+              if isinstance(m, dict):
+                  if m.get("buildsystem") == "cmake-ninja":
+                      opts = m.setdefault("config-opts", [])
+                      if "-DCMAKE_INSTALL_LIBDIR=lib" not in opts:
+                          opts.append("-DCMAKE_INSTALL_LIBDIR=lib")
+                  for sub in m.get("modules", []):
+                      fix(sub)
+          fix(d)
+          json.dump(d, open(p, "w"), indent=2)
+          print("patched: CMAKE_INSTALL_LIBDIR=lib")
+          PY
+
       - name: 构建 Flatpak
         run: flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/space.osbt.bit.yml
 
       - name: 导出 bundle
-        run: flatpak build-bundle repo bit-0.4.9.flatpak space.osbt.bit
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          flatpak build-bundle repo "bit-$VERSION.flatpak" space.osbt.bit
 
       - uses: actions/upload-artifact@v4
         with:
           name: flatpak-bundle
-          path: bit-0.4.9.flatpak
+          path: bit-*.flatpak

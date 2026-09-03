@@ -50,6 +50,11 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/update/check", get(update_check))
         .route("/api/update/status", get(update_status))
         .route("/api/update/download", post(update_download_route))
+        // 调试接口（ADB 调试桥联动）：只读快照，供外部调试工具分析与控制 BIT
+        .route("/api/debug/state", get(debug_state))
+        .route("/api/debug/sessions", get(debug_sessions))
+        .route("/api/debug/sessions/{id}", get(debug_session_detail))
+        .route("/api/debug/mcp", get(debug_mcp))
         .route("/mcp", post(mcp_endpoint))
         // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
         .route("/v1/models", get(openai_models))
@@ -387,6 +392,141 @@ async fn list_audit(State(ctx): State<Arc<Ctx>>) -> Json<serde_json::Value> {
     Json(json!({ "entries": log }))
 }
 
+// ==================== 调试接口（ADB 调试桥联动）====================
+// 供 ADB（github.com/yxpil/ADB）等调试工具只读拉取 BIT 内部状态做分析。
+// 全部在 /api/* 双重认证之下：Client Key（Bearer / ?key=）+ X-Access-Password。
+
+/// Client Key / API Key 脱敏：前 6 位 + 长度，完整密钥不出机器
+fn key_hint(key: &str) -> String {
+    let n = key.chars().count();
+    if n <= 6 {
+        "***".into()
+    } else {
+        let head: String = key.chars().take(6).collect();
+        format!("{head}…({n})")
+    }
+}
+
+/// GET /api/debug/state：运行快照——激活 Provider（密钥脱敏）、工具注册表、
+/// MCP 服务器、会话/记忆/技能计数、远程访问配置。ADB「BIT」页的数据源。
+async fn debug_state(State(ctx): State<Arc<Ctx>>) -> Response {
+    let ai = ctx.ai_config.lock().unwrap().clone();
+    let tools = ctx.tools.lock().unwrap().clone();
+    let mcp = ctx.mcp.lock().unwrap().clone();
+    let sessions = ctx.sessions.lock().unwrap().clone();
+    let memories = ctx.memories.lock().unwrap().len();
+    let skills = ctx.skills.lock().unwrap().len();
+    let cfg = ctx.config.lock().unwrap().clone();
+    let active = ai.providers.iter().find(|p| p.active).map(|p| {
+        json!({
+            "name": p.name,
+            "protocol": p.protocol,
+            "model": p.model,
+            "base_url": p.base_url,
+            "api_key_hint": key_hint(&p.api_key),
+        })
+    });
+    let total_messages: usize = sessions.sessions.iter().map(|s| s.messages.len()).sum();
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "remote": { "port": cfg.port, "access_password_enabled": cfg.password_enabled },
+        "provider": active,
+        "reasoning_effort": ai.reasoning_effort,
+        "tools": {
+            "count": tools.len(),
+            "names": tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        },
+        "mcp": {
+            "count": mcp.len(),
+            "servers": mcp.iter().map(|s| json!({
+                "id": s.id, "name": s.name, "url": s.url,
+                "enabled": s.enabled, "protocol": s.protocol, "version": s.version,
+            })).collect::<Vec<_>>(),
+        },
+        "sessions": {
+            "count": sessions.sessions.len(),
+            "active": sessions.active,
+            "messages": total_messages,
+        },
+        "memories": memories,
+        "skills": skills,
+    }))
+    .into_response()
+}
+
+/// GET /api/debug/sessions：会话列表（不含消息体，含条数与摘要）
+async fn debug_sessions(State(ctx): State<Arc<Ctx>>) -> Response {
+    let store = ctx.sessions.lock().unwrap().clone();
+    let list: Vec<_> = store
+        .sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "title": s.title,
+                "created": s.created,
+                "updated": s.updated,
+                "messages": s.messages.len(),
+                "preview": s.preview(),
+            })
+        })
+        .collect();
+    Json(json!({ "active": store.active, "sessions": list })).into_response()
+}
+
+/// GET /api/debug/sessions/{id}：单个会话全部消息（含 tool_calls 明细）
+async fn debug_session_detail(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {
+    let store = ctx.sessions.lock().unwrap().clone();
+    match store.sessions.iter().find(|s| s.id == id) {
+        Some(s) => Json(json!({
+            "id": s.id,
+            "title": s.title,
+            "created": s.created,
+            "updated": s.updated,
+            "messages": s.messages,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "session not found" })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/debug/mcp：MCP 服务器连接状态 + 每台服务器导入的工具名
+async fn debug_mcp(State(ctx): State<Arc<Ctx>>) -> Response {
+    let mcp = ctx.mcp.lock().unwrap().clone();
+    let tools = ctx.tools.lock().unwrap().clone();
+    let servers: Vec<_> = mcp
+        .iter()
+        .map(|s| {
+            let imported: Vec<&String> = tools
+                .iter()
+                .filter_map(|t| match &t.kind {
+                    crate::registry::ToolKind::Mcp { server_id, tool }
+                        if server_id == &s.id =>
+                    {
+                        Some(tool)
+                    }
+                    _ => None,
+                })
+                .collect();
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "url": s.url,
+                "enabled": s.enabled,
+                "protocol": s.protocol,
+                "version": s.version,
+                "connected_at": s.connected_at,
+                "tools": imported,
+            })
+        })
+        .collect();
+    Json(json!({ "servers": servers })).into_response()
+}
+
 /// 远程对话：Agent 通过 HTTP 使用 BIT 的 AI 能力（含自写插件）
 async fn remote_chat(
     State(ctx): State<Arc<Ctx>>,
@@ -661,10 +801,53 @@ mod tests {
     // ---------- 安全：鉴权边界测试 ----------
 
     #[test]
+    fn test_key_hint_masks_secrets() {
+        // 调试接口只允许泄露前 6 位 + 长度，绝不出现完整密钥
+        assert_eq!(key_hint("bit_0123456789abcdef"), "bit_01…(20)");
+        assert_eq!(key_hint("short!"), "***");
+        assert_eq!(key_hint(""), "***");
+        // 非 ASCII 密钥不得 panic（char boundary 安全）
+        assert_eq!(key_hint("密钥测试一"), "***");
+    }
+
+    #[test]
     fn test_auth_health_bypass() {
         // /api/health 免鉴权：无任何凭据也放行
         let cfg = cfg_with_key("sk-bit-test", Some("12345678"));
         assert!(check_auth(&cfg, "/api/health", "", "", "").is_ok());
+    }
+
+    #[test]
+    fn test_auth_debug_endpoints_require_dual_auth() {
+        // 调试接口（ADB 联动）与其它 /api/* 同级保护：Client Key + 访问密码缺一不可
+        let cfg = cfg_with_key("sk-bit-test", Some("12345678"));
+        let paths = [
+            "/api/debug/state",
+            "/api/debug/sessions",
+            "/api/debug/sessions/s1",
+            "/api/debug/mcp",
+        ];
+        for path in paths {
+            assert!(
+                check_auth(&cfg, path, "sk-bit-test", "", "12345678").is_ok(),
+                "{path} 双凭据应放行"
+            );
+            // 缺 Client Key → 401
+            assert_eq!(
+                check_auth(&cfg, path, "", "", "12345678"),
+                Err(StatusCode::UNAUTHORIZED),
+                "{path} 缺 Client Key 应 401"
+            );
+            // 缺访问密码 → 401（调试端点不适用 /v1/ 豁免）
+            assert_eq!(
+                check_auth(&cfg, path, "sk-bit-test", "", ""),
+                Err(StatusCode::UNAUTHORIZED),
+                "{path} 缺访问密码应 401"
+            );
+        }
+        // ?key= 查询参数通道同样适用于调试端点
+        assert!(check_auth(&cfg, "/api/debug/state", "", "sk-bit-test", "12345678").is_ok());
+        assert!(check_auth(&cfg, "/api/debug/state", "", "", "12345678").is_err());
     }
 
     #[test]

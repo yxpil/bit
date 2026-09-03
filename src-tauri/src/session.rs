@@ -120,3 +120,89 @@ pub fn persist(ctx: &Arc<crate::state::Ctx>) {
         serde_json::to_string(&*store).unwrap_or_default(),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage { role: role.into(), content: content.into(), tool_calls: Vec::new() }
+    }
+
+    fn session_with(messages: Vec<ChatMessage>) -> Session {
+        let mut s = Session::new("测试");
+        s.messages = messages;
+        s
+    }
+
+    // ---------- preview()：debug_sessions 会话列表的摘要来源 ----------
+
+    #[test]
+    fn test_preview_takes_last_non_system_message() {
+        let s = session_with(vec![
+            msg("user", "第一问"),
+            msg("system", "系统提示不应出现在摘要"),
+            msg("assistant", "最后的回答"),
+        ]);
+        assert_eq!(s.preview(), "最后的回答");
+    }
+
+    #[test]
+    fn test_preview_truncates_at_40_chars() {
+        // 恰好 40 字不截断
+        let exactly = "好".repeat(40);
+        assert_eq!(session_with(vec![msg("user", &exactly)]).preview(), exactly);
+        // 41 字截到 40；多字节按 char 截断，绝不产生乱码/panic
+        let long = format!("{}x", "好".repeat(40));
+        assert_eq!(session_with(vec![msg("user", &long)]).preview(), exactly);
+    }
+
+    #[test]
+    fn test_preview_replaces_newlines_and_empty_cases() {
+        assert_eq!(session_with(vec![msg("user", "两行\n内容")]).preview(), "两行 内容");
+        // 空会话 → 空摘要
+        assert_eq!(session_with(vec![]).preview(), "");
+        // 只有 system 消息 → 空摘要（不得把系统提示泄露到列表）
+        assert_eq!(session_with(vec![msg("system", "secret-prompt")]).preview(), "");
+    }
+
+    // ---------- Session / SessionStore 边界 ----------
+
+    #[test]
+    fn test_new_session_empty_title_falls_back() {
+        assert_eq!(Session::new("").title, "新对话");
+        assert_eq!(Session::new("   ").title, "新对话");
+        assert_eq!(Session::new("  我的问题  ").title, "我的问题");
+        // uuid simple 格式（无连字符）且非空
+        assert_eq!(Session::new("t").id.len(), 32);
+    }
+
+    #[test]
+    fn test_store_normalized_creates_default_and_fixes_active() {
+        // 空存储 → 自动建默认会话
+        let n = SessionStore::default().normalized();
+        assert_eq!(n.sessions.len(), 1);
+        assert_eq!(n.active, n.sessions[0].id);
+        // active 指向不存在的会话 → 修正为第一个
+        let s = session_with(vec![]);
+        let store = SessionStore { sessions: vec![s.clone()], active: "missing-id".into() };
+        let store = store.normalized();
+        assert_eq!(store.active, s.id);
+    }
+
+    #[test]
+    fn test_get_or_create_mut_reuses_and_creates() {
+        let s = session_with(vec![]);
+        let mut store = SessionStore { sessions: vec![s.clone()], active: s.id.clone() };
+        // 已存在：复用不新建
+        let reused = store.get_or_create_mut(&s.id);
+        reused.messages.push(msg("user", "hello"));
+        assert_eq!(store.sessions.len(), 1);
+        // 不存在：用指定 id 新建（远程 API 指定会话 ID 的路径）
+        let created = store.get_or_create_mut("custom-session-id");
+        created.messages.push(msg("user", "remote"));
+        assert_eq!(store.sessions.len(), 2);
+        assert_eq!(store.sessions[1].id, "custom-session-id");
+        assert_eq!(store.get_mut("custom-session-id").unwrap().messages.len(), 1);
+    }
+}

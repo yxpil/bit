@@ -62,7 +62,9 @@ function findConflicts() {
 // out 持续累积 stdout；send(line) 写入一行；waitExit 等待进程退出（默认超时强杀）
 function launchTui(dir, extraEnv = {}) {
   const proc = spawn(BIN, ["tui"], {
-    env: { ...process.env, BIT_DATA_DIR: dir, ...extraEnv },
+    // NO_AT_BRIDGE：Linux 下跳过 AT-SPI 无障碍总线查找（CI 无 dbus 时该查找阻塞 ~25s，
+    // 会吞掉首个测试标记导致 T17/T19a 假失败；对 macOS/Windows 无影响）
+    env: { ...process.env, NO_AT_BRIDGE: "1", BIT_DATA_DIR: dir, ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let out = "";
