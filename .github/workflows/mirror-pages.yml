@@ -37,6 +37,8 @@ jobs:
           VERSION="${TAG#v}"
           mkdir -p "site/$VERSION"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "site/$VERSION"
+          # latest.json 提到站点根：客户端自动更新检测优先请求 /bit/latest.json
+          if [ -f "site/$VERSION/latest.json" ]; then cp "site/$VERSION/latest.json" site/latest.json; fi
           # 站点首页：版本内全部文件的直链清单
           {
             echo "<!doctype html><meta charset=utf-8><title>BIT $VERSION downloads</title>"
