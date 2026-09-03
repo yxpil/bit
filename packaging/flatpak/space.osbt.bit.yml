@@ -51,6 +51,8 @@ modules:
 
   - name: ayatana-ido
     buildsystem: cmake-ninja
+    disable-cmake-targets:
+      - libayatana-ido3-0.4.vapi
     config-opts:
       - -DENABLE_GTKDOC=OFF
       - -DBUILD_VAPI=OFF
