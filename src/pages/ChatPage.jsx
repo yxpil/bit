@@ -61,6 +61,7 @@ export default function ChatPage({ onStats, visible }) {
 
   // 等待发送队列：会话执行中提交的新消息先排队，任务结束后自动按顺序发送
   const [queues, setQueues] = useState({}); // {sid: [{bubble, composed, imgData}]}
+  const [dragIdx, setDragIdx] = useState(null); // 正在拖拽的队列项索引
   const [queuePaused, setQueuePaused] = useState({}); // 中断后暂停自动续发
   const pausedRef = useRef({});
   const queuesRef = useRef({}); // 队列同步 ref：pumpQueue 读取用，避免在 setState updater 里产生副作用
@@ -510,6 +511,46 @@ export default function ChatPage({ onStats, visible }) {
     setQueues(next);
   };
 
+  // ── 队列拖拽排序（自实现 mouse 拖拽，兼容 WKWebView）──
+  const queueBoxRef = useRef(null);
+  useEffect(() => {
+    if (dragIdx == null) return;
+    const move = (e) => {
+      if (!queueBoxRef.current) return;
+      const arr = queuesRef.current[activeRef.current] || [];
+      // 找到第一个「中点在鼠标右侧」的剩余 pill → 插到它前面；都没有则插到末尾
+      let k = arr.length - 1;
+      for (const p of queueBoxRef.current.querySelectorAll("[data-qidx]")) {
+        const i = Number(p.dataset.qidx);
+        if (i === dragIdx) continue;
+        const r = p.getBoundingClientRect();
+        if (e.clientX < r.left + r.width / 2) {
+          k = i > dragIdx ? i - 1 : i;
+          break;
+        }
+      }
+      // 以移除后的数组为基准：from 移除后插入到 k
+      if (k !== dragIdx) {
+        const item = arr[dragIdx];
+        if (!item) return;
+        const next = [...arr];
+        next.splice(dragIdx, 1);
+        next.splice(k, 0, item);
+        const qnext = { ...queuesRef.current, [activeRef.current]: next };
+        queuesRef.current = qnext;
+        setQueues(qnext);
+        setDragIdx(k);
+      }
+    };
+    const up = () => setDragIdx(null);
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+    return () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+    };
+  }, [dragIdx]);
+
   // 任务结束后按顺序续发；被中断的会话暂停续发，需手动「继续」。
   // 副作用（setTimeout 启动 runTask）在 updater 外执行，避免 StrictMode 下 updater 双调用导致重复发送
   const pumpQueue = (sid) => {
@@ -785,20 +826,34 @@ export default function ChatPage({ onStats, visible }) {
             </div>
           )}
 
-          {/* 等待发送队列 */}
+          {/* 等待发送队列（拖拽 pill 调整发送顺序） */}
           {queues[activeId]?.length > 0 && (
-            <div className="flex flex-wrap items-center gap-2 px-1">
+            <div ref={queueBoxRef} className="flex flex-wrap items-center gap-2 px-1">
               <span className="flex items-center gap-1 text-[11px] text-neutral-400">
                 <IconQueue size={13} />
                 {queues[activeId].length} {t("chat.queued")}
               </span>
               {queues[activeId].map((q, i) => (
                 <span
-                  key={i}
-                  className="flex max-w-[220px] items-center gap-1 rounded-full bg-neutral-900/5 px-2.5 py-1 text-[11px] dark:bg-white/10"
+                  key={`${i}-${(q.bubble || "").slice(0, 8)}`}
+                  data-qidx={i}
+                  onMouseDown={() => setDragIdx(i)}
+                  onDoubleClick={() => removeQueueItem(activeId, i)}
+                  className={`flex max-w-[220px] cursor-grab select-none items-center gap-1 rounded-full px-2.5 py-1 text-[11px] transition-colors active:cursor-grabbing ${
+                    dragIdx === i
+                      ? "bg-neutral-900/15 ring-1 ring-neutral-900/30 dark:bg-white/20 dark:ring-white/40"
+                      : "bg-neutral-900/5 hover:bg-neutral-900/10 dark:bg-white/10 dark:hover:bg-white/15"
+                  }`}
+                  title={t("chat.queueDragHint")}
                 >
+                  <span className="text-neutral-400">{i + 1}</span>
                   <span className="truncate">{(q.bubble || "").split("\n")[0]}</span>
-                  <button onClick={() => removeQueueItem(activeId, i)} title={t("common.remove")}>
+                  <button
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={() => removeQueueItem(activeId, i)}
+                    className="shrink-0 text-neutral-400 hover:text-red-500"
+                    title={t("common.remove")}
+                  >
                     <IconX size={10} />
                   </button>
                 </span>
