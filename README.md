@@ -39,6 +39,8 @@ BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、�
 | 飞腾 / 鲲鹏 / 麒麟 ARM | `*_arm64.deb` / `*_arm64.AppImage` / `*_arm64.rpm` | 与 Linux ARM64 通用 |
 | 兆芯 / 海光 | `*_amd64.deb` / `*_amd64.AppImage` / `*_x86_64.rpm` | 与 Linux x64 通用 |
 
+> 全部支持的芯片架构与操作系统明细（含飞腾 / 鲲鹏 / 麒麟 / UOS / ChromeOS 矩阵）见 [Wiki：芯片与操作系统支持](https://github.com/yxpil/bit/wiki/%E8%8A%AF%E7%89%87%E4%B8%8E%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E6%94%AF%E6%8C%81)。
+
 ### ChromeOS（Crostini）安装
 
 ChromeOS 内置 Linux 开发环境（Debian 12 容器），BIT 的 Linux 安装包可直接使用，无需专门版本：
