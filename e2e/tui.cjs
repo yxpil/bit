@@ -271,19 +271,20 @@ async function main() {
     let deskErr = "";
     desktop.stderr.on("data", (d) => (deskErr += d.toString()));
 
-    // 等桌面端 HTTP 服务就绪
+    // 等桌面端 HTTP 服务就绪（xvfb/无 GPU 环境 webkit 首次启动可达数十秒）
     let up = false;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 120; i++) {
       try { const r = await get(PORT, "/api/health"); if (r.code === 200) { up = true; break; } } catch {}
       await sleep(500);
     }
-    record("T7a 桌面端启动并监听", up && !desktop.killed, up ? `port=${PORT}` : deskErr.slice(-200));
+    record("T7a 桌面端启动并监听", up && !desktop.killed, up ? `port=${PORT}` : (deskErr.slice(-200) || "60s 内未监听"));
 
     if (up) {
       // TUI 与桌面端同时运行：对话仍可用（共用数据目录无冲突）
       const tui = launchTui(DIR);
       tui.send("TUI-PARALLEL-CHECK");
-      await sleep(3000); // 等对话轮完成
+      // 轮询等待回复（最多 30s）
+      for (let i = 0; i < 60 && !tui.out.includes("好的。"); i++) await sleep(500);
       tui.send("/quit");
       const code = await tui.waitExit(60000);
       const tuiOk = code === 0 && tui.out.includes("好的。");
