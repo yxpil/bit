@@ -1,7 +1,8 @@
 name: sync-gitee
 
 # 每次推送到 main / 打 tag 后，将全部分支与标签镜像同步到 Gitee（https://gitee.com/yxpil/bit）。
-# 凭据存于仓库 Secrets：GITEE_USER / GITEE_PASS（密码已 URL 编码）。
+# 凭据存于仓库 Secrets：GITEE_USER / GITEE_PASS（Gitee 账号密码原文）。
+# 用 Basic Auth 头传递凭据，避免密码特殊字符在 URL 中需要转义的问题。
 on:
   push:
     branches: [main]
@@ -20,5 +21,9 @@ jobs:
           fetch-depth: 0
       - name: 镜像推送到 Gitee
         run: |
-          git push --prune "https://${GITEE_USER}:${GITEE_PASS}@gitee.com/yxpil/bit.git" \
+          git -c "http.extraheader=Authorization: Basic $(printf '%s:%s' "$GITEE_USER" "$GITEE_PASS" | base64)" \
+            push --prune "https://gitee.com/yxpil/bit.git" \
             "refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"
+        env:
+          GITEE_USER: ${{ secrets.GITEE_USER }}
+          GITEE_PASS: ${{ secrets.GITEE_PASS }}
