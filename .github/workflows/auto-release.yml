@@ -107,7 +107,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
+          # --autostash：版本文件已在此前步骤改为未暂存状态，rebase 需先自动暂存
+          git pull --rebase --autostash origin main
           git add -A
           git commit -m "chore(release): $TAG"
           git tag "$TAG"
