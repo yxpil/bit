@@ -16,6 +16,7 @@ const record = (name, ok, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  ${detail}` : ""}`);
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const tail = (out) => out.slice(-400).replace(/\n+/g, " | ");
 
 function portOpen(port) {
   return new Promise((resolve) => {
@@ -67,11 +68,19 @@ function launchTui(dir, extraEnv = {}) {
   let out = "";
   proc.stdout.on("data", (d) => (out += d.toString()));
   proc.stderr.on("data", (d) => (out += d.toString()));
+  // 进程退出后再写 stdin 会触发 write EOF——吞掉避免测试脚本崩溃
+  proc.stdin.on("error", () => {});
+  proc.on("error", () => {});
   const send = (line) => proc.stdin.write(line + "\n");
   const close = () => proc.stdin.end();
+  // 超时不抛异常：SIGKILL 后返回 -1，由断言展示已收集的输出便于诊断
   const waitExit = (timeout = 60000) =>
-    new Promise((resolve, reject) => {
-      const t = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("TUI 超时未退出")); }, timeout);
+    new Promise((resolve) => {
+      const t = setTimeout(() => {
+        out += `\n[waitExit 超时 ${timeout}ms，SIGKILL]\n`;
+        try { proc.kill("SIGKILL"); } catch {}
+        resolve(-1);
+      }, timeout);
       proc.on("exit", (code) => { clearTimeout(t); resolve(code); });
     });
   return { proc, get out() { return out; }, send, close, waitExit };
@@ -100,7 +109,7 @@ async function main() {
     const code = await tui.waitExit();
     const out = tui.out;
     const ok = code === 0 && ["/sessions", "/new", "/use", "/tools", "/mem", "/install-cli"].every((c) => out.includes(c));
-    record("T1 /help 命令清单", ok, `exit=${code}`);
+    record("T1 /help 命令清单", ok, ok ? `exit=${code}` : tail(out));
   }
 
   // ── T2 对话 + T3 工具调用 + T4 会话 + T5 记忆（一个 REPL 会话内顺序执行） ──
@@ -124,20 +133,30 @@ async function main() {
     record("T5 记忆沉淀/查看", memOk, "");
   }
 
-  // ── T6 /install-cli：符号链接落到 BIT_CLI_DIR ──
+  // ── T6 /install-cli：macOS/Linux 符号链接 / Windows bit.cmd 启动器 ──
   {
     const CLI_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-cli-"));
     const tui = launchTui(DIR, { BIT_CLI_DIR: CLI_DIR });
     tui.send("/install-cli");
     tui.send("/quit");
     await tui.waitExit();
-    const link = path.join(CLI_DIR, "bit");
     let ok = false, detail = "";
-    try {
-      ok = fs.realpathSync(link) === fs.realpathSync(BIN);
-      detail = fs.readlinkSync(link);
-    } catch (e) { detail = e.message; }
-    record("T6 /install-cli 符号链接", ok, detail);
+    if (process.platform === "win32") {
+      // Windows 写 bit.cmd 启动脚本（内含 exe 路径与 tui 参数）
+      const launcher = path.join(CLI_DIR, "bit.cmd");
+      try {
+        const content = fs.readFileSync(launcher, "utf8");
+        ok = /tui/.test(content) && content.toLowerCase().includes("bit");
+        detail = content.trim().split(/\r?\n/).pop() || "";
+      } catch (e) { detail = e.message; }
+    } else {
+      const link = path.join(CLI_DIR, "bit");
+      try {
+        ok = fs.realpathSync(link) === fs.realpathSync(BIN);
+        detail = fs.readlinkSync(link);
+      } catch (e) { detail = e.message; }
+    }
+    record("T6 /install-cli 安装", ok, detail);
   }
 
   // ── T8 非法命令与用法错误：各自得到提示，REPL 存活继续 ──

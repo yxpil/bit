@@ -25,8 +25,8 @@ enum Flow {
 }
 
 /// 由 main.rs 在独立线程调用：stdin 读取放专用线程（不阻塞 tokio worker），
-/// 行通过 channel 交给异步循环处理（chat_turn 是 async）。
-pub fn run_blocking(ctx: Arc<Ctx>, app: tauri::AppHandle) -> i32 {
+/// 行通过 channel 交给异步循环处理（chat_turn 是 async）。不返回（进程内退出）。
+pub fn run_blocking(ctx: Arc<Ctx>, app: tauri::AppHandle) -> ! {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -71,8 +71,8 @@ pub fn run_blocking(ctx: Arc<Ctx>, app: tauri::AppHandle) -> i32 {
     });
 
     crate::audit::record(&ctx, "local-cli", "app.quit", "tui", serde_json::json!({}), true);
-    app.exit(0);
-    0
+    // CLI 直接退出：不依赖 tauri 事件循环收尾（Linux 无窗口场景 app.exit 不可靠）
+    std::process::exit(0)
 }
 
 async fn handle(ctx: &Arc<Ctx>, line: &str) -> Result<Flow, String> {

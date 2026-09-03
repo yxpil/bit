@@ -69,11 +69,8 @@ fn main() {
                 let tui_ctx = ctx.clone();
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    let code = tui::run_blocking(tui_ctx, handle.clone());
-                    if code != 0 {
-                        handle.exit(code);
-                    }
-                    // code == 0 时 run_blocking 内部已调用 app.exit(0)
+                    // 内部 std::process::exit，不会返回
+                    tui::run_blocking(tui_ctx, handle);
                 });
                 return Ok(());
             }
@@ -213,12 +210,19 @@ fn attach_console() {
     extern "system" {
         fn AttachConsole(dw_process_id: u32) -> i32;
         fn SetStdHandle(n_std_handle: u32, handle: isize) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> isize;
     }
     const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
     const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
     const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
     const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
     unsafe {
+        // stdout 已有有效句柄（父进程管道重定向，如 E2E / CI）→ 绝不能覆盖，
+        // 否则输出会改道 CONOUT$ 导致管道收不到任何内容
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if out != 0 && out != -1 {
+            return;
+        }
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             return;
         }
