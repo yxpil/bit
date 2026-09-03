@@ -1,10 +1,10 @@
 # BIT — Agent Tool Hub
 
-[![Release](https://img.shields.io/github/v/release/yxpil/bit?style=flat-square&label=%E7%89%88%E6%9C%AC)](https://github.com/yxpil/bit/releases/latest) [![下载](https://img.shields.io/github/downloads/yxpil/bit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD)](https://github.com/yxpil/bit/releases) [![License](https://img.shields.io/github/license/yxpil/bit?style=flat-square)](https://github.com/yxpil/bit/blob/main/LICENSE) [![CI](https://img.shields.io/github/actions/workflow/status/yxpil/bit/release.yml?style=flat-square&branch=main&label=CI)](https://github.com/yxpil/bit/actions) [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20%E9%BE%99%E8%8A%AF%20%C2%B7%20RISC--V-black?style=flat-square)](https://osbt.space) [![官网](https://img.shields.io/website?up_message=osbt.space&down_message=%E7%A6%BB%E7%BA%BF&style=flat-square&url=https%3A%2F%2Fosbt.space)](https://osbt.space)
+[![Release](https://img.shields.io/github/v/release/yxpil/bit?style=flat-square&label=%E7%89%88%E6%9C%AC)](https://github.com/yxpil/bit/releases/latest) [![下载](https://img.shields.io/github/downloads/yxpil/bit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD)](https://github.com/yxpil/bit/releases) [![License](https://img.shields.io/github/license/yxpil/bit?style=flat-square)](https://github.com/yxpil/bit/blob/main/LICENSE) [![CI](https://img.shields.io/github/actions/workflow/status/yxpil/bit/release.yml?style=flat-square&branch=main&label=CI)](https://github.com/yxpil/bit/actions) [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20%E9%BE%99%E8%8A%AF%20%C2%B7%20RISC--V-black?style=flat-square)](https://osbt.space) [![官网](https://img.shields.io/website?up_message=osbt.space&down_message=%E7%A6%BB%E7%BA%BF&style=flat-square&url=https%3A%2F%2Fosbt.space)](https://osbt.space) [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-%E7%82%B9%E5%87%BB%E5%8A%A0%E5%85%A5-black?style=flat-square)](https://qm.qq.com/q/qlFr8ct0ps)
 
 BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、可远程访问的 AI Agent 工具中枢。你可以配置任意 AI 提供方，与模型进行流式对话，并让 AI 调用本机工具、自写脚本、沉淀记忆与技能。
 
-> 无边框自定义标题栏 · 深/浅色主题 · 黑白线性设计
+> 无边框自定义标题栏 · 深/浅色主题 · 黑白线性设计 · [QQ 交流群](https://qm.qq.com/q/qlFr8ct0ps)
 
 ## 功能特性
 

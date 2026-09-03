@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { api } from "./api.js";
 import { useTheme } from "./useTheme.js";
@@ -245,6 +246,20 @@ export default function App() {
             <p className="mt-3 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
               {t("app.aboutDesc")}
             </p>
+            <div className="mt-3 flex items-center justify-center gap-2">
+              <button
+                onClick={() => invoke("open_external", { url: "https://qm.qq.com/q/qlFr8ct0ps" })}
+                className="pill pill-outline pill-hover px-3 py-1 text-xs"
+              >
+                {t("app.qqGroup")}
+              </button>
+              <button
+                onClick={() => invoke("open_external", { url: "https://github.com/yxpil/bit" })}
+                className="pill pill-outline pill-hover px-3 py-1 text-xs"
+              >
+                GitHub
+              </button>
+            </div>
             <button
               onClick={() => setShowAbout(false)}
               className="pill pill-hover mx-auto mt-4"
