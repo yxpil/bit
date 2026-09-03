@@ -29,6 +29,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   # 确保目标 tag 的 Release 已存在（gh release upload 不支持自动创建）
@@ -288,3 +289,33 @@ jobs:
             packaging/exotic/out/bit_*.deb \
             packaging/exotic/out/bit_*.tar.gz \
             --clobber --repo "$GITHUB_REPOSITORY"
+
+  # 收尾：核心平台构建完成后，自动生成 latest.json 上传到 Release，
+  # 并触发 mirror-pages 刷新 GitHub Pages 镜像（更新检测三级回退的第一级）。
+  # exotic（QEMU 模拟编译）耗时不稳定，失败不阻塞发布。
+  finalize:
+    needs: [ensure-release, linux, linux-arm, windows, windows-arm, macos]
+    if: >-
+      always() && !cancelled() &&
+      needs.ensure-release.result == 'success' &&
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped') &&
+      (needs.linux-arm.result == 'success' || needs.linux-arm.result == 'skipped') &&
+      (needs.windows.result == 'success' || needs.windows.result == 'skipped') &&
+      (needs.windows-arm.result == 'success' || needs.windows-arm.result == 'skipped') &&
+      (needs.macos.result == 'success' || needs.macos.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 生成 latest.json + 触发 Pages 镜像
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.ensure-release.outputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          # notes 取 Release 说明前 300 字符，与客户端 GitHub API 回退路径的截断一致
+          NOTES=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body | head -c 300)
+          jq -n --arg v "$VERSION" --arg n "$NOTES" --arg u "https://yxpil.github.io/bit/$VERSION/" \
+            '{version: $v, notes: $n, url: $u}' > latest.json
+          cat latest.json
+          gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+          gh workflow run mirror-pages.yml -f tag="$TAG" --repo "$GITHUB_REPOSITORY"
+          echo "latest.json 已上传，Pages 镜像已触发（tag=$TAG）"

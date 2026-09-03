@@ -1,0 +1,129 @@
+name: auto-release
+
+# 一键发布：自动升版本号 → 提交 + 打 tag → 触发 release 全平台构建 → 同步 Gitee。
+# 用法：Actions → auto-release → Run workflow → 选 bump 类型（或填显式版本号）。
+# release.yml 构建完成后其 finalize 任务会自动上传 latest.json 并刷新 GitHub Pages 镜像。
+# 说明：GITHUB_TOKEN 的 push 不会触发其他 workflow（GitHub 防递归限制），
+#       所以本流程在推完 main + tag 后用 API 显式 dispatch release / e2e / sync-gitee。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "版本号升级类型（显式指定 version 时忽略此项）"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+      version:
+        description: "显式版本号（如 0.5.0，留空则按 bump 自动升级）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  bump-and-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - id: ver
+        name: 计算新版本号
+        run: |
+          CUR=$(node -p "require('./package.json').version")
+          EXPLICIT="${{ inputs.version }}"
+          if [ -n "$EXPLICIT" ]; then
+            NEW="$EXPLICIT"
+          else
+            NEW=$(node -e '
+              const b = process.argv[1];
+              let [x, y, z] = process.argv[2].split(".").map(Number);
+              if (b === "major") { x++; y = 0; z = 0; }
+              else if (b === "minor") { y++; z = 0; }
+              else { z++; }
+              console.log([x, y, z].join("."));
+            ' "${{ inputs.bump }}" "$CUR")
+          fi
+          echo "$NEW" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "非法版本号: $NEW"; exit 1; }
+          node -e '
+            const cmp = (a, b) => {
+              const p = s => s.split(".").map(Number);
+              const [x, y, z] = p(a), [i, j, k] = p(b);
+              return x !== i ? x - i : y !== j ? y - j : z - k;
+            };
+            process.exit(cmp(process.argv[1], process.argv[2]) > 0 ? 0 : 1);
+          ' "$NEW" "$CUR" || { echo "新版本 $NEW 必须大于当前 $CUR"; exit 1; }
+          if git ls-remote --exit-code --tags origin "v$NEW" >/dev/null 2>&1; then
+            echo "tag v$NEW 已存在，请换用其他版本号"; exit 1
+          fi
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+          echo "版本：$CUR → $NEW"
+
+      - name: 更新版本号（package.json / tauri.conf.json / Cargo.toml / Cargo.lock）
+        env:
+          NEW: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 - "$NEW" <<'EOF'
+          import json, re, sys
+          new = sys.argv[1]
+          # JSON 配置：package.json / tauri.conf.json
+          for f in ["package.json", "src-tauri/tauri.conf.json"]:
+              with open(f) as fp:
+                  j = json.load(fp)
+              j["version"] = new
+              with open(f, "w") as fp:
+                  json.dump(j, fp, indent=2, ensure_ascii=False)
+                  fp.write("\n")
+          # Cargo.toml：[package] 段第一处 version = "..."
+          s = open("src-tauri/Cargo.toml").read()
+          s2 = re.sub(r'^version = "[\d.]+"', f'version = "{new}"', s, count=1, flags=re.M)
+          assert s2 != s, "Cargo.toml 未匹配到 version"
+          open("src-tauri/Cargo.toml", "w").write(s2)
+          # Cargo.lock：bit 包自身的版本条目
+          s = open("src-tauri/Cargo.lock").read()
+          s2 = re.sub(r'(\[\[package\]\]\nname = "bit"\nversion = )"[\d.]+"', r'\1"' + new + '"', s)
+          assert s2 != s, "Cargo.lock 中未找到 bit 包版本"
+          open("src-tauri/Cargo.lock", "w").write(s2)
+          EOF
+          git diff --stat
+
+      - name: 提交并打 tag
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          git add -A
+          git commit -m "chore(release): $TAG"
+          git tag "$TAG"
+          git push origin main
+          git push origin "$TAG"
+
+      - name: 触发 release 构建 + E2E + Gitee 同步
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh workflow run release.yml -f tag="$TAG" --repo "$GITHUB_REPOSITORY"
+          gh workflow run e2e.yml --repo "$GITHUB_REPOSITORY"
+          gh workflow run sync-gitee.yml --repo "$GITHUB_REPOSITORY"
+          echo "### 发布 $TAG 已启动" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release：全平台构建安装包并上传 Release" >> "$GITHUB_STEP_SUMMARY"
+          echo "- e2e：三平台 TUI 测试" >> "$GITHUB_STEP_SUMMARY"
+          echo "- sync-gitee：镜像同步到 Gitee" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 构建完成后 finalize 自动上传 latest.json 并刷新 Pages 镜像" >> "$GITHUB_STEP_SUMMARY"
