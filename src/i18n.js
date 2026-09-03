@@ -275,6 +275,10 @@ const dict = {
     "remote.mcpNote":
       "MCP 端点：BIT 同时也是一个 MCP 服务器（Streamable HTTP），Claude Desktop 等 MCP 客户端用 POST http://主机:端口/mcp 认证（Bearer Client Key 或 ?key=）即可直接调用 BIT 的全部启用工具；工具页的「扫描」也能发现局域网内其它 MCP 服务器。",
     "remote.agentTitle": "Agent 接入示例（双重认证）",
+    "remote.cliTitle": "终端命令（bit）",
+    "remote.cliDesc":
+      "把 bit 命令安装到终端 PATH，即可在任意终端运行 bit tui 进入简约终端模式（对话、工具、会话、记忆全部可用），可与桌面端同时运行。",
+    "remote.cliInstall": "安装 bit 命令",
     "remote.curlListModels": "查看可用模型",
     "remote.curlChat": "对话（加 \"stream\": true 即为流式 SSE）",
     "remote.curlChatContent": "你好",
@@ -577,6 +581,10 @@ const dict = {
     "remote.mcpNote":
       "MCP endpoint: BIT is also an MCP server (Streamable HTTP). MCP clients such as Claude Desktop can call every enabled BIT tool via POST http://host:port/mcp (Bearer Client Key or ?key=). The \"Scan\" on the Tools page can also discover other MCP servers.",
     "remote.agentTitle": "Agent integration example (two-factor auth)",
+    "remote.cliTitle": "Terminal command (bit)",
+    "remote.cliDesc":
+      "Install the bit command into your terminal PATH, then run bit tui for a minimal terminal mode (chat, tools, sessions and memories all work) — it can run alongside the desktop app.",
+    "remote.cliInstall": "Install bit command",
     "remote.curlListModels": "List available models",
     "remote.curlChat": "Chat (add \"stream\": true for streaming SSE)",
     "remote.curlChatContent": "hello",

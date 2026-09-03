@@ -18,6 +18,7 @@ export const api = {
   runScript: (runtime, code, params) => invoke("run_script", { runtime, code, params }),
   listAudit: () => invoke("list_audit"),
   getRemoteConfig: () => invoke("get_remote_config"),
+  installCli: () => invoke("install_cli"),
   saveRemoteConfig: (remote_enabled, host, port) =>
     invoke("save_remote_config", { remote_enabled, host, port }),
   regenerateClientKey: () => invoke("regenerate_client_key"),

@@ -18,6 +18,20 @@ export default function RemotePage({ onStats }) {
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
   const [pwdMsg, setPwdMsg] = useState("");
+  const [cli, setCli] = useState(null); // {path, hint} | {error}
+  const [cliBusy, setCliBusy] = useState(false);
+
+  const installCli = async () => {
+    setCliBusy(true);
+    setCli(null);
+    try {
+      setCli(await api.installCli());
+    } catch (e) {
+      setCli({ error: String(e) });
+    } finally {
+      setCliBusy(false);
+    }
+  };
 
   useEffect(() => {
     api.getRemoteConfig().then((c) => {
@@ -323,6 +337,24 @@ curl -X POST http://${cfg.host}:${cfg.port}/api/chat \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "X-Access-Password: ${pwd}" \\
   -d '{"message":"${t("remote.curlAIChatContent")}"}'`}</pre>
+      </div>
+
+      {/* 终端命令：安装 bit 命令到 PATH，bit tui 进入简约终端模式 */}
+      <div className="card">
+        <p className="mb-3 font-medium">{t("remote.cliTitle")}</p>
+        <p className="mb-3 text-xs text-neutral-500">{t("remote.cliDesc")}</p>
+        <div className="flex items-center gap-3">
+          <button onClick={installCli} disabled={cliBusy} className="pill pill-hover shrink-0">
+            {cliBusy ? "..." : t("remote.cliInstall")}
+          </button>
+          {cli && !cli.error && (
+            <code className="truncate font-mono text-xs text-neutral-500">{cli.path}</code>
+          )}
+          {cli?.error && <span className="text-xs text-red-500">{cli.error}</span>}
+        </div>
+        {cli && !cli.error && cli.hint && (
+          <p className="mt-2 text-xs text-neutral-500">{cli.hint}</p>
+        )}
       </div>
     </div>
   );

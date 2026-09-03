@@ -19,30 +19,64 @@ mod script_runtime;
 mod session;
 mod state;
 mod tray;
+mod tui;
 
 use tauri::Manager;
 
 fn main() {
+    // 终端模式：`bit tui` 进入简约 TUI（无窗口 / 无单实例 / 不监听端口，
+    // 可与桌面端同时运行，共用数据目录）。generate_context! 只能展开一次，
+    // 所以 TUI 与桌面端共用同一个 Builder，仅按模式注册不同的插件与启动逻辑。
+    let tui_mode = std::env::args().any(|a| a == "tui");
+    if tui_mode {
+        #[cfg(windows)]
+        attach_console();
+    }
+
     // WebView2 默认遵循系统代理，而安装版前端经 http://tauri.localhost 加载；
     // 系统代理（如 Clash）未排除该主机时会白屏。前端资源全部本地内嵌，禁用代理无副作用。
     // 追加而非覆盖，保留外部传入的调试参数（如 --remote-debugging-port）。
-    let mut webview_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
-    if !webview_args.is_empty() && !webview_args.contains("no-proxy-server") {
-        webview_args.push(' ');
+    if !tui_mode {
+        let mut webview_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        if !webview_args.is_empty() && !webview_args.contains("no-proxy-server") {
+            webview_args.push(' ');
+        }
+        webview_args.push_str("--no-proxy-server");
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
     }
-    webview_args.push_str("--no-proxy-server");
-    std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
 
-    tauri::Builder::default()
-        // 单实例保护：必须最先注册；二次启动时唤起已有实例的主窗口后退出新进程
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            tray::show_main_window(app);
-        }))
-        .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
+    let mut builder = tauri::Builder::default();
+    if !tui_mode {
+        // 单实例保护：仅桌面端注册（TUI 需要能与桌面端同时运行）；
+        // 二次启动时唤起已有实例的主窗口后退出新进程
+        builder = builder
+            .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                tray::show_main_window(app);
+            }))
+            .plugin(tauri_plugin_notification::init());
+    }
+    builder
+        .setup(move |app| {
             let ctx = state::Ctx::load(app.handle().clone());
-            audit::record(&ctx, "local-app", "app.start", "BIT", serde_json::json!({}), true);
+            let (actor, target) = if tui_mode { ("local-cli", "tui") } else { ("local-app", "BIT") };
+            audit::record(&ctx, actor, "app.start", target, serde_json::json!({}), true);
             app.manage(ctx.clone());
+
+            if tui_mode {
+                // TUI：无窗口、无托盘、无 HTTP 服务、无 Autopilot（与桌面端零冲突）。
+                // 解释器探测同步执行：CLI 场景不赶时间，脚本类工具需要完整列表。
+                let _ = ctx.refresh_runtimes();
+                let tui_ctx = ctx.clone();
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let code = tui::run_blocking(tui_ctx, handle.clone());
+                    if code != 0 {
+                        handle.exit(code);
+                    }
+                    // code == 0 时 run_blocking 内部已调用 app.exit(0)
+                });
+                return Ok(());
+            }
 
             // 解释器探测移到后台：不阻塞窗口显示（修复启动慢/白屏）
             let rt_ctx = ctx.clone();
@@ -84,6 +118,7 @@ fn main() {
             commands::is_headless,
             commands::check_updates,
             commands::open_external,
+            commands::install_cli,
             commands::mem_usage,
             commands::get_overview,
             commands::list_tools,
@@ -169,4 +204,31 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);
         });
+}
+
+/// Windows release 版是 GUI 子系统（无控制台），`bit tui` 从终端启动时
+/// 需先挂接父进程控制台并重新打开标准流，否则输出会静默丢失。
+#[cfg(windows)]
+fn attach_console() {
+    extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn SetStdHandle(n_std_handle: u32, handle: isize) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        use std::os::windows::io::AsRawHandle;
+        if let Ok(f) = std::fs::OpenOptions::new().read(true).open("CONIN$") {
+            SetStdHandle(STD_INPUT_HANDLE, f.as_raw_handle() as _);
+        }
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+            SetStdHandle(STD_OUTPUT_HANDLE, f.as_raw_handle() as _);
+            SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle() as _);
+        }
+    }
 }
