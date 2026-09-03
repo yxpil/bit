@@ -1,0 +1,24 @@
+name: sync-gitee
+
+# 每次推送到 main / 打 tag 后，将全部分支与标签镜像同步到 Gitee（https://gitee.com/yxpil/bit）。
+# 凭据存于仓库 Secrets：GITEE_USER / GITEE_PASS（密码已 URL 编码）。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 镜像推送到 Gitee
+        run: |
+          git push --prune "https://${GITEE_USER}:${GITEE_PASS}@gitee.com/yxpil/bit.git" \
+            "refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"
