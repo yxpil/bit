@@ -257,6 +257,35 @@ async function main() {
     record("T14/15 EOF 退出 + 30 连发风暴", ok, `exit=${code}`);
   }
 
+  // ── T17 模糊格式识别：变体 AI 响应格式动态识别（content 数组/legacy text/output_text/MAX_TOKENS/垃圾体）──
+  {
+    const tui = launchTui(DIR);
+    // 三种变体格式：严格路径解析不到 → 模糊识别应成功取到正文
+    for (const [marker, expect] of [
+      ["E2E-FMT-ARRAY", "E2E-FMT-ARRAY-OK"],
+      ["E2E-FMT-LEGACY", "E2E-FMT-LEGACY-OK"],
+      ["E2E-FMT-OUTTEXT", "E2E-FMT-OUTTEXT-OK"],
+    ]) {
+      tui.send(marker);
+      for (let i = 0; i < 60 && !tui.out.includes(expect); i++) await sleep(500);
+      const ok = tui.out.includes(expect);
+      record(`T17 变体格式 ${marker}`, ok, ok ? "" : tail(tui.out));
+    }
+    // finish_reason 大写变体 MAX_TOKENS：应被归一化识别并显式标注截断
+    tui.send("E2E-FMT-MAXTOK");
+    for (let i = 0; i < 60 && !tui.out.includes("E2E-FMT-MAXTOK-OK"); i++) await sleep(500);
+    const maxOk = tui.out.includes("E2E-FMT-MAXTOK-OK") && tui.out.includes("截断");
+    record("T17 MAX_TOKENS 截断归一化", maxOk, maxOk ? "" : tail(tui.out));
+    // 完全不可解析的响应体：报错有提示、REPL 存活、可继续退出
+    tui.send("E2E-FMT-GARBAGE");
+    for (let i = 0; i < 60 && !tui.out.includes("错误："); i++) await sleep(500);
+    tui.send("/tools");
+    tui.send("/quit");
+    const code = await tui.waitExit(60000);
+    const garbOk = code === 0 && tui.out.includes("错误：") && tui.out.includes("Execute a shell command");
+    record("T17 垃圾响应容错", garbOk, `exit=${code}`);
+  }
+
   // ── T7 桌面端 + TUI 同数据目录并行：互不干扰 ──
   {
     // 桌面端配置：开启远程访问（8611），TUI 启动不应抢掉该端口也不应被单实例顶掉

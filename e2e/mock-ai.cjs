@@ -273,6 +273,75 @@ const server = http.createServer((req, res) => {
       }));
     }
 
+    // ── 模糊格式识别：不严格遵循 OpenAI 协议的变体响应（BIT 应动态识别而非报错） ──
+
+    // content 为内容块数组（网关转换常见）：流式 delta.content 同样给数组
+    if (last.includes("E2E-FMT-ARRAY")) {
+      const blocks = [{ type: "text", text: "E2E-FMT-ARRAY" }, { type: "text", text: "-OK" }];
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: blocks } }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: blocks } }], usage: usageFor(messages) }));
+    }
+
+    // 旧版 completions：choices[0].text（无 message）
+    if (last.includes("E2E-FMT-LEGACY")) {
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "text_completion.chunk", choices: [{ index: 0, text: "E2E-FMT-LEGACY-OK" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ id: "mock", object: "text_completion", choices: [{ index: 0, text: "E2E-FMT-LEGACY-OK" }], usage: usageFor(messages) }));
+    }
+
+    // Responses API 风格：顶层 output_text
+    if (last.includes("E2E-FMT-OUTTEXT")) {
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "mock", type: "response.output_text.delta", output_text: "E2E-FMT-OUTTEXT-OK" })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ id: "mock", object: "response", output_text: "E2E-FMT-OUTTEXT-OK", usage: usageFor(messages) }));
+    }
+
+    // finish_reason 大写变体 MAX_TOKENS：应被归一化识别并显式标注截断
+    if (last.includes("E2E-FMT-MAXTOK")) {
+      const content = "E2E-FMT-MAXTOK-OK 回答到这里被截断";
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "MAX_TOKENS" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        id: "mock", object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "MAX_TOKENS" }],
+        usage: usageFor(messages),
+      }));
+    }
+
+    // 完全不可解析的响应体：BIT 必须报错而不是崩溃或吞掉
+    if (last.includes("E2E-FMT-GARBAGE")) {
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write("data: not-json-garbage{{{\n\n");
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end("not-json-garbage{{{");
+    }
+
     if (last.includes("E2E-CMD-SHELL"))
       return respond(res, '好的，我来执行命令。\n[{"tool":"shell","params":{"command":"echo e2e-shell-ok"}}]', sse);
 

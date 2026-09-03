@@ -423,10 +423,16 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
                     finish = f.to_string();
                 }
             }
-            if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(|x| x.as_str()) {
-                full.push_str(delta);
+            if let Some(delta) = v
+                .pointer("/choices/0/delta/content")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+                // 模糊回退：delta 缺失改用 message / 旧版 text / output_text 等变体（网关转换常见）
+                .or_else(|| fuzzy_text(&v))
+            {
+                full.push_str(&delta);
                 // 回调返回 false = 调用方中止（中断会话）：停止读取 SSE
-                if !on_token(delta) {
+                if !on_token(&delta) {
                     stopped = true;
                     return true;
                 }
@@ -446,7 +452,7 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
         return Err("连接中断：流式响应未正常结束（网络波动或代理断开），请重试".into());
     }
     // 达到输出上限：在正文尾部显式标注，避免“话说一半”看起来像 bug
-    let full = if finish == "length" {
+    let full = if finish_truncated(&finish) {
         format!("{full}\n\n（回复因达到最大输出长度被截断，可回复“继续”）")
     } else {
         full
@@ -497,9 +503,15 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
                     usage.completion_tokens = n;
                 }
             } else if t == "content_block_delta" {
-                if let Some(delta) = v.pointer("/delta/text").and_then(|x| x.as_str()) {
-                    full.push_str(delta);
-                    if !on_token(delta) {
+                if let Some(delta) = v
+                    .pointer("/delta/text")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+                    // 模糊回退：delta.content 变体 / 非标准块结构
+                    .or_else(|| fuzzy_text(&v))
+                {
+                    full.push_str(&delta);
+                    if !on_token(&delta) {
                         stopped = true;
                         return true;
                     }
@@ -556,9 +568,15 @@ async fn stream_gemini<F: FnMut(&str) -> bool>(
             if v.get("usageMetadata").is_some() {
                 usage = usage_from_gemini(&v);
             }
-            if let Some(delta) = v.pointer("/candidates/0/content/parts/0/text").and_then(|x| x.as_str()) {
-                full.push_str(delta);
-                if !on_token(delta) {
+            if let Some(delta) = v
+                .pointer("/candidates/0/content/parts/0/text")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+                // 模糊回退：文本被拆进多个 parts（严格路径只取 parts/0 会丢内容）等变体
+                .or_else(|| fuzzy_text(&v))
+            {
+                full.push_str(&delta);
+                if !on_token(&delta) {
                     stopped = true;
                     return true;
                 }
@@ -601,9 +619,15 @@ async fn chat_openai(
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+        // 模糊回退：content 为内容块数组 / 旧版 choices[0].text / Responses API output_text 等
+        .or_else(|| fuzzy_text(&value))
         .ok_or_else(|| "响应中缺少 content".to_string())?;
     // finish_reason=length：输出被截断，显式标注避免“话说一半”像 bug
-    if value.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("length") {
+    if value
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .is_some_and(finish_truncated)
+    {
         content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
     }
     Ok((content, usage_from_openai(&value)))
@@ -641,6 +665,8 @@ async fn chat_gemini(
         .pointer("/candidates/0/content/parts/0/text")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+        // 模糊回退：多 part 拼接 / 变体结构
+        .or_else(|| fuzzy_text(&value))
         .ok_or_else(|| "响应中缺少 text".to_string())?;
     Ok((text, usage_from_gemini(&value)))
 }
@@ -706,6 +732,8 @@ async fn chat_claude(
         .pointer("/content/0/text")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+        // 模糊回退：content 为纯字符串 / 多 text 块拼接 / 变体结构
+        .or_else(|| fuzzy_text(&value))
         .ok_or_else(|| "响应中缺少 text".to_string())?;
     Ok((text, usage_from_claude(&value)))
 }
@@ -719,6 +747,124 @@ async fn read_json_resp(resp: reqwest::Response) -> Result<serde_json::Value, St
         return Err(format!("HTTP {status}: {short}"));
     }
     serde_json::from_str(&text).map_err(|e| format!("响应解析失败: {e}"))
+}
+
+// ── 模糊格式识别：动态适配不严格遵循协议的响应（第三方网关 / 新模型常出现变体）──
+
+/// 视为文本载体的键（小写精确匹配），命中即取值；对象/数组则继续深入
+const FUZZY_TEXT_KEYS: &[&str] = &[
+    "text",
+    "content",
+    "delta",
+    "message",
+    "output_text",
+    "completion",
+    "answer",
+    "response",
+];
+
+/// 明确跳过的键：推理过程不是正文；error / 工具调用 / 元数据结构不能当回复
+const FUZZY_SKIP_KEYS: &[&str] = &[
+    "error",
+    "errors",
+    "reasoning_content",
+    "reasoning",
+    "thinking",
+    "thought",
+    "signature",
+    "type",
+    "role",
+    "id",
+    "model",
+    "name",
+    "url",
+    "data",
+    "index",
+    "object",
+    "created",
+    "usage",
+    "finish_reason",
+    "stop_reason",
+    "annotations",
+    "citations",
+    "refusal",
+    "logprobs",
+    "system_fingerprint",
+    "function",
+    "function_call",
+    "functioncall",
+    "tool_calls",
+    "tool_use",
+    "arguments",
+    "input",
+    "args",
+    "parameters",
+];
+
+/// 递归模糊提取正文文本：字符串挂在文本键下才算命中；数组按序拼接（多 part / 多内容块）
+fn fuzzy_text(v: &serde_json::Value) -> Option<String> {
+    fuzzy_walk(v, 0).filter(|s| !s.trim().is_empty())
+}
+
+fn fuzzy_walk(v: &serde_json::Value, depth: usize) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    match v {
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<String> =
+                arr.iter().filter_map(|x| fuzzy_walk(x, depth + 1)).collect();
+            if parts.is_empty() { None } else { Some(parts.concat()) }
+        }
+        serde_json::Value::Object(m) => {
+            // 第一轮：只看文本键（保持字段优先级，命中即返回）
+            for (k, val) in m {
+                let kl = k.to_lowercase();
+                if FUZZY_SKIP_KEYS.contains(&kl.as_str()) {
+                    continue;
+                }
+                if FUZZY_TEXT_KEYS.contains(&kl.as_str()) {
+                    match val {
+                        serde_json::Value::String(s) if !s.is_empty() => return Some(s.clone()),
+                        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                            if let Some(t) = fuzzy_walk(val, depth + 1) {
+                                return Some(t);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // 第二轮：文本键下没有 → 继续深入容器键（choices / candidates / parts 等结构）
+            for (k, val) in m {
+                let kl = k.to_lowercase();
+                if FUZZY_SKIP_KEYS.contains(&kl.as_str()) {
+                    continue;
+                }
+                if matches!(val, serde_json::Value::Object(_) | serde_json::Value::Array(_)) {
+                    if let Some(t) = fuzzy_walk(val, depth + 1) {
+                        return Some(t);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// finish_reason 模糊归一化：不同端点大小写 / 别名不一（length / max_tokens / MAX_TOKENS 风格）
+fn finish_truncated(f: &str) -> bool {
+    matches!(
+        f.to_lowercase().as_str(),
+        "length"
+            | "max_tokens"
+            | "max_output_tokens"
+            | "max_token_limit"
+            | "token_limit"
+            | "length_limit"
+            | "context_length_exceeded"
+    )
 }
 
 /// 生成当前已注册工具的清单（供 AI 了解可用工具）
@@ -1198,8 +1344,12 @@ async fn native_round_openai(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    // finish_reason=length：输出被截断（可能连工具调用都没来得及发出），显式标注
-    if value.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("length") {
+    // finish_reason 模糊归一化：达到输出上限（可能连工具调用都没来得及发出），显式标注
+    if value
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .is_some_and(finish_truncated)
+    {
         content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
     }
     let mut calls = Vec::new();
@@ -1210,11 +1360,14 @@ async fn native_round_openai(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let args_raw = tc
-                .pointer("/function/arguments")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            let args = serde_json::from_str(args_raw).unwrap_or(serde_json::json!({}));
+            // arguments 兼容两种形态：标准字符串 JSON / 部分端点直接给对象
+            let args = match tc.pointer("/function/arguments") {
+                Some(serde_json::Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+                }
+                Some(v @ serde_json::Value::Object(_)) => v.clone(),
+                _ => serde_json::json!({}),
+            };
             if !name.is_empty() {
                 calls.push(NativeToolCall {
                     id: tc
@@ -1226,6 +1379,32 @@ async fn native_round_openai(
                     args,
                 });
             }
+        }
+    }
+    // 模糊回退：旧版 function_call 单调用格式（无 tool_calls 数组）
+    if calls.is_empty() {
+        if let Some(fc) = msg.get("function_call") {
+            let name = fc
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if !name.is_empty() {
+                let args = match fc.get("arguments") {
+                    Some(serde_json::Value::String(s)) => {
+                        serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+                    }
+                    Some(v @ serde_json::Value::Object(_)) => v.clone(),
+                    _ => serde_json::json!({}),
+                };
+                calls.push(NativeToolCall { id: "legacy-fc".into(), name, args });
+            }
+        }
+    }
+    // 模糊回退：content 为内容块数组等变体（仅在无工具调用时启用，避免误读参数为正文）
+    if content.is_empty() && calls.is_empty() {
+        if let Some(t) = fuzzy_text(&value) {
+            content = t;
         }
     }
     Ok(NativeRound { content, calls, usage: usage_from_openai(&value) })
@@ -1330,6 +1509,12 @@ async fn native_round_claude(
             }
         }
     }
+    // 模糊回退：content 为纯字符串等变体（仅在无工具调用时启用，避免误读 input 参数为正文）
+    if content.is_empty() && calls.is_empty() {
+        if let Some(t) = fuzzy_text(&value) {
+            content = t;
+        }
+    }
     Ok(NativeRound { content, calls, usage: usage_from_claude(&value) })
 }
 
@@ -1427,6 +1612,12 @@ async fn native_round_gemini(
                     });
                 }
             }
+        }
+    }
+    // 模糊回退：非标准结构（仅在无工具调用时启用，避免误读 functionCall 参数为正文）
+    if content.is_empty() && calls.is_empty() {
+        if let Some(t) = fuzzy_text(&value) {
+            content = t;
         }
     }
     Ok(NativeRound { content, calls, usage: usage_from_gemini(&value) })
@@ -1708,5 +1899,124 @@ mod native_tests {
         .unwrap();
         assert_eq!(full, expect, "500 块应全部有序到达且无损拼接");
         assert!(full.starts_with("t0;t1;") && full.ends_with("t498;t499;"));
+    }
+}
+
+/// 模糊格式识别测试：覆盖各协议常见变体 + 不得误读的结构
+#[cfg(test)]
+mod fuzzy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn openai_content_array_blocks() {
+        // 部分网关把 content 返回成内容块数组
+        let v = json!({"choices":[{"message":{"content":[
+            {"type":"text","text":"你好"},{"type":"text","text":"世界"}
+        ]}}]});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("你好世界"));
+    }
+
+    #[test]
+    fn legacy_completions_text() {
+        // 旧版 completions：choices[0].text
+        let v = json!({"choices":[{"text":"hello"}]});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn responses_api_output_text() {
+        let v = json!({"object":"response","output_text":"hi there"});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn stream_message_instead_of_delta() {
+        // 流式网关直接回 message 而非 delta
+        let v = json!({"choices":[{"message":{"role":"assistant","content":"chunk1"}}]});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("chunk1"));
+    }
+
+    #[test]
+    fn claude_content_plain_string() {
+        let v = json!({"id":"msg_1","type":"message","content":"plain"});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn claude_multi_text_blocks() {
+        let v = json!({"content":[
+            {"type":"text","text":"A"},{"type":"text","text":"B"}
+        ]});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("AB"));
+    }
+
+    #[test]
+    fn gemini_multi_part_concat() {
+        // 严格路径只取 parts/0，模糊路径应拼接全部 parts
+        let v = json!({"candidates":[{"content":{"parts":[{"text":"A"},{"text":"B"}]}}]});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("AB"));
+    }
+
+    #[test]
+    fn error_body_never_matched() {
+        // 200 但带 error 结构：message 不能被当正文
+        let v = json!({"error":{"message":"boom","type":"invalid_request"}});
+        assert_eq!(fuzzy_text(&v), None);
+    }
+
+    #[test]
+    fn reasoning_not_matched() {
+        // 推理内容不是正文
+        let v = json!({"choices":[{"delta":{"reasoning_content":"thinking..."}}]});
+        assert_eq!(fuzzy_text(&v), None);
+    }
+
+    #[test]
+    fn tool_call_payload_not_leaked() {
+        // 工具调用结构（含 arguments 字符串）不能被当正文
+        let v = json!({"choices":[{"message":{
+            "content": null,
+            "tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls -la\"}"}}]
+        }}]});
+        assert_eq!(fuzzy_text(&v), None);
+    }
+
+    #[test]
+    fn claude_tool_use_input_not_leaked() {
+        // tool_use 块的 input 参数（可能含 content/text 键）不能被当正文
+        let v = json!({"content":[{"type":"tool_use","id":"t1","name":"write_file",
+            "input":{"path":"a.txt","content":"file body"}}]});
+        assert_eq!(fuzzy_text(&v), None);
+    }
+
+    #[test]
+    fn claude_message_delta_not_matched() {
+        // 流式 message_delta：stop_reason / usage 不是正文
+        let v = json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}});
+        assert_eq!(fuzzy_text(&v), None);
+    }
+
+    #[test]
+    fn deep_nested_container_found() {
+        // 非标准嵌套：result → items → response
+        let v = json!({"result":{"items":[{"response":"deep"}]}});
+        assert_eq!(fuzzy_text(&v).as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn usage_only_chunk_not_matched() {
+        let v = json!({"id":"x","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":5}});
+        assert_eq!(fuzzy_text(&v), None);
+    }
+
+    #[test]
+    fn finish_reason_variants() {
+        for f in ["length", "MAX_TOKENS", "max_output_tokens", "Length", "token_limit"] {
+            assert!(finish_truncated(f), "{f} 应判定为截断");
+        }
+        for f in ["stop", "end_turn", "STOP", "tool_calls", "max_tokens_exceeded_ok", ""] {
+            assert!(!finish_truncated(f), "{f} 不应判定为截断");
+        }
     }
 }
