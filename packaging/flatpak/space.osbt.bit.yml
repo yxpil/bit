@@ -52,7 +52,8 @@ modules:
   - name: ayatana-ido
     buildsystem: simple
     build-commands:
-      - rm -f /usr/bin/g-ir-scanner /usr/bin/g-ir-compiler
+      # 修改源码CMakeLists，彻底删除gobject‑introspection逻辑，不触碰只读/usr
+      - sed -i '/find_package(GObjectIntrospection)/,/endif()/d' src/CMakeLists.txt
       - cmake -B build -G Ninja
         -DCMAKE_INSTALL_PREFIX=/app
         -DENABLE_GTKDOC=OFF
