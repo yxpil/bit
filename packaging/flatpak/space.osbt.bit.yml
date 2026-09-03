@@ -7,32 +7,23 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.node22
 command: bit
 separate-locales: false
-
 finish-args:
+  # 联网：AI 提供方 / 远程访问 API
   - --share=network
   - --share=ipc
+  # 图形显示（X11 与 Wayland，Crostini 下走 Wayland）
   - --socket=x11
   - --socket=wayland
   - --device=dri
-
-  # 系统托盘、通知
+  # 系统托盘与通知
   - --talk-name=org.kde.StatusNotifierWatcher
   - --talk-name=org.freedesktop.Notifications
-
-  # DBus 会话总线（Tauri 部分桌面通知需要）
-  - --own-name=space.osbt.bit.*
-
-  # 文件权限：Agent 需要读写，Flathub 审核可协商；优先 xdg，兜底 home
-  - --filesystem=xdg-config
-  - --filesystem=xdg-cache
+  # Agent 工具需要执行命令 / 读写文件（Shell / 文件 / 技能）
   - --filesystem=home
-
   - --socket=pulseaudio
-
-  # 读取系统图标主题
-  - --filesystem=xdg-data/icons:ro
-
 modules:
+  # Vala 编译器：ayatana-ido 的 CMake 构建依赖（freedesktop 24.08 SDK 未含）。
+  # 必须 ≥0.56.19：旧版 vapigen 无法解析 g-ir 1.86 生成的 <doc:format> 标签（Do not error-out on doc:format）
   - name: vala
     buildsystem: simple
     build-commands:
@@ -40,27 +31,16 @@ modules:
       - make -j$(nproc)
       - make install
     cleanup:
-      - /share/doc
-      - /share/man
-      - /lib/pkgconfig
-      - /include
+      - "*"
     sources:
       - type: archive
-        url: https://download.gnome.org/sources/vala/0.56/vala-0.56.17.tar.xz
-        sha256: 26100c4e4ef0049c619275f140d97cf565883d00c7543c82bcce5a426934ed6a
-
+        url: https://download.gnome.org/sources/vala/0.56/vala-0.56.19.tar.xz
+        sha256: 5ad7cbbfcc0de61b403d6797c9ef60455bfbebd8e162aec33b5b0b097adfb9d5
+  # libayatana-ido：ayatana-indicator 的缺失上游依赖（共享模块链未包含，runtime 亦无）
   - name: ayatana-ido
-    buildsystem: simple
-    build-commands:
-      # 修改源码CMakeLists，彻底删除gobject‑introspection逻辑，不触碰只读/usr
-      - sed -i '/find_package(GObjectIntrospection)/,/endif()/d' src/CMakeLists.txt
-      - cmake -B build -G Ninja
-        -DCMAKE_INSTALL_PREFIX=/app
-        -DENABLE_GTKDOC=OFF
-        -DBUILD_VAPI=OFF
-        -DENABLE_INTROSPECTION=OFF
-      - ninja -C build -j"${NPROC:-1}"
-      - ninja -C build install
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DENABLE_GTKDOC=OFF
     cleanup:
       - /include
       - /lib/pkgconfig
@@ -69,17 +49,14 @@ modules:
       - type: archive
         url: https://github.com/AyatanaIndicators/ayatana-ido/archive/refs/tags/0.10.4.tar.gz
         sha256: bd59abd5f1314e411d0d55ce3643e91cef633271f58126be529de5fb71c5ab38
-
-  # 👉 使用前：git submodule add https://github.com/flathub/shared-modules.git
+  # Flathub 共享模块（CI 会先克隆到本目录）：intltool → libdbusmenu → libayatana-indicator → libayatana-appindicator
   - shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json
-
   - name: bit
     buildsystem: simple
     build-options:
-      append-path: /app/bin:/usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
       env:
         npm_config_yes: 'true'
-        CARGO_HOME: /run/build/bit/cargo
     build-commands:
       - npm install --no-audit --no-fund
       - npm run tauri build -- --no-bundle
