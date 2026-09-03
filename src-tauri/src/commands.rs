@@ -1496,7 +1496,13 @@ pub fn open_external(url: String) -> Result<(), String> {
 /// Windows 写 bit.cmd 到用户 PATH 自带的 %LOCALAPPDATA%\Microsoft\WindowsApps（start /wait 等待 GUI 进程）。
 /// BIT_CLI_DIR 环境变量可覆盖安装目录（E2E 测试用）。
 pub fn install_cli_impl(ctx: &Arc<Ctx>) -> Result<serde_json::Value, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法定位可执行文件: {e}"))?;
+    // AppImage：current_exe() 指向 /tmp/.mount_xxx 临时挂载点（退出即失效），
+    // 链接必须指向 $APPIMAGE（AppImage 运行时注入的 .AppImage 本体，参数会透传给内部二进制）
+    let exe = std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| std::env::current_exe().ok())
+        .ok_or("无法定位可执行文件")?;
     let record_audit = |path: &str, hint: &str| {
         crate::audit::record(
             ctx,
