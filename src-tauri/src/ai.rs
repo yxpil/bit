@@ -406,13 +406,22 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
     let mut full = String::new();
     let mut usage = TokenUsage::default();
     let mut stopped = false;
+    let mut saw_done = false;
+    let mut finish = String::new();
     read_sse(resp, |data| {
         if data == "[DONE]" {
+            saw_done = true;
             return true;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             if v.get("usage").is_some() {
                 usage = usage_from_openai(&v);
+            }
+            // 追踪 finish_reason：length = 达到 max_tokens 被截断，需显式告知
+            if let Some(f) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
+                if !f.is_empty() {
+                    finish = f.to_string();
+                }
             }
             if let Some(delta) = v.pointer("/choices/0/delta/content").and_then(|x| x.as_str()) {
                 full.push_str(delta);
@@ -432,6 +441,16 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
     if full.is_empty() {
         return Err("流式无内容".into());
     }
+    // 上游未发 [DONE] = 连接异常中断（网络波动/代理断开）：半截内容不能当完整回复
+    if !saw_done {
+        return Err("连接中断：流式响应未正常结束（网络波动或代理断开），请重试".into());
+    }
+    // 达到输出上限：在正文尾部显式标注，避免“话说一半”看起来像 bug
+    let full = if finish == "length" {
+        format!("{full}\n\n（回复因达到最大输出长度被截断，可回复“继续”）")
+    } else {
+        full
+    };
     Ok((full, usage))
 }
 
@@ -446,7 +465,7 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
 ) -> Result<(String, TokenUsage), String> {
     let (system_txt, mut msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
-        "model": p.model, "max_tokens": 4096, "messages": msgs, "stream": true
+        "model": p.model, "max_tokens": 8192, "messages": msgs, "stream": true
     });
     apply_params("claude", &mut body, params);
     claude_apply_cache(&mut body, &system_txt, &mut msgs);
@@ -568,7 +587,7 @@ async fn chat_openai(
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
     // 只发送 role/content（图片挂到最后一条 user），剥离本地可视化用的 tool_calls 字段
     let msgs = openai_messages(messages, images);
-    let mut body = serde_json::json!({ "model": p.model, "messages": msgs });
+    let mut body = serde_json::json!({ "model": p.model, "messages": msgs, "max_tokens": 8192 });
     apply_params("openai", &mut body, params);
     let resp = client
         .post(&url)
@@ -578,11 +597,15 @@ async fn chat_openai(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let value = read_json_resp(resp).await?;
-    let content = value
+    let mut content = value
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| "响应中缺少 content".to_string())?;
+    // finish_reason=length：输出被截断，显式标注避免“话说一半”像 bug
+    if value.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("length") {
+        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+    }
     Ok((content, usage_from_openai(&value)))
 }
 
@@ -663,7 +686,7 @@ async fn chat_claude(
     let (system_txt, mut msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "messages": msgs,
     });
     apply_params("claude", &mut body, params);
@@ -807,6 +830,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         (
             "## How to call tools (native function calling)\n\
             You are in native function-calling mode: when you need to act, issue function calls directly (multiple parallel calls in one turn are allowed). \
+            NEVER announce an action and then stop — if your reply says you are going to do something, the same turn MUST contain the actual tool call. \
             The system executes each call and returns its result to you as a tool message; keep reasoning or calling more tools based on the results. \
             When everything is done, output the final answer in natural language (do NOT output any call-format explanation or JSON call arrays in your reply).",
             "Write/search SKILLs with Tool 6 · skill: action=save writes a skill (same name overwrites), action=search finds existing skills.",
@@ -830,6 +854,9 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
     format!(
         "You are BIT, a self-extending AI assistant. You can call tools, and write code to add new tools for yourself.\n\
         Always reply in the user's language (e.g. reply in Chinese when the user writes Chinese).\n\
+        You are a local-first agent: every tool call executes on the user's own machine and all data stays on their device. \
+        Your underlying model may be hosted by a remote API provider, but never present yourself as a cloud service — \
+        if asked about your nature, answer honestly: a local agent running on this device, with a model served remotely.\n\
         \n\
         {manual}\n\
         \n\
@@ -1150,6 +1177,8 @@ async fn native_round_openai(
         .collect();
     let mut body = serde_json::json!({
         "model": p.model,
+        // DeepSeek 等默认 max_tokens=4096：长预告+工具调用易撞上限导致“话说一半没调用”，放宽到 8192
+        "max_tokens": 8192,
         "messages": msgs,
         "tools": tools,
         "tool_choice": "auto",
@@ -1164,11 +1193,15 @@ async fn native_round_openai(
         .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
     let value = read_json_native(resp).await?;
     let msg = &value["choices"][0]["message"];
-    let content = msg
+    let mut content = msg
         .get("content")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // finish_reason=length：输出被截断（可能连工具调用都没来得及发出），显式标注
+    if value.pointer("/choices/0/finish_reason").and_then(|v| v.as_str()) == Some("length") {
+        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+    }
     let mut calls = Vec::new();
     if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
         for tc in arr {
@@ -1247,7 +1280,7 @@ async fn native_round_claude(
         .collect();
     let mut body = serde_json::json!({
         "model": p.model,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "messages": msgs,
         "tools": tools,
         "tool_choice": {"type": "auto"},

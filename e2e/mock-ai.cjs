@@ -95,8 +95,11 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
   let body = "";
-  req.on("data", (c) => (body += c));
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
+    // Buffer 拼接后再转 utf8：直接 += 会在 chunk 边界切断多字节字符产生 U+FFFD
+    body = Buffer.concat(chunks).toString("utf8");
     let parsed;
     try {
       parsed = JSON.parse(body);
@@ -215,6 +218,61 @@ const server = http.createServer((req, res) => {
     }
 
     // ── 用户轮：按场景标记返回工具调用（含 BIT 文本协议的各种变体） ──
+
+    // 压测-上行完整性：回显收到的最后一条用户消息的统计（验证 BIT 完整转发大文本）
+    if (last.includes("E2E-CMD-ECHO")) {
+      try { require("fs").writeFileSync("/tmp/mock-echo-received.txt", last); } catch {}
+      const payload = JSON.stringify({ len: last.length, head: last.slice(0, 24), tail: last.slice(-24) });
+      return respond(res, `E2E-ECHO-STATS ${payload}`, sse);
+    }
+
+    // 压测-下行长文本：分块流式输出 50KB 确定性文本（可校验 head/tail 完整性）
+    if (last.includes("E2E-CMD-LONG")) {
+      const total = 50;
+      const mk = (i) => `L${String(i).padStart(4, "0")}:` + "x".repeat(1000 - 6) + "\n";
+      const full = Array.from({ length: total }, (_, i) => mk(i)).join("");
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        const usage = usageFor(messages);
+        for (let i = 0; i < total; i += 5) {
+          const chunk = { id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: mk(i) + mk(i + 1) + mk(i + 2) + mk(i + 3) + mk(i + 4) } }] };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {} }], usage })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      return respond(res, full, sse);
+    }
+
+    // 压测-流中断：发两块内容后直接断开（不发 [DONE]），验证 BIT 不再把半截当完整回复
+    if (last.includes("E2E-CMD-DROP")) {
+      if (!sse) return respond(res, "E2E-DROP-需要流式请求", sse);
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "第一段内容。" } }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "第二段内容，马上就要断了" } }] })}\n\n`);
+      setTimeout(() => res.destroy(), 50);
+      return;
+    }
+
+    // 压测-max_tokens 截断：finish_reason=length（验证 BIT 显式标注截断而不是默默断句）
+    if (last.includes("E2E-CMD-LENGTH")) {
+      const content = "回答的前半部分，然后长度到上限了";
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "length" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        id: "mock", object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "length" }],
+        usage: usageFor(messages),
+      }));
+    }
+
     if (last.includes("E2E-CMD-SHELL"))
       return respond(res, '好的，我来执行命令。\n[{"tool":"shell","params":{"command":"echo e2e-shell-ok"}}]', sse);
 
