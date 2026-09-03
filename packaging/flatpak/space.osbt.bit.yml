@@ -60,7 +60,15 @@ modules:
       env:
         npm_config_yes: 'true'
     build-commands:
-      - npm install --no-audit --no-fund
+      - |
+        # 沙盒内 npm 拉 registry 偶发 "Exit handler never called"，重试 3 次兜底
+        npm config set fetch-retries 5
+        npm config set fetch-retry-maxtimeout 120000
+        for i in 1 2 3; do
+          if npm install --no-audit --no-fund; then break; fi
+          if [ "$i" = 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
+          sleep 20
+        done
       - npm run tauri build -- --no-bundle
       - install -Dm755 src-tauri/target/release/bit /app/bin/bit
       - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/space.osbt.bit.png
