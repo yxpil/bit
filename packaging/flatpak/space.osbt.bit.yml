@@ -50,14 +50,16 @@ modules:
         sha256: 26100c4e4ef0049c619275f140d97cf565883d00c7543c82bcce5a426934ed6a
 
   - name: ayatana-ido
-    buildsystem: cmake-ninja
+    buildsystem: simple
     build-commands:
-      # 构建阶段直接移除 gobject‑introspection 工具，cmake检测不到，整套内省逻辑直接跳过
-      - rm -f /usr/bin/g-ir-compiler /usr/bin/g-ir-scanner
-    config-opts:
-      - -DENABLE_GTKDOC=OFF
-      - -DBUILD_VAPI=OFF
-      - -DENABLE_INTROSPECTION=OFF
+      - rm -f /usr/bin/g-ir-scanner /usr/bin/g-ir-compiler
+      - cmake -B build -G Ninja
+        -DCMAKE_INSTALL_PREFIX=/app
+        -DENABLE_GTKDOC=OFF
+        -DBUILD_VAPI=OFF
+        -DENABLE_INTROSPECTION=OFF
+      - ninja -C build -j"${NPROC:-1}"
+      - ninja -C build install
     cleanup:
       - /include
       - /lib/pkgconfig
