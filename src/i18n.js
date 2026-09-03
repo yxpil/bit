@@ -279,7 +279,7 @@ const dict = {
     "remote.agentTitle": "Agent 接入示例（双重认证）",
     "remote.cliTitle": "终端命令（bit）",
     "remote.cliDesc":
-      "把 bit 命令安装到终端 PATH，即可在任意终端运行 bit tui 进入简约终端模式（对话、工具、会话、记忆全部可用），可与桌面端同时运行。",
+      "把 bit 命令安装到终端 PATH，即可在任意终端运行 bit 进入简约终端模式（对话、工具、会话、记忆全部可用，交互式终端直接输 bit 即可，bit tui 同效），可与桌面端同时运行。",
     "remote.cliInstall": "安装 bit 命令",
     "remote.curlListModels": "查看可用模型",
     "remote.curlChat": "对话（加 \"stream\": true 即为流式 SSE）",
@@ -587,7 +587,7 @@ const dict = {
     "remote.agentTitle": "Agent integration example (two-factor auth)",
     "remote.cliTitle": "Terminal command (bit)",
     "remote.cliDesc":
-      "Install the bit command into your terminal PATH, then run bit tui for a minimal terminal mode (chat, tools, sessions and memories all work) — it can run alongside the desktop app.",
+      "Install the bit command into your terminal PATH, then run bit for a minimal terminal mode (chat, tools, sessions and memories all work; typing bit in an interactive terminal is enough, bit tui also works) — it can run alongside the desktop app.",
     "remote.cliInstall": "Install bit command",
     "remote.curlListModels": "List available models",
     "remote.curlChat": "Chat (add \"stream\": true for streaming SSE)",

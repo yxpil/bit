@@ -25,10 +25,17 @@ mod update;
 use tauri::Manager;
 
 fn main() {
-    // 终端模式：`bit tui` 进入简约 TUI（无窗口 / 无单实例 / 不监听端口，
+    // 终端模式：`bit tui` 或交互式终端里的裸 `bit` 进入简约 TUI（无窗口 / 无单实例 / 不监听端口，
     // 可与桌面端同时运行，共用数据目录）。generate_context! 只能展开一次，
     // 所以 TUI 与桌面端共用同一个 Builder，仅按模式注册不同的插件与启动逻辑。
-    let tui_mode = std::env::args().any(|a| a == "tui");
+    // 裸 `bit` 的判定：stdin 是 TTY（交互终端）才进 TUI——Finder 双击 / .desktop 图标 /
+    // `open -a` / 自动更新重启均无 TTY，仍走桌面端；BIT_HEADLESS（e2e）强制桌面路径。
+    let explicit_tui = std::env::args().any(|a| a == "tui");
+    let bare_tty_tui = !explicit_tui
+        && std::env::args().count() == 1
+        && std::env::var_os("BIT_HEADLESS").is_none()
+        && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let tui_mode = explicit_tui || bare_tty_tui;
     if tui_mode {
         #[cfg(windows)]
         attach_console();
