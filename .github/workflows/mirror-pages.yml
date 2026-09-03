@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要镜像的 tag（如 v0.4.9）"
-        required: true
-        default: "v0.4.9"
+        description: "要镜像的 tag（留空自动取最新 Release）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -34,6 +34,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
+          # 未显式指定 tag 时自动取最新 Release（避免默认旧 tag 把站点覆盖回旧版本）
+          if [ -z "$TAG" ]; then TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name); fi
+          echo "镜像 $TAG"
           VERSION="${TAG#v}"
           mkdir -p "site/$VERSION"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "site/$VERSION"
