@@ -51,8 +51,9 @@ modules:
 
   - name: ayatana-ido
     buildsystem: cmake-ninja
-    disable-cmake-targets:
-      - libayatana-ido3-0.4.vapi
+    build-commands:
+      # 构建阶段直接移除 gobject‑introspection 工具，cmake检测不到，整套内省逻辑直接跳过
+      - rm -f /usr/bin/g-ir-compiler /usr/bin/g-ir-scanner
     config-opts:
       - -DENABLE_GTKDOC=OFF
       - -DBUILD_VAPI=OFF
@@ -62,10 +63,9 @@ modules:
       - /lib/pkgconfig
       - /lib/*.la
     sources:
-      - type: git
-        url: https://github.com/AyatanaIndicators/ayatana-ido.git
-        branch: main
-        commit: 550694293978093076251967217837277707777
+      - type: archive
+        url: https://github.com/AyatanaIndicators/ayatana-ido/archive/refs/tags/0.10.4.tar.gz
+        sha256: bd59abd5f1314e411d0d55ce3643e91cef633271f58126be529de5fb71c5ab38
 
   # 👉 使用前：git submodule add https://github.com/flathub/shared-modules.git
   - shared-modules/libayatana-appindicator/libayatana-appindicator-gtk3.json
