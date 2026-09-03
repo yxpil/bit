@@ -22,7 +22,7 @@ jobs:
       - name: 镜像推送到 Gitee
         run: |
           git -c "http.extraheader=Authorization: Basic $(printf '%s:%s' "$GITEE_USER" "$GITEE_PASS" | base64)" \
-            push --prune "https://gitee.com/yxpil/bit.git" \
+            push --prune --force "https://gitee.com/yxpil/bit.git" \
             "refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"
         env:
           GITEE_USER: ${{ secrets.GITEE_USER }}
