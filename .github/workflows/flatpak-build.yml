@@ -25,8 +25,10 @@ jobs:
           flatpak install --user -y --noninteractive \
             org.gnome.Platform//48 \
             org.gnome.Sdk//48 \
-            org.freedesktop.Sdk.Extension.rust-stable//48 \
-            org.freedesktop.Sdk.Extension.node22//48
+            org.freedesktop.Sdk.Extension.rust-stable//24.08 \
+            org.freedesktop.Sdk.Extension.node22//24.08
+          # 注意：扩展分支按 GNOME 运行时的 freedesktop 基座版本（48→24.08），
+          # Flathub 上不存在 rust-stable/node22 的 //48 分支
 
       - name: 拉取 Flathub 共享模块（manifest include 相对路径所需）
         run: git clone --depth 1 https://github.com/flathub/shared-modules.git packaging/flatpak/shared-modules
