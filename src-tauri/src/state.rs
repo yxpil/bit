@@ -70,6 +70,9 @@ pub struct Ctx {
     pub sessions: Mutex<SessionStore>,
     /// 已接入的 MCP 服务器（Streamable HTTP）
     pub mcp: Mutex<Vec<crate::mcp::McpServer>>,
+    /// BIT 作为 MCP 服务器时分配的会话（session_id → 最后活跃时刻）。
+    /// 内存态：进程重启即失效，客户端需重新 initialize
+    pub mcp_sessions: Mutex<HashMap<String, std::time::Instant>>,
     /// 小圆片播放/暂停状态（true = 播放，自动总结进行中）
     pub autopilot_running: AtomicBool,
     /// 会话中断标志（session_id → flag），chat_interrupt 置位后执行循环在检查点停止
@@ -160,6 +163,7 @@ impl Ctx {
             todos: Mutex::new(todos),
             sessions: Mutex::new(sessions),
             mcp: Mutex::new(mcp),
+            mcp_sessions: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
             native_probe: Mutex::new(HashMap::new()),
             cache_stats: Mutex::new(HashMap::new()),

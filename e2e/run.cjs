@@ -197,38 +197,56 @@ function record(name, ok, detail) {
     }
   } catch (e) { record("T10 new-tool-in-manifest", false, e.message); }
 
-  // T11 MCP 服务端全流程：tools/list → tools/call（BIT 自身作为 MCP 服务器，Streamable HTTP / JSON-RPC 2.0）
+  // T11 MCP 服务端全流程（标准 Streamable HTTP 客户端行为）：
+  // initialize 从响应头取 Mcp-Session-Id → tools/list / tools/call 均携带会话
+  let mcpSid = "";
   try {
-    const rpc = (method, params) => new Promise((resolve, reject) => {
+    const rpc = (method, params, sid) => new Promise((resolve, reject) => {
       const data = JSON.stringify({ jsonrpc: "2.0", id: 1, method, ...(params ? { params } : {}) });
+      const headers = { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data) };
+      if (sid) headers["Mcp-Session-Id"] = sid;
       const req = http.request(
         { host: BASE, port: PORT, path: "/mcp", method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data) },
-          timeout: 60000, agent },
-        (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b })); }
+          headers, timeout: 60000, agent },
+        (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b, sid: res.headers["mcp-session-id"] || "" })); }
       );
       req.on("error", reject);
       req.write(data);
       req.end();
     });
     const init = await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e", version: "0" } });
-    const list = await rpc("tools/list");
+    mcpSid = init.sid;
+    const list = await rpc("tools/list", null, mcpSid);
     const hasShell = (JSON.parse(list.body).result?.tools || []).some((t) => t.name === "shell");
-    const call = await rpc("tools/call", { name: "shell", arguments: { command: "echo e2e-mcp-ok" } });
+    const call = await rpc("tools/call", { name: "shell", arguments: { command: "echo e2e-mcp-ok" } }, mcpSid);
     const okMcp =
-      init.code === 200 &&
+      init.code === 200 && mcpSid.length > 0 &&
       list.code === 200 && hasShell &&
       call.code === 200 && call.body.includes("e2e-mcp-ok") && call.body.includes('"isError":false');
-    record("T11 mcp-server-roundtrip", okMcp, `init=${init.code} list=${list.code} hasShell=${hasShell} call=${call.code} ${call.body.slice(0, 80)}`);
+    record("T11 mcp-server-roundtrip", okMcp, `init=${init.code} sid=${mcpSid ? "yes" : "no"} list=${list.code} hasShell=${hasShell} call=${call.code} ${call.body.slice(0, 80)}`);
   } catch (e) { record("T11 mcp-server-roundtrip", false, e.message); }
 
-  // T12 MCP 错误分支：未知 method → JSON-RPC -32601；未知工具 → -32602
+  // T12 MCP 错误分支（带合法会话）：未知 method → JSON-RPC -32601；未知工具 → -32602
   try {
+    if (!mcpSid) {
+      const data = JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e", version: "0" } } });
+      mcpSid = await new Promise((resolve, reject) => {
+        const req = http.request(
+          { host: BASE, port: PORT, path: "/mcp", method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data) },
+            timeout: 15000, agent },
+          (res) => { res.resume(); res.on("end", () => resolve(res.headers["mcp-session-id"] || "")); }
+        );
+        req.on("error", reject);
+        req.write(data);
+        req.end();
+      });
+    }
     const rpc = (body) => new Promise((resolve, reject) => {
       const data = JSON.stringify(body);
       const req = http.request(
         { host: BASE, port: PORT, path: "/mcp", method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data) },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data), "Mcp-Session-Id": mcpSid },
           timeout: 15000, agent },
         (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b })); }
       );
@@ -243,6 +261,57 @@ function record(name, ok, detail) {
       noTool.code === 200 && noTool.body.includes("-32602");
     record("T12 mcp-error-branches", okErr, `unknown=${unknown.code}:${unknown.body.slice(0, 60)} noTool=${noTool.code}:${noTool.body.slice(0, 60)}`);
   } catch (e) { record("T12 mcp-error-branches", false, e.message); }
+
+  // T21 MCP 协议符合性（标准 MCP 客户端视角）：会话缺失 400 / 未知 404 / 版本协商回显 /
+  // ping 空 result / 通知 202 / JSON-RPC batch / DELETE 终止后 404 / GET 405
+  try {
+    const post = (bodyObj, sid) => new Promise((resolve, reject) => {
+      const data = JSON.stringify(bodyObj);
+      const headers = { "Content-Type": "application/json", Authorization: `Bearer ${KEY}`, "Content-Length": Buffer.byteLength(data) };
+      if (sid) headers["Mcp-Session-Id"] = sid;
+      const req = http.request(
+        { host: BASE, port: PORT, path: "/mcp", method: "POST", headers, timeout: 15000, agent },
+        (res) => { let b = ""; res.on("data", (c) => (b += c)); res.on("end", () => resolve({ code: res.statusCode, body: b, sid: res.headers["mcp-session-id"] || "" })); }
+      );
+      req.on("error", reject);
+      req.write(data);
+      req.end();
+    });
+    const noSid = await post({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    const badSid = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" }, "mcp-does-not-exist");
+    const init2 = await post({ jsonrpc: "2.0", id: 3, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "e2e", version: "0" } } });
+    const sid2 = init2.sid;
+    const negOk = init2.code === 200 && sid2.length > 0 && JSON.parse(init2.body).result?.protocolVersion === "2024-11-05";
+    const ping = await post({ jsonrpc: "2.0", id: 4, method: "ping" }, sid2);
+    const pingOk = ping.code === 200 && JSON.stringify(JSON.parse(ping.body).result) === "{}";
+    const notif = await post({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const batch = await post([
+      { jsonrpc: "2.0", id: 5, method: "ping" },
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+    ], sid2);
+    let batchOk = batch.code === 200;
+    if (batchOk) {
+      const arr = JSON.parse(batch.body);
+      batchOk = Array.isArray(arr) && arr.length === 1 && JSON.stringify(arr[0].result) === "{}";
+    }
+    const del = await new Promise((resolve, reject) => {
+      const req = http.request(
+        { host: BASE, port: PORT, path: "/mcp", method: "DELETE",
+          headers: { Authorization: `Bearer ${KEY}`, "Mcp-Session-Id": sid2 }, timeout: 15000, agent },
+        (res) => { res.resume(); res.on("end", () => resolve(res.statusCode)); }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    const afterDel = await post({ jsonrpc: "2.0", id: 6, method: "tools/list" }, sid2);
+    const getMcp = await getStatus("/mcp", { Authorization: `Bearer ${KEY}` });
+    const ok21 =
+      noSid.code === 400 && badSid.code === 404 && negOk &&
+      pingOk && notif.code === 202 && batchOk && del === 200 &&
+      afterDel.code === 404 && getMcp.code === 405;
+    record("T21 mcp-protocol-conformance", ok21,
+      `noSid=${noSid.code} badSid=${badSid.code} neg=${negOk} ping=${ping.code} notif=${notif.code} batch=${batchOk} del=${del} after=${afterDel.code} get=${getMcp.code}`);
+  } catch (e) { record("T21 mcp-protocol-conformance", false, e.message); }
 
   // T13 视觉：/api/chat 携带图片（data URL），mock 上游确认看到图片
   try {
@@ -299,7 +368,7 @@ function record(name, ok, detail) {
       const calls = (r.messages || []).flatMap((m) => m.tool_calls || []);
       const blockedCall = calls.find((c) => c.tool === "delete_tool" && c.params?.name === "shell");
       const delCall = calls.find((c) => c.tool === "delete_tool" && c.params?.name === "e2e-temp-tool");
-      const okBlocked = !!blockedCall && blockedCall.ok === false && /不允许删除/.test(JSON.stringify(blockedCall.result || ""));
+      const okBlocked = !!blockedCall && blockedCall.ok === false && /cannot be deleted|不允许删除/.test(JSON.stringify(blockedCall.result || ""));
       const okDeleted = !!delCall && delCall.ok === true && delCall.result?.deleted === "e2e-temp-tool";
       // 清单校验：自建工具已消失，内置 shell 仍在，delete_tool 本身在内置清单里
       const q = await getJson("/api/tools");

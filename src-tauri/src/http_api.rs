@@ -1,6 +1,6 @@
 use crate::state::Ctx;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
@@ -8,6 +8,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 启动/重启远程访问 HTTP 服务
 pub async fn restart_server(ctx: &Arc<Ctx>) -> Result<String, String> {
@@ -55,7 +56,7 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/debug/sessions", get(debug_sessions))
         .route("/api/debug/sessions/{id}", get(debug_session_detail))
         .route("/api/debug/mcp", get(debug_mcp))
-        .route("/mcp", post(mcp_endpoint))
+        .route("/mcp", post(mcp_endpoint).delete(mcp_delete))
         // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(openai_chat_completions))
@@ -106,31 +107,118 @@ async fn update_download_route(State(ctx): State<Arc<Ctx>>) -> Response {
     }
 }
 
-/// BIT 自身作为 MCP 服务器（Streamable HTTP / JSON-RPC 2.0）：
-/// 任何 MCP 客户端（Claude Desktop、Cherry Studio、BIT 自己的自动发现）都可接入 BIT 的全部启用工具。
-/// 认证：Bearer Client Key 或 ?key=（见 auth 中间件）。
-async fn mcp_endpoint(
-    State(ctx): State<Arc<Ctx>>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let rpc_ok = |result: serde_json::Value| {
-        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+/// BIT 支持的 MCP 协议版本（Streamable HTTP / JSON-RPC 2.0）。
+/// 协商规则：客户端 initialize 请求的版本在列表内则回显同版本，否则返回最新支持版
+const MCP_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
+/// MCP 会话空闲过期时间（懒清理）
+const MCP_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// 会话数上限（超出清最旧，防未认证洪泛堆积）
+const MCP_SESSION_MAX: usize = 512;
+
+fn mcp_negotiate_version(client: &str) -> &'static str {
+    match MCP_VERSIONS.iter().find(|v| **v == client) {
+        Some(v) => v,
+        None => MCP_VERSIONS[MCP_VERSIONS.len() - 1],
+    }
+}
+
+fn gen_mcp_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("mcp-{nanos:x}-{:x}-{seq:x}", std::process::id())
+}
+
+/// 会话校验（对 map 的纯函数，便于单测）：
+/// - 未携带 Mcp-Session-Id → 400（会话建立后规范要求客户端所有请求都携带）
+/// - 未知 / 已过期会话 → 404（客户端应重新 initialize）
+/// - 有效 → 刷新活跃时间
+fn mcp_check_session_map(
+    map: &mut std::collections::HashMap<String, std::time::Instant>,
+    sid: Option<&str>,
+    ttl: std::time::Duration,
+) -> Result<(), StatusCode> {
+    let Some(sid) = sid else {
+        return Err(StatusCode::BAD_REQUEST);
     };
-    let rpc_err = |code: i64, msg: &str| {
-        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": msg } })
+    map.retain(|_, t| t.elapsed() < ttl);
+    match map.get_mut(sid) {
+        Some(t) => {
+            *t = std::time::Instant::now();
+            Ok(())
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// 单条 JSON-RPC 消息处理。返回 (状态码, 可选响应体, 新分配的会话 id)
+async fn mcp_handle_one(
+    ctx: &Arc<Ctx>,
+    headers: &HeaderMap,
+    msg: &serde_json::Value,
+) -> (StatusCode, Option<serde_json::Value>, Option<String>) {
+    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let id = msg.get("id").cloned();
+    // JSON-RPC 2.0：无 id 字段 = 通知，服务器不回 body（Streamable HTTP 返回 202）
+    let is_notification = id.is_none();
+    let rpc_ok = |result: serde_json::Value| {
+        json!({ "jsonrpc": "2.0", "id": id.clone().unwrap_or(serde_json::Value::Null), "result": result })
+    };
+    let rpc_err = |code: i64, m: &str| {
+        json!({ "jsonrpc": "2.0", "id": id.clone().unwrap_or(serde_json::Value::Null), "error": { "code": code, "message": m } })
     };
 
     match method {
-        "initialize" => Json(rpc_ok(json!({
-            "protocolVersion": "2025-03-26",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "BIT", "version": env!("CARGO_PKG_VERSION") }
-        })))
-        .into_response(),
-        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+        "initialize" => {
+            if is_notification {
+                return (StatusCode::ACCEPTED, None, None);
+            }
+            let client_ver = msg
+                .pointer("/params/protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ver = mcp_negotiate_version(client_ver);
+            let sid = gen_mcp_session_id();
+            let mut sessions = ctx.mcp_sessions.lock().unwrap();
+            if sessions.len() >= MCP_SESSION_MAX {
+                if let Some(oldest) = sessions.iter().min_by_key(|(_, t)| *t).map(|(k, _)| k.clone()) {
+                    sessions.remove(&oldest);
+                }
+            }
+            sessions.insert(sid.clone(), std::time::Instant::now());
+            drop(sessions);
+            (
+                StatusCode::OK,
+                Some(rpc_ok(json!({
+                    "protocolVersion": ver,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "BIT", "version": env!("CARGO_PKG_VERSION") }
+                }))),
+                Some(sid),
+            )
+        }
+        "ping" => {
+            if let Err(st) = mcp_check_session_map(
+                &mut ctx.mcp_sessions.lock().unwrap(),
+                headers.get("mcp-session-id").and_then(|v| v.to_str().ok()),
+                MCP_SESSION_TTL,
+            ) {
+                return (st, None, None);
+            }
+            (StatusCode::OK, Some(rpc_ok(json!({}))), None)
+        }
         "tools/list" => {
+            if let Err(st) = mcp_check_session_map(
+                &mut ctx.mcp_sessions.lock().unwrap(),
+                headers.get("mcp-session-id").and_then(|v| v.to_str().ok()),
+                MCP_SESSION_TTL,
+            ) {
+                return (st, None, None);
+            }
             let tools = ctx.tools.lock().unwrap();
             let list: Vec<serde_json::Value> = tools
                 .iter()
@@ -143,15 +231,22 @@ async fn mcp_endpoint(
                     })
                 })
                 .collect();
-            Json(rpc_ok(json!({ "tools": list }))).into_response()
+            (StatusCode::OK, Some(rpc_ok(json!({ "tools": list }))), None)
         }
         "tools/call" => {
-            let name = body
+            if let Err(st) = mcp_check_session_map(
+                &mut ctx.mcp_sessions.lock().unwrap(),
+                headers.get("mcp-session-id").and_then(|v| v.to_str().ok()),
+                MCP_SESSION_TTL,
+            ) {
+                return (st, None, None);
+            }
+            let name = msg
                 .pointer("/params/name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let args = body
+            let args = msg
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or(json!({}));
@@ -163,24 +258,111 @@ async fn mcp_endpoint(
                     .map(|t| (t.id.clone(), t.enabled))
             };
             match found {
-                None => Json(rpc_err(-32602, "tool not found")).into_response(),
-                Some((_, false)) => Json(rpc_err(-32000, "tool is paused")).into_response(),
-                Some((tid, _)) => match crate::registry::invoke(&ctx, &tid, args, "mcp-client", None).await {
-                    Ok(v) => Json(rpc_ok(json!({
-                        "content": [{ "type": "text", "text": v.to_string() }],
-                        "isError": false
-                    })))
-                    .into_response(),
-                    Err(e) => Json(rpc_ok(json!({
-                        "content": [{ "type": "text", "text": e }],
-                        "isError": true
-                    })))
-                    .into_response(),
-                },
+                None => (
+                    StatusCode::OK,
+                    Some(rpc_err(-32602, "tool not found")),
+                    None,
+                ),
+                Some((_, false)) => (
+                    StatusCode::OK,
+                    Some(rpc_err(-32000, "tool is paused")),
+                    None,
+                ),
+                Some((tid, _)) => {
+                    match crate::registry::invoke(&ctx, &tid, args, "mcp-client", None).await {
+                        Ok(v) => (
+                            StatusCode::OK,
+                            Some(rpc_ok(json!({
+                                "content": [{ "type": "text", "text": v.to_string() }],
+                                "isError": false
+                            }))),
+                            None,
+                        ),
+                        Err(e) => (
+                            StatusCode::OK,
+                            Some(rpc_ok(json!({
+                                "content": [{ "type": "text", "text": e }],
+                                "isError": true
+                            }))),
+                            None,
+                        ),
+                    }
+                }
             }
         }
-        "" => (StatusCode::BAD_REQUEST, Json(rpc_err(-32600, "missing method"))).into_response(),
-        _ => Json(rpc_err(-32601, "method not found")).into_response(),
+        // 任意通知（notifications/initialized、notifications/cancelled、未知通知）→ 202 无 body
+        m if m.starts_with("notifications/") || is_notification => {
+            (StatusCode::ACCEPTED, None, None)
+        }
+        "" => (
+            StatusCode::BAD_REQUEST,
+            Some(rpc_err(-32600, "missing method")),
+            None,
+        ),
+        _ => (StatusCode::OK, Some(rpc_err(-32601, "method not found")), None),
+    }
+}
+
+/// BIT 自身作为 MCP 服务器（Streamable HTTP / JSON-RPC 2.0，支持 2024-11-05 / 2025-03-26 / 2025-06-18 协商）：
+/// 任何标准 MCP 客户端（Claude Desktop、Cherry Studio、MCP Inspector、BIT 自己的自动发现）都可接入 BIT 的全部启用工具。
+/// 会话：initialize 响应头返回 Mcp-Session-Id，后续请求必须携带（缺失 400 / 过期 404）；
+/// DELETE /mcp 终止会话；GET 返回 405（不提供服务器推送流）；POST 数组按 JSON-RPC batch 处理。
+/// 认证：Bearer Client Key 或 ?key=（见 auth 中间件）。
+async fn mcp_endpoint(
+    State(ctx): State<Arc<Ctx>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    // JSON-RPC batch（数组）：逐条处理，通知不产生 body，全部为通知时返回 202
+    if let serde_json::Value::Array(msgs) = &body {
+        let mut bodies: Vec<serde_json::Value> = Vec::new();
+        let mut sid_out: Option<String> = None;
+        for m in msgs {
+            let (_, resp, sid) = mcp_handle_one(&ctx, &headers, m).await;
+            if let Some(s) = sid {
+                sid_out = Some(s);
+            }
+            if let Some(b) = resp {
+                bodies.push(b);
+            }
+        }
+        let mut resp = if bodies.is_empty() {
+            StatusCode::ACCEPTED.into_response()
+        } else {
+            Json(bodies).into_response()
+        };
+        if let Some(s) = sid_out {
+            if let Ok(v) = HeaderValue::from_str(&s) {
+                resp.headers_mut().insert("Mcp-Session-Id", v);
+            }
+        }
+        return resp;
+    }
+
+    let (status, resp_body, sid) = mcp_handle_one(&ctx, &headers, &body).await;
+    let mut resp = match resp_body {
+        Some(b) => (status, Json(b)).into_response(),
+        None => status.into_response(),
+    };
+    if let Some(s) = sid {
+        if let Ok(v) = HeaderValue::from_str(&s) {
+            resp.headers_mut().insert("Mcp-Session-Id", v);
+        }
+    }
+    resp
+}
+
+/// DELETE /mcp：客户端显式终止会话
+async fn mcp_delete(State(ctx): State<Arc<Ctx>>, headers: HeaderMap) -> Response {
+    match headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        Some(sid) => {
+            if ctx.mcp_sessions.lock().unwrap().remove(sid).is_some() {
+                StatusCode::OK.into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+        None => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
@@ -1005,5 +1187,71 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("401"), "尾斜杠应被归一化: {err}");
+    }
+
+    // ── MCP 服务器（Streamable HTTP）协议符合性 ──
+
+    #[test]
+    fn test_mcp_negotiate_version_echoes_supported() {
+        // 客户端请求受支持版本 → 必须回显同版本（规范要求）
+        assert_eq!(super::mcp_negotiate_version("2025-06-18"), "2025-06-18");
+        assert_eq!(super::mcp_negotiate_version("2025-03-26"), "2025-03-26");
+        assert_eq!(super::mcp_negotiate_version("2024-11-05"), "2024-11-05");
+    }
+
+    #[test]
+    fn test_mcp_negotiate_version_falls_back_to_latest() {
+        // 客户端请求未知/缺失版本 → 返回服务器最新支持版
+        assert_eq!(super::mcp_negotiate_version("1999-01-01"), "2025-06-18");
+        assert_eq!(super::mcp_negotiate_version(""), "2025-06-18");
+    }
+
+    #[test]
+    fn test_mcp_session_id_unique_and_shaped() {
+        let a = super::gen_mcp_session_id();
+        let b = super::gen_mcp_session_id();
+        assert!(a.starts_with("mcp-"), "会话 id 应有固定前缀: {a}");
+        assert_ne!(a, b, "连续生成的会话 id 必须唯一");
+    }
+
+    #[test]
+    fn test_mcp_check_session_missing_sid_is_400() {
+        // 会话建立后不携带 Mcp-Session-Id → 400（规范）
+        let mut map = std::collections::HashMap::new();
+        map.insert("mcp-1".to_string(), std::time::Instant::now());
+        assert_eq!(
+            super::mcp_check_session_map(&mut map, None, super::MCP_SESSION_TTL),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn test_mcp_check_session_unknown_is_404() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("mcp-real".to_string(), std::time::Instant::now());
+        assert_eq!(
+            super::mcp_check_session_map(&mut map, Some("mcp-fake"), super::MCP_SESSION_TTL),
+            Err(StatusCode::NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn test_mcp_check_session_valid_refreshes() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("mcp-1".to_string(), std::time::Instant::now());
+        assert!(super::mcp_check_session_map(&mut map, Some("mcp-1"), super::MCP_SESSION_TTL).is_ok());
+        assert!(map.contains_key("mcp-1"), "有效会话不应被清除");
+    }
+
+    #[test]
+    fn test_mcp_check_session_expired_pruned() {
+        // TTL=0：所有现存会话立即过期 → 懒清理后视为未知 → 404
+        let mut map = std::collections::HashMap::new();
+        map.insert("mcp-old".to_string(), std::time::Instant::now());
+        assert_eq!(
+            super::mcp_check_session_map(&mut map, Some("mcp-old"), std::time::Duration::ZERO),
+            Err(StatusCode::NOT_FOUND)
+        );
+        assert!(map.is_empty(), "过期会话应被懒清理");
     }
 }
