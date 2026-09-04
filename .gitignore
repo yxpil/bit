@@ -12,3 +12,8 @@ commit-msg.txt
 release-notes.md
 tmp/
 __pycache__/
+
+# 本地打包产物（npm pack / 本地构建输出，不入库）
+packaging/npm/*.tgz
+*.dmg
+*.zip
