@@ -148,6 +148,8 @@ fn main() {
             commands::set_runtime_enabled,
             commands::run_script,
             commands::list_audit,
+            commands::clear_audit,
+            commands::delete_audit_entry,
             commands::get_remote_config,
             commands::save_remote_config,
             commands::regenerate_client_key,

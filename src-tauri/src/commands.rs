@@ -257,6 +257,26 @@ pub fn list_audit(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     json!({ "entries": entries })
 }
 
+/// 清空审计日志；清空动作本身记一条，保证操作可追溯
+#[tauri::command]
+pub fn clear_audit(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    crate::audit::clear(&ctx);
+    crate::audit::record(&ctx, "local-user", "audit.clear", "audit", json!({}), true);
+    Ok(json!({ "cleared": true }))
+}
+
+/// 删除单条审计记录；删除动作本身记一条
+#[tauri::command]
+pub fn delete_audit_entry(state: State<'_, Arc<Ctx>>, id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    if !crate::audit::delete(&ctx, &id) {
+        return Err("记录不存在".into());
+    }
+    crate::audit::record(&ctx, "local-user", "audit.delete", &id, json!({}), true);
+    Ok(json!({ "deleted": true }))
+}
+
 // ---------- 远程访问 ----------
 
 #[tauri::command]

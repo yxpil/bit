@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { useLang } from "../i18n.js";
-import { IconAudit, IconRefresh } from "../components/Icons.jsx";
+import { IconAudit, IconRefresh, IconTrash } from "../components/Icons.jsx";
 
 // 审计日志：所有工具调用 / 注册 / HTTP 访问 / Autopilot 动作；点行弹层查看完整详情
 export default function AuditPage() {
@@ -32,10 +32,22 @@ export default function AuditPage() {
             {t("audit.subtitle")}
           </p>
         </div>
-        <button onClick={reload} className="pill pill-outline pill-hover">
-          <IconRefresh size={14} />
-          {t("common.refresh")}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              if (!window.confirm(t("audit.clearConfirm"))) return;
+              api.clearAudit().then(reload);
+            }}
+            className="pill pill-outline pill-hover"
+          >
+            <IconTrash size={14} />
+            {t("audit.clear")}
+          </button>
+          <button onClick={reload} className="pill pill-outline pill-hover">
+            <IconRefresh size={14} />
+            {t("common.refresh")}
+          </button>
+        </div>
       </div>
 
       <input
@@ -72,7 +84,19 @@ export default function AuditPage() {
                   {JSON.stringify(e.detail)}
                 </td>
                 <td className="px-4 py-2.5">
-                  <span className={`inline-block h-2 w-2 rounded-full ${e.ok ? "bg-neutral-900" : "bg-red-500"}`} />
+                  <div className="flex items-center justify-end gap-2 pr-1">
+                    <span className={`inline-block h-2 w-2 rounded-full ${e.ok ? "bg-neutral-900" : "bg-red-500"}`} />
+                    <button
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        api.deleteAuditEntry(e.id).then(reload);
+                      }}
+                      title={t("audit.delete")}
+                      className="text-neutral-300 transition-colors hover:text-red-500"
+                    >
+                      <IconTrash size={13} />
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
