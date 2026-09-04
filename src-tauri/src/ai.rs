@@ -69,17 +69,20 @@ pub struct ChatMessage {
     /// 该条 assistant 消息触发的工具调用（用于前端可视化，模型请求时会被剥离）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallRecord>,
+    /// 该条 assistant 消息的思考过程（前端折叠展示，模型请求时会被剥离）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        ChatMessage { role: "user".into(), content: content.into(), tool_calls: Vec::new() }
+        ChatMessage { role: "user".into(), content: content.into(), tool_calls: Vec::new(), thinking: None }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        ChatMessage { role: "assistant".into(), content: content.into(), tool_calls: Vec::new() }
+        ChatMessage { role: "assistant".into(), content: content.into(), tool_calls: Vec::new(), thinking: None }
     }
     pub fn system(content: impl Into<String>) -> Self {
-        ChatMessage { role: "system".into(), content: content.into(), tool_calls: Vec::new() }
+        ChatMessage { role: "system".into(), content: content.into(), tool_calls: Vec::new(), thinking: None }
     }
 }
 
@@ -190,9 +193,16 @@ pub async fn chat_with_images(
 /// 流式被调用方中止的哨兵错误（中断会话时立即断开 SSE 读取，不回退非流式）
 pub const STREAM_STOP: &str = "__BIT_STREAM_STOP__";
 
+/// 流式 token 种类：Text = 正文增量，Think = 思考过程增量（reasoning/thinking）
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TokenKind {
+    Text,
+    Think,
+}
+
 /// 流式对话：on_token 回调返回 false 表示调用方要求立即停止（如会话中断）。
 /// 返回 (完整文本, token 用量)
-pub async fn chat_stream_with_images<F: FnMut(&str) -> bool>(
+pub async fn chat_stream_with_images<F: FnMut(TokenKind, &str) -> bool>(
     ctx: &Arc<crate::state::Ctx>,
     messages: &[ChatMessage],
     images: &[String],
@@ -231,7 +241,7 @@ pub async fn chat_stream_with_images<F: FnMut(&str) -> bool>(
                 "claude" => chat_claude(&client, &p, messages, images, &params).await,
                 _ => chat_openai(&client, &p, messages, images, &params).await,
             }?;
-            on_token(&full);
+            on_token(TokenKind::Text, &full);
             Ok((full, usage))
         }
     }
@@ -389,7 +399,7 @@ fn gemini_contents(messages: &[ChatMessage], images: &[String]) -> (String, Vec<
 }
 
 /// OpenAI 流式：/chat/completions stream=true
-async fn stream_openai<F: FnMut(&str) -> bool>(
+async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
@@ -432,6 +442,19 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
                     finish = f.to_string();
                 }
             }
+            // 思考过程增量（DeepSeek R1 reasoning_content / OpenRouter reasoning）：先于正文，不混入回复
+            if let Some(think) = v
+                .pointer("/choices/0/delta/reasoning_content")
+                .or_else(|| v.pointer("/choices/0/delta/reasoning"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+            {
+                if !on_token(TokenKind::Think, &think) {
+                    stopped = true;
+                    return true;
+                }
+            }
             if let Some(delta) = v
                 .pointer("/choices/0/delta/content")
                 .and_then(|x| x.as_str())
@@ -441,7 +464,7 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
             {
                 full.push_str(&delta);
                 // 回调返回 false = 调用方中止（中断会话）：停止读取 SSE
-                if !on_token(&delta) {
+                if !on_token(TokenKind::Text, &delta) {
                     stopped = true;
                     return true;
                 }
@@ -470,7 +493,7 @@ async fn stream_openai<F: FnMut(&str) -> bool>(
 }
 
 /// Claude 流式：/v1/messages stream=true（content_block_delta）
-async fn stream_claude<F: FnMut(&str) -> bool>(
+async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
@@ -512,6 +535,21 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
                     usage.completion_tokens = n;
                 }
             } else if t == "content_block_delta" {
+                // thinking_delta：思考过程增量（开思考时先于正文块），不混入回复
+                if v.pointer("/delta/type").and_then(|x| x.as_str()) == Some("thinking_delta") {
+                    if let Some(think) = v
+                        .pointer("/delta/thinking")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                    {
+                        if !on_token(TokenKind::Think, &think) {
+                            stopped = true;
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 if let Some(delta) = v
                     .pointer("/delta/text")
                     .and_then(|x| x.as_str())
@@ -520,7 +558,7 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
                     .or_else(|| fuzzy_text(&v))
                 {
                     full.push_str(&delta);
-                    if !on_token(&delta) {
+                    if !on_token(TokenKind::Text, &delta) {
                         stopped = true;
                         return true;
                     }
@@ -542,7 +580,7 @@ async fn stream_claude<F: FnMut(&str) -> bool>(
 }
 
 /// Gemini 流式：streamGenerateContent?alt=sse
-async fn stream_gemini<F: FnMut(&str) -> bool>(
+async fn stream_gemini<F: FnMut(TokenKind, &str) -> bool>(
     client: &reqwest::Client,
     p: &Provider,
     messages: &[ChatMessage],
@@ -577,15 +615,29 @@ async fn stream_gemini<F: FnMut(&str) -> bool>(
             if v.get("usageMetadata").is_some() {
                 usage = usage_from_gemini(&v);
             }
-            if let Some(delta) = v
-                .pointer("/candidates/0/content/parts/0/text")
-                .and_then(|x| x.as_str())
-                .map(String::from)
-                // 模糊回退：文本被拆进多个 parts（严格路径只取 parts/0 会丢内容）等变体
-                .or_else(|| fuzzy_text(&v))
-            {
+            if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(|x| x.as_array()) {
+                // thought=true 的 part 是思考过程（先于正文），其余为正文
+                for part in parts {
+                    let Some(text) = part.get("text").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) else {
+                        continue;
+                    };
+                    if part.get("thought").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        if !on_token(TokenKind::Think, text) {
+                            stopped = true;
+                            return true;
+                        }
+                    } else {
+                        full.push_str(text);
+                        if !on_token(TokenKind::Text, text) {
+                            stopped = true;
+                            return true;
+                        }
+                    }
+                }
+            } else if let Some(delta) = fuzzy_text(&v) {
+                // 模糊回退：非标准结构（文本被拆进多 part 等变体）
                 full.push_str(&delta);
-                if !on_token(&delta) {
+                if !on_token(TokenKind::Text, &delta) {
                     stopped = true;
                     return true;
                 }
@@ -1151,6 +1203,8 @@ fn usage_from_gemini(v: &serde_json::Value) -> TokenUsage {
 #[derive(Debug)]
 pub struct NativeRound {
     pub content: String,
+    /// 思考过程（reasoning/thinking），可能为空
+    pub thinking: String,
     pub calls: Vec<NativeToolCall>,
     pub usage: TokenUsage,
 }
@@ -1416,7 +1470,14 @@ async fn native_round_openai(
             content = t;
         }
     }
-    Ok(NativeRound { content, calls, usage: usage_from_openai(&value) })
+    // 思考过程：reasoning_content（DeepSeek R1）/ reasoning（OpenRouter 变体）
+    let thinking = value
+        .pointer("/choices/0/message/reasoning_content")
+        .or_else(|| value.pointer("/choices/0/message/reasoning"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(NativeRound { content, thinking, calls, usage: usage_from_openai(&value) })
 }
 
 async fn native_round_claude(
@@ -1487,6 +1548,7 @@ async fn native_round_claude(
         .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
     let value = read_json_native(resp).await?;
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut calls = Vec::new();
     if let Some(arr) = value.get("content").and_then(|v| v.as_array()) {
         for b in arr {
@@ -1494,6 +1556,12 @@ async fn native_round_claude(
                 Some("text") => {
                     if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
                         content.push_str(t);
+                    }
+                }
+                // thinking 块：思考过程，不混入正文
+                Some("thinking") => {
+                    if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
+                        thinking.push_str(t);
                     }
                 }
                 Some("tool_use") => {
@@ -1524,7 +1592,7 @@ async fn native_round_claude(
             content = t;
         }
     }
-    Ok(NativeRound { content, calls, usage: usage_from_claude(&value) })
+    Ok(NativeRound { content, thinking, calls, usage: usage_from_claude(&value) })
 }
 
 async fn native_round_gemini(
@@ -1598,6 +1666,7 @@ async fn native_round_gemini(
         .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
     let value = read_json_native(resp).await?;
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut calls = Vec::new();
     if let Some(parts) = value
         .pointer("/candidates/0/content/parts")
@@ -1605,7 +1674,12 @@ async fn native_round_gemini(
     {
         for part in parts {
             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                content.push_str(t);
+                // thought=true 的 part 是思考过程，不混入正文
+                if part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    thinking.push_str(t);
+                } else {
+                    content.push_str(t);
+                }
             }
             if let Some(fc) = part.get("functionCall") {
                 let name = fc
@@ -1629,7 +1703,7 @@ async fn native_round_gemini(
             content = t;
         }
     }
-    Ok(NativeRound { content, calls, usage: usage_from_gemini(&value) })
+    Ok(NativeRound { content, thinking, calls, usage: usage_from_gemini(&value) })
 }
 
 #[cfg(test)]
@@ -1859,7 +1933,7 @@ mod native_tests {
         let (full, usage) = stream_openai(
             &client, &p,
             &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
-            &mut |t| { tokens.push(t.to_string()); true },
+            &mut |_kind, t| { tokens.push(t.to_string()); true },
         )
         .await
         .unwrap();
@@ -1868,6 +1942,55 @@ mod native_tests {
         // 模拟端点未携带 usage 字段：用量应保持为 0（不计入命中率统计）
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn test_stream_openai_thinking() {
+        // 思考过程提取：reasoning_content 增量 → TokenKind::Think（不混入正文），content 增量 → TokenKind::Text
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tauri::async_runtime::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            let frames = [
+                json!({"choices":[{"delta":{"reasoning_content":"思"}}]}).to_string(),
+                json!({"choices":[{"delta":{"reasoning_content":"考"}}]}).to_string(),
+                json!({"choices":[{"delta":{"content":"答"}}]}).to_string(),
+            ];
+            for f in &frames {
+                let ev = format!("data: {f}\n\n");
+                let _ = sock.write_all(format!("{:x}\r\n{}\r\n", ev.len(), ev).as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+            let done = "data: [DONE]\n\n";
+            let _ = sock.write_all(format!("{:x}\r\n{}\r\n", done.len(), done).as_bytes()).await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        let p = test_provider("openai", &format!("http://{addr}"));
+        let client = reqwest::Client::new();
+        let mut got: Vec<(TokenKind, String)> = Vec::new();
+        let (full, _) = stream_openai(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |kind, t| { got.push((kind, t.to_string())); true },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (TokenKind::Think, "思".to_string()),
+                (TokenKind::Think, "考".to_string()),
+                (TokenKind::Text, "答".to_string()),
+            ],
+            "思考与正文应按 TokenKind 分流"
+        );
+        assert_eq!(full, "答", "完整正文不应混入思考内容");
     }
 
     #[tokio::test]
@@ -1881,7 +2004,7 @@ mod native_tests {
         let r = stream_openai(
             &client, &p,
             &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
-            &mut |_t| { n += 1; n < 2 },
+            &mut |_kind, _t| { n += 1; n < 2 },
         )
         .await;
         assert!(matches!(r, Err(ref e) if e == STREAM_STOP), "应为 STREAM_STOP: {r:?}");
@@ -1902,7 +2025,7 @@ mod native_tests {
         let (full, _) = stream_openai(
             &client, &p,
             &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
-            &mut |_| true,
+            &mut |_kind, _t| true,
         )
         .await
         .unwrap();

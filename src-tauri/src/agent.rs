@@ -52,6 +52,12 @@ fn history_window<'a>(msgs: &'a [ChatMessage]) -> &'a [ChatMessage] {
     &msgs[skip..]
 }
 
+/// 思考过程非空才随消息落库（None 序列化时跳过，兼容旧数据）
+fn opt_thinking(t: &std::sync::Mutex<String>) -> Option<String> {
+    let s = t.lock().unwrap().trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 /// 累计本会话 token 用量，返回带命中率的 usage 事件负载
 fn record_and_payload(ctx: &Arc<Ctx>, session: &str, usage: &ai::TokenUsage) -> serde_json::Value {
     let stats = crate::state::record_usage(ctx, session, usage);
@@ -376,7 +382,7 @@ pub async fn chat_turn(
         let mut v = vec![ChatMessage::system(sys)];
         // 只取最近若干条，且剥离 tool_calls（模型请求只需 role/content）
         for m in history_window(&sess.messages) {
-            v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
+            v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None });
         }
         v
     };
@@ -395,6 +401,7 @@ pub async fn chat_turn(
         let round_images: &[String] = if round == 1 { &images } else { &pending_images };
 
         // 拿到本轮回复：原生 function calling 优先，未探测过/已支持时尝试；失败降级文本约定
+        let round_thinking = Arc::new(std::sync::Mutex::new(String::new()));
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
             // select! 让整段生成的原生请求也能被中断即时打断（150ms 内）
             let attempt = tokio::select! {
@@ -408,6 +415,7 @@ pub async fn chat_turn(
             match attempt {
                 Ok(r) => {
                     ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    *round_thinking.lock().unwrap() = r.thinking;
                     // 记录本轮用量并推送缓存命中率统计
                     let payload = record_and_payload(ctx, &target, &r.usage);
                     let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
@@ -438,7 +446,15 @@ pub async fn chat_turn(
             }
         } else {
             // 文本协议统一走 SSE 流式（与桌面端一致）：非流式请求会被仅支持流式的端点拒绝
-            let (reply, usage) = ai::chat_stream_with_images(ctx, &convo, round_images, |_| true).await?;
+            // 思考过程增量（reasoning/thinking）累积进 round_thinking，随消息落库
+            let think_buf = round_thinking.clone();
+            let (reply, usage) = ai::chat_stream_with_images(ctx, &convo, round_images, move |kind, tok| {
+                if kind == ai::TokenKind::Think {
+                    think_buf.lock().unwrap().push_str(tok);
+                }
+                true
+            })
+            .await?;
             // 记录本轮用量并推送缓存命中率统计
             let payload = record_and_payload(ctx, &target, &usage);
             let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
@@ -497,6 +513,7 @@ pub async fn chat_turn(
             let visible = strip_tool_json(&strip_think_blocks(&reply));
             let mut msg = ChatMessage::assistant(visible);
             msg.tool_calls = records.clone();
+            msg.thinking = opt_thinking(&round_thinking);
             {
                 let mut store = ctx.sessions.lock().unwrap();
                 if let Some(sess) = store.get_mut(&target) {
@@ -537,9 +554,11 @@ pub async fn chat_turn(
         if !native_mode && looks_truncated(&reply) {
             let visible = strip_tool_json(&strip_think_blocks(&reply));
             if !visible.is_empty() {
+                let mut msg = ChatMessage::assistant(visible);
+                msg.thinking = opt_thinking(&round_thinking);
                 let mut store = ctx.sessions.lock().unwrap();
                 if let Some(sess) = store.get_mut(&target) {
-                    sess.messages.push(ChatMessage::assistant(visible));
+                    sess.messages.push(msg);
                     sess.touch();
                     if sess.messages.len() > CHAT_MAX {
                         let drop_n = sess.messages.len() - CHAT_MAX;
@@ -654,7 +673,7 @@ pub async fn chat_turn_stream(
         };
         let mut v = vec![ChatMessage::system(sys)];
         for m in history_window(&sess.messages) {
-            v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
+            v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None });
         }
         v
     };
@@ -674,6 +693,8 @@ pub async fn chat_turn_stream(
         }
         // 流式获取本轮回复，逐 token 推给前端
         emit(json!({ "type": "round_start" }));
+        // 思考过程缓冲（reasoning/thinking）：流式增量实时推送 + 结束后随消息落库，每轮重置
+        let round_thinking = Arc::new(std::sync::Mutex::new(String::new()));
         // 图片只在第一轮随请求发送；view_image 看过的图从第二轮起随请求注入
         let round_images: &[String] = if round == 1 { &images } else { &pending_images };
 
@@ -693,6 +714,7 @@ pub async fn chat_turn_stream(
             match attempt {
                 Ok(r) => {
                     ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    *round_thinking.lock().unwrap() = r.thinking;
                     // 记录本轮用量并随流式通道推送缓存命中率统计
                     let mut payload = record_and_payload(ctx, &target, &r.usage);
                     payload["type"] = json!("usage");
@@ -731,12 +753,20 @@ pub async fn chat_turn_stream(
                 let emit_ref = &emit;
                 let sc = stream_cancelled.clone();
                 let iflag2 = iflag.clone();
-                ai::chat_stream_with_images(ctx, &convo, round_images, move |tok| {
+                let think_buf = round_thinking.clone();
+                ai::chat_stream_with_images(ctx, &convo, round_images, move |kind, tok| {
                     if iflag2.load(Ordering::Relaxed) {
                         sc.store(true, Ordering::Relaxed);
                         return false;
                     }
-                    emit_ref(json!({ "type": "delta", "text": tok }));
+                    match kind {
+                        // 思考过程增量：实时推给前端展示 + 累积缓冲（结束后随消息落库）
+                        ai::TokenKind::Think => {
+                            think_buf.lock().unwrap().push_str(tok);
+                            emit_ref(json!({ "type": "think", "text": tok }));
+                        }
+                        ai::TokenKind::Text => emit_ref(json!({ "type": "delta", "text": tok })),
+                    }
                     true
                 })
                 .await
@@ -766,7 +796,11 @@ pub async fn chat_turn_stream(
             (reply, calls)
         };
 
-        // 原生模式下没有逐 token 流式：一次性下发本轮文本（工具轮由 tools 事件接管渲染）
+        // 原生模式下没有逐 token 流式：思考过程与文本一次性下发
+        let native_thinking = round_thinking.lock().unwrap().clone();
+        if native_mode && !native_thinking.is_empty() {
+            emit(json!({ "type": "think", "text": native_thinking }));
+        }
         if native_mode && !reply.is_empty() {
             emit(json!({ "type": "delta", "text": &reply }));
         }
@@ -820,6 +854,7 @@ pub async fn chat_turn_stream(
             let visible = strip_tool_json(&strip_think_blocks(&reply));
             let mut msg = ChatMessage::assistant(visible.clone());
             msg.tool_calls = records.clone();
+            msg.thinking = opt_thinking(&round_thinking);
             {
                 let mut store = ctx.sessions.lock().unwrap();
                 if let Some(sess) = store.get_mut(&target) {
@@ -862,9 +897,11 @@ pub async fn chat_turn_stream(
         if !native_mode && looks_truncated(&reply) {
             let visible = strip_tool_json(&strip_think_blocks(&reply));
             if !visible.is_empty() {
+                let mut msg = ChatMessage::assistant(visible.clone());
+                msg.thinking = opt_thinking(&round_thinking);
                 let mut store = ctx.sessions.lock().unwrap();
                 if let Some(sess) = store.get_mut(&target) {
-                    sess.messages.push(ChatMessage::assistant(visible.clone()));
+                    sess.messages.push(msg);
                     sess.touch();
                     if sess.messages.len() > CHAT_MAX {
                         let drop_n = sess.messages.len() - CHAT_MAX;
@@ -884,9 +921,11 @@ pub async fn chat_turn_stream(
         let visible = strip_tool_json(&strip_think_blocks(&reply));
         let visible = if visible.is_empty() { reply.clone() } else { visible };
         {
+            let mut msg = ChatMessage::assistant(visible);
+            msg.thinking = opt_thinking(&round_thinking);
             let mut store = ctx.sessions.lock().unwrap();
             if let Some(sess) = store.get_mut(&target) {
-                sess.messages.push(ChatMessage::assistant(visible));
+                sess.messages.push(msg);
                 sess.touch();
                 if sess.messages.len() > CHAT_MAX {
                     let drop_n = sess.messages.len() - CHAT_MAX;
@@ -928,7 +967,7 @@ pub fn build_context(
         .ok_or("会话不存在")?;
     let mut v = vec![ChatMessage::system(ai::system_prompt(ctx, Some(&target)))];
     for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
-        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new() });
+        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None });
     }
     Ok((v, ai::tools_manifest(ctx)))
 }

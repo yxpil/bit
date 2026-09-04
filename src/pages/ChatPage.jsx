@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "../api.js";
-import { useLang } from "../i18n.js";
+import { useLang, t } from "../i18n.js";
 import {
   IconSend,
   IconTrash,
@@ -411,7 +411,7 @@ export default function ChatPage({ onStats, visible }) {
     if (runningRef.current.has(sid)) return; // 重入保护：同一会话绝不并发两个任务
     runningRef.current.add(sid);
     setBusyMap((m) => ({ ...m, [sid]: true }));
-    setLiveMap((m) => ({ ...m, [sid]: m[sid] || { text: "", cards: [] } }));
+    setLiveMap((m) => ({ ...m, [sid]: m[sid] || { text: "", think: "", cards: [] } }));
     // 结束时移除该会话的运行/流式状态
     const endLive = () =>
       setLiveMap((m) => {
@@ -424,13 +424,20 @@ export default function ChatPage({ onStats, visible }) {
         if (!ev || typeof ev !== "object") return;
         switch (ev.type) {
           case "round_start":
-            // 新一轮开始：清空本轮实时文本，保留此前已完成轮次的工具卡片
-            setLiveMap((m) => ({ ...m, [sid]: { text: "", cards: m[sid]?.cards || [] } }));
+            // 新一轮开始：清空本轮实时文本与思考过程，保留此前已完成轮次的工具卡片
+            setLiveMap((m) => ({ ...m, [sid]: { text: "", think: "", cards: m[sid]?.cards || [] } }));
+            break;
+          case "think":
+            // 思考过程增量（reasoning/thinking）：实时展示
+            setLiveMap((m) => ({
+              ...m,
+              [sid]: { text: m[sid]?.text || "", think: (m[sid]?.think || "") + (ev.text || ""), cards: m[sid]?.cards || [] },
+            }));
             break;
           case "delta":
             setLiveMap((m) => ({
               ...m,
-              [sid]: { text: (m[sid]?.text || "") + (ev.text || ""), cards: m[sid]?.cards || [] },
+              [sid]: { text: (m[sid]?.text || "") + (ev.text || ""), think: m[sid]?.think || "", cards: m[sid]?.cards || [] },
             }));
             break;
           case "tools":
@@ -439,13 +446,14 @@ export default function ChatPage({ onStats, visible }) {
               ...m,
               [sid]: {
                 text: "",
+                think: "",
                 cards: [...(m[sid]?.cards || []), { visible: ev.visible || "", calls: ev.calls || [] }],
               },
             }));
             break;
           case "continue":
             // 后端检测到回复被截断，自动续发「继续」：用清洗后的片段替换原始流式文本
-            setLiveMap((m) => ({ ...m, [sid]: { text: ev.visible || "", cards: m[sid]?.cards || [] } }));
+            setLiveMap((m) => ({ ...m, [sid]: { text: ev.visible || "", think: m[sid]?.think || "", cards: m[sid]?.cards || [] } }));
             break;
           case "usage":
             // 本轮 token 用量与缓存命中率（会话累计）
@@ -743,6 +751,8 @@ export default function ChatPage({ onStats, visible }) {
                     </div>
                   );
                 })}
+                {/* 本轮思考过程实时展示（默认展开，流式中） */}
+                {live.think && live.think.trim() && <ThinkPanel text={live.think} openDefault streaming />}
                 {live.text ? (
                   <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
                     <Markdown>{live.text}</Markdown>
@@ -1238,6 +1248,30 @@ function CopyBtn({ text }) {
   );
 }
 
+// 思考过程折叠面板：流式期间默认展开（openDefault），历史消息默认折叠
+function ThinkPanel({ text, openDefault = false, streaming = false }) {
+  const [open, setOpen] = useState(openDefault);
+  if (!text || !text.trim()) return null;
+  return (
+    <div className="w-full overflow-hidden rounded-2xl border border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1 px-3 py-1.5 text-left text-xs text-neutral-500 dark:text-neutral-400"
+      >
+        <span className={`inline-block transition-transform ${open ? "rotate-90" : ""}`}>›</span>
+        {streaming ? t("chat.thinking") : t("chat.thinkLabel")}
+        {streaming && <span className="h-1 w-1 animate-pulse rounded-full bg-neutral-500" />}
+      </button>
+      {open && (
+        <div className="max-h-56 overflow-y-auto whitespace-pre-wrap border-t border-neutral-200 px-3 py-2 text-xs leading-relaxed text-neutral-500 dark:border-neutral-800 dark:text-neutral-400">
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // 单条消息气泡：user / assistant，assistant 可携带工具调用卡片
 // send_file 成功的调用渲染为文件卡片（如同收文件），不出工具卡
 function MessageBubble({ message }) {
@@ -1279,6 +1313,7 @@ function MessageBubble({ message }) {
           ))}
         </div>
       )}
+      {message.thinking && message.thinking.trim() && <ThinkPanel text={message.thinking} />}
       {hasText && (
         <div className="group flex flex-col gap-0.5">
           <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">

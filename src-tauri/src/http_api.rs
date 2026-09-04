@@ -892,8 +892,12 @@ async fn openai_chat_completions(
             // 首个 chunk 带 role
             send_chunk(json!({ "role": "assistant" }), None);
 
-            let result = crate::ai::chat_stream_with_images(&ctx2, &messages, &images, |tok| {
-                send_chunk(json!({ "content": tok }), None);
+            let result = crate::ai::chat_stream_with_images(&ctx2, &messages, &images, |kind, tok| {
+                // 思考过程按 OpenAI 兼容约定转发为 reasoning_content 增量，正文为 content
+                match kind {
+                    crate::ai::TokenKind::Think => send_chunk(json!({ "reasoning_content": tok }), None),
+                    crate::ai::TokenKind::Text => send_chunk(json!({ "content": tok }), None),
+                }
                 true
             })
             .await;

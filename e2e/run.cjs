@@ -88,6 +88,13 @@ function getStatus(path, headers) {
 }
 
 const results = [];
+// 保护真实 ai_config.json：备份 → 进程退出时恢复（含失败路径），杜绝 E2E 污染日常使用的提供方配置
+const AI_CFG = os.homedir() + "/Library/Application Support/com.bit.hub/ai_config.json";
+const AI_CFG_BACKUP = fs.existsSync(AI_CFG) ? fs.readFileSync(AI_CFG) : null;
+process.on("exit", () => {
+  if (AI_CFG_BACKUP === null) return;
+  try { fs.writeFileSync(AI_CFG, AI_CFG_BACKUP); console.log("(ai_config.json restored)"); } catch {}
+});
 function record(name, ok, detail) {
   results.push({ name, ok, detail });
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}  ${ok ? "" : "| " + detail}`);
