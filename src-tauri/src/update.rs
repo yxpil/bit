@@ -134,6 +134,16 @@ pub fn pick_asset(latest: &serde_json::Value) -> Option<(String, String)> {
     }
     // 回退：按 CI 发布资产的命名规则构造直链
     let v = latest.get("version").and_then(|x| x.as_str())?;
+    // 版本号只允许 数字+点（清单数据不可信，防止 "1.2/../../x" 之类路径注入）
+    if v.is_empty()
+        || !v
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
+        || v.contains("..")
+        || v.starts_with('.')
+    {
+        return None;
+    }
     let name = match key {
         "windows-x64" => format!("BIT_{v}_x64-setup.exe"),
         "windows-arm64" => format!("BIT_{v}_aarch64-setup.exe"),
