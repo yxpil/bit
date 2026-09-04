@@ -1,5 +1,7 @@
 # BIT — Agent Tool Hub
 
+简体中文 | [English](README_EN.md)
+
 [![Release](https://img.shields.io/github/v/release/yxpil/bit?style=flat-square&label=%E7%89%88%E6%9C%AC)](https://github.com/yxpil/bit/releases/latest) [![下载](https://img.shields.io/github/downloads/yxpil/bit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD)](https://github.com/yxpil/bit/releases) [![License](https://img.shields.io/github/license/yxpil/bit?style=flat-square)](https://github.com/yxpil/bit/blob/main/LICENSE) [![CI](https://img.shields.io/github/actions/workflow/status/yxpil/bit/release.yml?style=flat-square&branch=main&label=CI)](https://github.com/yxpil/bit/actions) [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20%E9%BE%99%E8%8A%AF%20%C2%B7%20RISC--V-black?style=flat-square)](https://osbt.space) [![官网](https://img.shields.io/website?up_message=osbt.space&down_message=%E7%A6%BB%E7%BA%BF&style=flat-square&url=https%3A%2F%2Fosbt.space)](https://osbt.space) [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-%E7%82%B9%E5%87%BB%E5%8A%A0%E5%85%A5-black?style=flat-square)](https://qm.qq.com/q/qlFr8ct0ps)
 
 BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、可远程访问的 AI Agent 工具中枢。你可以配置任意 AI 提供方，与模型进行流式对话，并让 AI 调用本机工具、自写脚本、沉淀记忆与技能。
@@ -49,7 +51,7 @@ ChromeOS 内置 Linux 开发环境（Debian 12 容器），BIT 的 Linux 安装�
 2. 在 Linux 终端安装（Intel/AMD 选 amd64，ARM 选 arm64）：
 
 ```bash
-sudo apt install ./BIT_0.4.9_amd64.deb
+sudo apt install ./BIT_0.5.6_amd64.deb
 ```
 
 依赖（libwebkit2gtk-4.1、libgtk-3、libayatana-appindicator3）会由 Debian 12 仓库自动补齐；安装后 BIT 出现在「Linux 应用」文件夹，窗口经 Wayland 显示，与原生 Linux 体验一致。
@@ -140,8 +142,8 @@ xattr -cr /Applications/BIT.app
 ### Linux 运行 AppImage
 
 ```bash
-chmod +x BIT_0.4.2_amd64.AppImage
-./BIT_0.4.2_amd64.AppImage
+chmod +x BIT_0.5.6_amd64.AppImage
+./BIT_0.5.6_amd64.AppImage
 ```
 
 ### 首次使用
@@ -165,7 +167,8 @@ src/               React 前端
   pages/           对话 / AI 设置 / 工具 / 技能 / 记忆 / 审计 / 远程
   components/      Markdown、工具卡片、图标等
 src-tauri/         Tauri (Rust) 后端
-  src/             ai、agent、registry、runtime、http_api、audit …
+  src/             ai、agent、mcp、registry、runtime、script_runtime、
+                   http_api、update、audit、session、goal、memory …
 installer/bit.iss  Inno Setup 打包脚本
 ```
 
