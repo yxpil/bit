@@ -2,7 +2,7 @@
 
 简体中文 | [English](README_EN.md)
 
-[![Release](https://img.shields.io/github/v/release/yxpil/OpenBit?style=flat-square&label=%E7%89%88%E6%9C%AC)](https://github.com/yxpil/OpenBit/releases/latest) [![下载](https://img.shields.io/github/downloads/yxpil/OpenBit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD)](https://github.com/yxpil/OpenBit/releases) [![License](https://img.shields.io/github/license/yxpil/OpenBit?style=flat-square)](https://github.com/yxpil/OpenBit/blob/main/LICENSE) [![CI](https://img.shields.io/github/actions/workflow/status/yxpil/OpenBit/release.yml?style=flat-square&branch=main&label=CI)](https://github.com/yxpil/OpenBit/actions) [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20%E9%BE%99%E8%8A%AF%20%C2%B7%20RISC--V-black?style=flat-square)](https://osbt.space) [![官网](https://img.shields.io/website?up_message=osbt.space&down_message=%E7%A6%BB%E7%BA%BF&style=flat-square&url=https%3A%2F%2Fosbt.space)](https://osbt.space) [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-%E7%82%B9%E5%87%BB%E5%8A%A0%E5%85%A5-black?style=flat-square)](https://qm.qq.com/q/qlFr8ct0ps)
+[![Release](https://img.shields.io/github/v/release/yxpil/bit?style=flat-square&label=%E7%89%88%E6%9C%AC)](https://github.com/yxpil/bit/releases/latest) [![下载](https://img.shields.io/github/downloads/yxpil/bit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD)](https://github.com/yxpil/bit/releases) [![License](https://img.shields.io/github/license/yxpil/bit?style=flat-square)](https://github.com/yxpil/bit/blob/main/LICENSE) [![CI](https://img.shields.io/github/actions/workflow/status/yxpil/bit/release.yml?style=flat-square&branch=main&label=CI)](https://github.com/yxpil/bit/actions) [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20%E9%BE%99%E8%8A%AF%20%C2%B7%20RISC--V-black?style=flat-square)](https://osbt.space) [![官网](https://img.shields.io/website?up_message=osbt.space&down_message=%E7%A6%BB%E7%BA%BF&style=flat-square&url=https%3A%2F%2Fosbt.space)](https://osbt.space) [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-%E7%82%B9%E5%87%BB%E5%8A%A0%E5%85%A5-black?style=flat-square)](https://qm.qq.com/q/qlFr8ct0ps)
 
 [![Homebrew](https://img.shields.io/badge/Homebrew-brew%20install%20--cask%20bit-black?style=flat-square)](https://github.com/yxpil/homebrew-bit) [![Scoop](https://img.shields.io/badge/Scoop-scoop%20install%20bit-black?style=flat-square)](https://github.com/yxpil/scoop-bit) [![npm](https://img.shields.io/badge/npm-bit--agent-black?style=flat-square)](https://www.npmjs.com/package/bit-agent) [![winget](https://img.shields.io/badge/winget-yxpil.bit-black?style=flat-square)](https://github.com/microsoft/winget-pkgs/pull/428288) [![APT](https://img.shields.io/badge/APT-yxpil%2Fapt--repo-black?style=flat-square)](https://yxpil.github.io/apt-repo) [![DNF](https://img.shields.io/badge/DNF-yxpil%2Fdnf--repo-black?style=flat-square)](https://yxpil.github.io/dnf-repo) [![pacman](https://img.shields.io/badge/pacman-yxpil%2Fpacman--repo-black?style=flat-square)](https://yxpil.github.io/pacman-repo)
 
@@ -53,7 +53,7 @@ BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、�
 
 ## 安装使用
 
-从 [Releases](https://github.com/yxpil/OpenBit/releases) 下载对应平台的安装包：
+从 [Releases](https://github.com/yxpil/bit/releases) 下载对应平台的安装包：
 
 | 平台 | 安装包 | 说明 |
 |---|---|---|
@@ -66,7 +66,7 @@ BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、�
 | 飞腾 / 鲲鹏 / 麒麟 ARM | `*_arm64.deb` / `*_arm64.AppImage` / `*_arm64.rpm` | 与 Linux ARM64 通用 |
 | 兆芯 / 海光 | `*_amd64.deb` / `*_amd64.AppImage` / `*_x86_64.rpm` | 与 Linux x64 通用 |
 
-> 全部支持的芯片架构与操作系统明细（含飞腾 / 鲲鹏 / 麒麟 / UOS / ChromeOS 矩阵）见 [Wiki：芯片与操作系统支持](https://github.com/yxpil/OpenBit/wiki/%E8%8A%AF%E7%89%87%E4%B8%8E%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E6%94%AF%E6%8C%81)。
+> 全部支持的芯片架构与操作系统明细（含飞腾 / 鲲鹏 / 麒麟 / UOS / ChromeOS 矩阵）见 [Wiki：芯片与操作系统支持](https://github.com/yxpil/bit/wiki/%E8%8A%AF%E7%89%87%E4%B8%8E%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F%E6%94%AF%E6%8C%81)。
 
 ### ChromeOS（Crostini）安装
 
@@ -87,7 +87,7 @@ sudo apt install ./BIT_0.5.8_amd64.deb
 macOS（Homebrew）：
 
 ```bash
-brew tap yxpil/OpenBit
+brew tap yxpil/bit
 brew install --cask bit
 ```
 
@@ -203,17 +203,17 @@ curl http://127.0.0.1:8600/v1/chat/completions \
   -d '{"model":"YOUR_MODEL","messages":[{"role":"user","content":"列出当前目录"}]}'
 ```
 
-详见 Wiki：[远程访问与 API](https://github.com/yxpil/OpenBit/wiki/远程访问与-API) · [MCP-集成](https://github.com/yxpil/OpenBit/wiki/MCP-集成)
+详见 Wiki：[远程访问与 API](https://github.com/yxpil/bit/wiki/远程访问与-API) · [MCP-集成](https://github.com/yxpil/bit/wiki/MCP-集成)
 
 ## 文档
 
-完整文档在 [Wiki](https://github.com/yxpil/OpenBit/wiki)（中英双语，每页顶部可切换语言）：
+完整文档在 [Wiki](https://github.com/yxpil/bit/wiki)（中英双语，每页顶部可切换语言）：
 
-- **使用**：[安装指南](https://github.com/yxpil/OpenBit/wiki/安装指南) · [芯片与操作系统支持](https://github.com/yxpil/OpenBit/wiki/芯片与操作系统支持) · [快速上手](https://github.com/yxpil/OpenBit/wiki/快速上手) · [对话功能](https://github.com/yxpil/OpenBit/wiki/对话功能) · [TUI-终端模式](https://github.com/yxpil/OpenBit/wiki/TUI-终端模式) · [FAQ](https://github.com/yxpil/OpenBit/wiki/FAQ)
-- **进阶**：[工具系统](https://github.com/yxpil/OpenBit/wiki/工具系统) · [MCP-集成](https://github.com/yxpil/OpenBit/wiki/MCP-集成) · [记忆与技能](https://github.com/yxpil/OpenBit/wiki/记忆与技能) · [远程访问与 API](https://github.com/yxpil/OpenBit/wiki/远程访问与-API) · [自动更新](https://github.com/yxpil/OpenBit/wiki/自动更新) · [审计日志](https://github.com/yxpil/OpenBit/wiki/审计日志)
-- **参与**：[开发与构建](https://github.com/yxpil/OpenBit/wiki/开发与构建)
+- **使用**：[安装指南](https://github.com/yxpil/bit/wiki/安装指南) · [芯片与操作系统支持](https://github.com/yxpil/bit/wiki/芯片与操作系统支持) · [快速上手](https://github.com/yxpil/bit/wiki/快速上手) · [对话功能](https://github.com/yxpil/bit/wiki/对话功能) · [TUI-终端模式](https://github.com/yxpil/bit/wiki/TUI-终端模式) · [FAQ](https://github.com/yxpil/bit/wiki/FAQ)
+- **进阶**：[工具系统](https://github.com/yxpil/bit/wiki/工具系统) · [MCP-集成](https://github.com/yxpil/bit/wiki/MCP-集成) · [记忆与技能](https://github.com/yxpil/bit/wiki/记忆与技能) · [远程访问与 API](https://github.com/yxpil/bit/wiki/远程访问与-API) · [自动更新](https://github.com/yxpil/bit/wiki/自动更新) · [审计日志](https://github.com/yxpil/bit/wiki/审计日志)
+- **参与**：[开发与构建](https://github.com/yxpil/bit/wiki/开发与构建)
 
-English wiki: [Home-EN](https://github.com/yxpil/OpenBit/wiki/Home-EN) — every page has a language switcher at the top.
+English wiki: [Home-EN](https://github.com/yxpil/bit/wiki/Home-EN) — every page has a language switcher at the top.
 
 在线站点：[osbt.space](https://osbt.space) · [文档](https://osbt.space/docs.html)
 
