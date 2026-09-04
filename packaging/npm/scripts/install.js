@@ -42,6 +42,16 @@ function download(url, dest) {
   });
 }
 
+// GitHub CDN 偶发断流（socket hang up / ECONNRESET），重试 3 次
+function downloadWithRetry(url, dest, attempts = 3) {
+  return download(url, dest).catch((e) => {
+    if (attempts <= 1) throw e;
+    console.log(`[bit-agent] 下载失败（${e.message}），重试...`);
+    fs.rmSync(dest, { force: true });
+    return downloadWithRetry(url, dest, attempts - 1);
+  });
+}
+
 async function main() {
   const asset = assetFor();
   if (!asset) {
@@ -61,7 +71,7 @@ async function main() {
   }
   const tmp = path.join(HOME, asset.file);
   console.log(`[bit-agent] 下载 ${asset.file} ...`);
-  await download(`${BASE}/${asset.file}`, tmp);
+  await downloadWithRetry(`${BASE}/${asset.file}`, tmp);
 
   let binary;
   if (asset.kind === "dmg") {

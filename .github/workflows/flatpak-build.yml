@@ -60,9 +60,10 @@ jobs:
         run: npm install --cache .npm-flatpak-cache --no-audit --no-fund
 
       - name: 构建 Flatpak
-        # --share=network：flatpak-builder 沙盒默认断网（DNS 不可达），
+        # 沙盒联网在 manifest 的 bit 模块 build-options.build-args 加 --share=network
+        # （flatpak-builder CLI 无此选项；build-args 透传给底层 flatpak build），
         # cargo 拉 crates.io 必须联网；npm 已走离线缓存不依赖网络
-        run: flatpak-builder --user --force-clean --share=network --repo=repo build-dir packaging/flatpak/space.osbt.bit.yml
+        run: flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/space.osbt.bit.yml
 
       - name: 导出 bundle
         run: |

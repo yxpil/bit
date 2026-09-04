@@ -59,6 +59,10 @@ modules:
       append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node22/bin
       env:
         npm_config_yes: 'true'
+      # flatpak-builder 构建沙盒默认断网；build-args 透传给底层 flatpak build，
+      # cargo 拉 crates.io 必须联网（npm install --offline 走预烘焙缓存，不受影响）
+      build-args:
+        - --share=network
     build-commands:
       # 沙盒内直接访问 registry 会黑洞（Exit handler never called）：
       # 用宿主机预热的缓存目录做 --offline 安装，零网络、失败快速可见
