@@ -6,6 +6,8 @@
 
 BIT is a desktop app built on **Tauri 2 + React 18**: an auditable, remotely accessible AI Agent tool hub. Configure any AI provider, chat with models over streaming, and let the AI call local tools, write its own scripts, and accumulate memory and skills.
 
+**BIT is free forever**: fully open source (Apache-2.0), every feature free for individuals and businesses — no in-app purchases, no subscriptions, no locked features, no telemetry; build it yourself from source anytime.
+
 > Frameless custom title bar · Dark/light themes · Minimal black-and-white design · [QQ group](https://qm.qq.com/q/qlFr8ct0ps)
 
 ## Table of Contents
@@ -245,4 +247,4 @@ installer/bit.iss  Inno Setup packaging script
 
 ## License
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](LICENSE) — **BIT is free forever**: all features with no in-app purchases, no subscriptions, and no locked features, free for personal and commercial use.

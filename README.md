@@ -6,6 +6,8 @@
 
 BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、可远程访问的 AI Agent 工具中枢。你可以配置任意 AI 提供方，与模型进行流式对话，并让 AI 调用本机工具、自写脚本、沉淀记忆与技能。
 
+**BIT 永久免费**：完全开源（Apache-2.0），所有功能对个人与商业用户永久免费——无内购、无订阅、无功能锁、无遥测，可随时自行编译。
+
 > 无边框自定义标题栏 · 深/浅色主题 · 黑白线性设计 · [QQ 交流群](https://qm.qq.com/q/qlFr8ct0ps)
 
 ## 目录
@@ -245,4 +247,4 @@ installer/bit.iss  Inno Setup 打包脚本
 
 ## 许可
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](LICENSE) — **BIT 永久免费**：所有功能无内购、无订阅、无功能锁，个人与商业使用均免费。
