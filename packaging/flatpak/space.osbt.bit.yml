@@ -1,7 +1,9 @@
 app-id: space.osbt.bit
-runtime: org.freedesktop.Platform
-runtime-version: '24.08'
-sdk: org.freedesktop.Sdk
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+# GNOME SDK（基于 freedesktop 24.08）自带 webkit2gtk-4.1 / javascriptcoregtk-4.1
+# 与 vala；freedesktop 原生 SDK 不含 webkit，Tauri 无法在其上编译
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.node22
@@ -22,20 +24,6 @@ finish-args:
   - --filesystem=home
   - --socket=pulseaudio
 modules:
-  # Vala 编译器：ayatana-ido 的 CMake 构建依赖（freedesktop 24.08 SDK 未含）。
-  # 必须 ≥0.56.19：旧版 vapigen 无法解析 g-ir 1.86 生成的 <doc:format> 标签（Do not error-out on doc:format）
-  - name: vala
-    buildsystem: simple
-    build-commands:
-      - ./configure --prefix=/app --disable-valadoc
-      - make -j$(nproc)
-      - make install
-    cleanup:
-      - "*"
-    sources:
-      - type: archive
-        url: https://download.gnome.org/sources/vala/0.56/vala-0.56.19.tar.xz
-        sha256: 5ad7cbbfcc0de61b403d6797c9ef60455bfbebd8e162aec33b5b0b097adfb9d5
   # libayatana-ido：ayatana-indicator 的缺失上游依赖（共享模块链未包含，runtime 亦无）
   - name: ayatana-ido
     buildsystem: cmake-ninja

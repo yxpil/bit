@@ -23,10 +23,10 @@ jobs:
           sudo apt-get install -y -qq flatpak flatpak-builder
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y --noninteractive \
-            org.freedesktop.Platform//24.08 \
-            org.freedesktop.Sdk//24.08 \
-            org.freedesktop.Sdk.Extension.rust-stable//24.08 \
-            org.freedesktop.Sdk.Extension.node22//24.08
+            org.gnome.Platform//48 \
+            org.gnome.Sdk//48 \
+            org.freedesktop.Sdk.Extension.rust-stable//48 \
+            org.freedesktop.Sdk.Extension.node22//48
 
       - name: 拉取 Flathub 共享模块（manifest include 相对路径所需）
         run: git clone --depth 1 https://github.com/flathub/shared-modules.git packaging/flatpak/shared-modules
