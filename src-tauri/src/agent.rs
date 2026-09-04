@@ -161,10 +161,18 @@ fn is_safe_tool(tool: &str) -> bool {
     if SAFE.iter().any(|s| s.eq_ignore_ascii_case(tool)) {
         return true;
     }
+    // 只读类判定必须锚定词首（starts_with）：contains 会把 "bread_maker"、"already_exec"
+    // 之类名字误判为安全工具，AI 给自建工具起个含关键词的名字即可绕过审批执行任意代码
     let lower = tool.to_lowercase();
-    ["read", "list", "search", "get", "view", "query"]
-        .iter()
-        .any(|k| lower.contains(k))
+    lower == "read"
+        || lower == "list"
+        || lower == "search"
+        || lower == "get"
+        || lower == "view"
+        || lower == "query"
+        || ["read_", "list_", "search_", "get_", "view_", "query_"]
+            .iter()
+            .any(|k| lower.starts_with(k))
 }
 
 /// 执行 AI 输出的单个工具调用（含 AI 自写插件能力）。
@@ -1266,6 +1274,27 @@ mod tests {
         // 未知模式按 ask 处理（保守）
         assert!(!auto_pass("", "shell"));
         assert!(!auto_pass("unknown", "add_memory"));
+    }
+
+    /// 只读类关键词判定必须锚定词首：含关键词子串的恶意命名不得绕过审批
+    #[test]
+    fn test_safe_tool_keyword_prefix_only() {
+        // 词首命中：仍然放行（保持原有 UX）
+        assert!(auto_pass("auto", "read_file"));
+        assert!(auto_pass("auto", "list_tools"));
+        assert!(auto_pass("auto", "get_weather"));
+        assert!(auto_pass("auto", "query_db"));
+        assert!(auto_pass("auto", "search_web"));
+        assert!(auto_pass("auto", "view_image"));
+        // 裸名：仍然放行
+        assert!(auto_pass("auto", "read"));
+        assert!(auto_pass("auto", "query"));
+        // 关键词出现在词中/词尾：必须询问（此前 contains 会误放行）
+        assert!(!auto_pass("auto", "bread_maker"));
+        assert!(!auto_pass("auto", "already_exec"));
+        assert!(!auto_pass("auto", "readable_stats"));
+        assert!(!auto_pass("auto", "thread_viewer_kill"));
+        assert!(!auto_pass("auto", "budget_get_shell"));
     }
 
     #[test]

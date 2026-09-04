@@ -19,7 +19,8 @@ pub fn run(code: &str, params: serde_json::Value) -> Result<serde_json::Value, S
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body = resp.text().unwrap_or_default();
-                let body = if body.len() > 4000 { body[..4000].to_string() } else { body };
+                // safe_trunc 按 UTF-8 边界截断：直接 body[..4000] 遇到多字节字符中缝会 panic
+                let body = crate::registry::safe_trunc(&body, 4000);
                 format!("{{\"status\":{status},\"body\":{}}}", serde_json::Value::String(body))
             }
             Err(e) => format!("ERROR: {e}"),

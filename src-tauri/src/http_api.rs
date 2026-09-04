@@ -384,7 +384,7 @@ fn check_auth(
     if cfg.client_key.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    if bearer != cfg.client_key && qkey != cfg.client_key {
+    if !cfg.verify_client_key(bearer) && !cfg.verify_client_key(qkey) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let openai_endpoint = path.starts_with("/v1/");
@@ -421,7 +421,7 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
 
     if let Err(status) = check_auth(&cfg, &path, &provided, &qkey, access_password) {
         if status == StatusCode::UNAUTHORIZED {
-            let reason = if provided != cfg.client_key && qkey != cfg.client_key {
+            let reason = if !cfg.verify_client_key(&provided) && !cfg.verify_client_key(&qkey) {
                 "client_key"
             } else {
                 "access_password"

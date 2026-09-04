@@ -97,22 +97,30 @@ impl Config {
             return true;
         }
         match &self.access_password {
-            Some(expected) => {
-                // 常数时间比较，避免时序侧信道
-                let a = provided.as_bytes();
-                let b = expected.as_bytes();
-                if a.len() != b.len() {
-                    return false;
-                }
-                a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-            }
+            Some(expected) => ct_eq(provided.as_bytes(), expected.as_bytes()),
             None => false,
         }
+    }
+
+    /// 校验 Client Key（常数时间比较，避免时序侧信道）
+    pub fn verify_client_key(&self, provided: &str) -> bool {
+        if self.client_key.is_empty() {
+            return false;
+        }
+        ct_eq(provided.as_bytes(), self.client_key.as_bytes())
     }
 
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+/// 常数时间字节比较（长度不等直接 false，长度本身不构成敏感信息）
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -146,5 +154,24 @@ mod tests {
         assert_eq!(cfg.port, 8600);
         assert_eq!(cfg.revision, 3);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Client Key 校验：正确/错误/长度不等/空 key，均按预期判定（常数时间比较语义不变）
+    #[test]
+    fn test_verify_client_key() {
+        let cfg = Config {
+            client_key: "bit_ab12ab12ab12ab12ab12ab12ab12ab12".into(),
+            ..Config::default()
+        };
+        assert!(cfg.verify_client_key("bit_ab12ab12ab12ab12ab12ab12ab12ab12"));
+        assert!(!cfg.verify_client_key("bit_ab12ab12ab12ab12ab12ab12ab12ab13"));
+        assert!(!cfg.verify_client_key("bit_"));
+        assert!(!cfg.verify_client_key(""));
+        // 空 client_key 一律拒绝（配合 check_auth 的 503 前置）
+        let empty = Config {
+            client_key: "".into(),
+            ..Config::default()
+        };
+        assert!(!empty.verify_client_key(""));
     }
 }

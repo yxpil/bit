@@ -91,8 +91,26 @@ pub async fn fetch_latest() -> Result<LatestInfo, String> {
     Err("暂时无法获取最新版本信息".into())
 }
 
+/// 可信下载主机白名单：latest.json 的 assets URL 只接受这些主机，
+/// 防止 latest.json 被篡改时把任意主机的安装包喂给换装逻辑（HTTPS 之外一律拒绝）。
+/// 注意 GitHub release 下载会 302 到 objects/release-assets.githubusercontent.com。
+fn trusted_asset_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    matches!(
+        host,
+        "github.com"
+            | "objects.githubusercontent.com"
+            | "release-assets.githubusercontent.com"
+            | "yxpil.github.io"
+            | "osbt.space"
+    )
+}
+
 /// 从 latest.json 选出当前平台的安装包下载地址：
-/// 优先 assets 映射；缺失时按发布资产命名规则构造 GitHub 直链。
+/// 优先 assets 映射（仅可信主机）；缺失或不可信时按发布资产命名规则构造 GitHub 直链。
 /// 返回 (文件名, URL)。 exotic 平台返回 None（不支持自动更新）。
 pub fn pick_asset(latest: &serde_json::Value) -> Option<(String, String)> {
     let key = match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -109,8 +127,10 @@ pub fn pick_asset(latest: &serde_json::Value) -> Option<(String, String)> {
         .and_then(|a| a.get(key))
         .and_then(|v| v.as_str())
     {
-        let name = u.rsplit('/').next().unwrap_or("bit-update.bin").to_string();
-        return Some((name, u.to_string()));
+        if trusted_asset_url(u) {
+            let name = u.rsplit('/').next().unwrap_or("bit-update.bin").to_string();
+            return Some((name, u.to_string()));
+        }
     }
     // 回退：按 CI 发布资产的命名规则构造直链
     let v = latest.get("version").and_then(|x| x.as_str())?;
@@ -387,16 +407,16 @@ mod tests {
 
     #[test]
     fn pick_asset_from_map() {
-        // assets 映射优先：当前平台键命中即用
+        // assets 映射优先：当前平台键命中且主机可信即用
         let latest = serde_json::json!({
             "version": "9.9.9",
             "assets": {
-                "windows-x64": "http://x/BIT_9.9.9_x64-setup.exe",
-                "windows-arm64": "http://x/BIT_9.9.9_aarch64-setup.exe",
-                "macos-arm64": "http://x/BIT_9.9.9_aarch64-app.zip",
-                "macos-x64": "http://x/BIT_9.9.9_x64-app.zip",
-                "linux-x64": "http://x/BIT_9.9.9_amd64.AppImage",
-                "linux-arm64": "http://x/BIT_9.9.9_aarch64.AppImage",
+                "windows-x64": "https://github.com/yxpil/bit/releases/download/v9.9.9/BIT_9.9.9_x64-setup.exe",
+                "windows-arm64": "https://github.com/yxpil/bit/releases/download/v9.9.9/BIT_9.9.9_aarch64-setup.exe",
+                "macos-arm64": "https://github.com/yxpil/bit/releases/download/v9.9.9/BIT_9.9.9_aarch64-app.zip",
+                "macos-x64": "https://github.com/yxpil/bit/releases/download/v9.9.9/BIT_9.9.9_x64-app.zip",
+                "linux-x64": "https://github.com/yxpil/bit/releases/download/v9.9.9/BIT_9.9.9_amd64.AppImage",
+                "linux-arm64": "https://github.com/yxpil/bit/releases/download/v9.9.9/BIT_9.9.9_aarch64.AppImage",
             }
         });
         let (name, url) = match pick_asset(&latest) {
@@ -404,7 +424,7 @@ mod tests {
             // exotic 平台（riscv64/loongarch64 等）不支持自动更新，返回 None 是正确行为
             None => return,
         };
-        assert!(url.starts_with("http://x/"));
+        assert!(url.starts_with("https://github.com/"));
         match (std::env::consts::OS, std::env::consts::ARCH) {
             ("windows", "x86_64") => assert!(name.ends_with("_x64-setup.exe")),
             ("windows", "aarch64") => assert!(name.ends_with("_aarch64-setup.exe")),
@@ -413,6 +433,22 @@ mod tests {
             ("linux", "x86_64") => assert!(name.ends_with("_amd64.AppImage")),
             ("linux", "aarch64") => assert!(name.ends_with("_aarch64.AppImage")),
             _ => panic!("exotic 平台不支持自动更新"),
+        }
+    }
+
+    #[test]
+    fn pick_asset_rejects_untrusted_host() {
+        // latest.json 被篡改指向任意主机（http、evil 域名、仿冒后缀）→ 必须回退到构造的 GitHub 直链
+        for evil in [
+            "http://x/BIT_9.9.9_x64-setup.exe",
+            "https://evil.com/BIT_9.9.9_x64-setup.exe",
+            "https://github.com.evil.com/BIT_9.9.9_x64-setup.exe",
+            "ftp://github.com/BIT_9.9.9_x64-setup.exe",
+        ] {
+            let latest = serde_json::json!({ "version": "9.9.9", "assets": { "windows-x64": evil } });
+            if let Some((_, url)) = pick_asset(&latest) {
+                assert!(url.starts_with("https://github.com/yxpil/bit/releases/"), "evil={evil} url={url}");
+            }
         }
     }
 
