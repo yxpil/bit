@@ -4,6 +4,8 @@
 
 [![Release](https://img.shields.io/github/v/release/yxpil/bit?style=flat-square&label=%E7%89%88%E6%9C%AC)](https://github.com/yxpil/bit/releases/latest) [![下载](https://img.shields.io/github/downloads/yxpil/bit/total?style=flat-square&label=%E4%B8%8B%E8%BD%BD)](https://github.com/yxpil/bit/releases) [![License](https://img.shields.io/github/license/yxpil/bit?style=flat-square)](https://github.com/yxpil/bit/blob/main/LICENSE) [![CI](https://img.shields.io/github/actions/workflow/status/yxpil/bit/release.yml?style=flat-square&branch=main&label=CI)](https://github.com/yxpil/bit/actions) [![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20%E9%BE%99%E8%8A%AF%20%C2%B7%20RISC--V-black?style=flat-square)](https://osbt.space) [![官网](https://img.shields.io/website?up_message=osbt.space&down_message=%E7%A6%BB%E7%BA%BF&style=flat-square&url=https%3A%2F%2Fosbt.space)](https://osbt.space) [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-%E7%82%B9%E5%87%BB%E5%8A%A0%E5%85%A5-black?style=flat-square)](https://qm.qq.com/q/qlFr8ct0ps)
 
+[![Homebrew](https://img.shields.io/badge/Homebrew-brew%20install%20--cask%20bit-black?style=flat-square)](https://github.com/yxpil/homebrew-bit) [![Scoop](https://img.shields.io/badge/Scoop-scoop%20install%20bit-black?style=flat-square)](https://github.com/yxpil/scoop-bit) [![npm](https://img.shields.io/badge/npm-bit--agent-black?style=flat-square)](https://www.npmjs.com/package/bit-agent) [![winget](https://img.shields.io/badge/winget-yxpil.bit-black?style=flat-square)](https://github.com/microsoft/winget-pkgs/pull/428288) [![APT](https://img.shields.io/badge/APT-yxpil%2Fapt--repo-black?style=flat-square)](https://yxpil.github.io/apt-repo) [![DNF](https://img.shields.io/badge/DNF-yxpil%2Fdnf--repo-black?style=flat-square)](https://yxpil.github.io/dnf-repo) [![pacman](https://img.shields.io/badge/pacman-yxpil%2Fpacman--repo-black?style=flat-square)](https://yxpil.github.io/pacman-repo)
+
 BIT is a desktop app built on **Tauri 2 + React 18**: an auditable, remotely accessible AI Agent tool hub. Configure any AI provider, chat with models over streaming, and let the AI call local tools, write its own scripts, and accumulate memory and skills.
 
 **BIT is free forever**: fully open source (Apache-2.0), every feature free for individuals and businesses — no in-app purchases, no subscriptions, no locked features, no telemetry; build it yourself from source anytime.
@@ -74,7 +76,7 @@ ChromeOS ships with a built-in Linux development environment (a Debian 12 contai
 2. Install from the Linux terminal (amd64 for Intel/AMD, arm64 for ARM):
 
 ```bash
-sudo apt install ./BIT_0.5.6_amd64.deb
+sudo apt install ./BIT_0.5.8_amd64.deb
 ```
 
 The dependencies (libwebkit2gtk-4.1, libgtk-3, libayatana-appindicator3) are pulled in automatically from the Debian 12 repositories. After installation BIT appears in the "Linux apps" folder; the window is displayed via Wayland, matching the native Linux experience.
@@ -165,8 +167,8 @@ The installer is not code-signed (EV certificates also cost money). When the Sma
 ### Running the AppImage on Linux
 
 ```bash
-chmod +x BIT_0.5.6_amd64.AppImage
-./BIT_0.5.6_amd64.AppImage
+chmod +x BIT_0.5.8_amd64.AppImage
+./BIT_0.5.8_amd64.AppImage
 ```
 
 ### First Run
