@@ -295,6 +295,13 @@ jobs:
             packaging/exotic/out/bit_*.deb \
             packaging/exotic/out/bit_*.tar.gz \
             --clobber --repo "$GITHUB_REPOSITORY"
+      - name: 刷新镜像（exotic 晚于 finalize 上传，mirror 需单独同步）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # finalize 先于本 job 完成，其触发的 mirror-pages 同步拿不到 exotic 资产
+          # （0.5.5 的龙芯/RISC-V 包因此从未上镜像）。上传完成后补一次同步；两条 matrix 各触发一次，幂等。
+          gh workflow run mirror-pages.yml -f tag="${{ needs.ensure-release.outputs.tag }}" --repo "$GITHUB_REPOSITORY"
 
   # 收尾：核心平台构建完成后，自动生成 latest.json 上传到 Release，
   # 并触发 mirror-pages 刷新 GitHub Pages 镜像（更新检测三级回退的第一级）。
