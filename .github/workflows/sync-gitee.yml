@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# main push 与 tag push 会同时触发两次全量镜像推送，互撞会非快进失败
+concurrency:
+  group: gitee
+  cancel-in-progress: true
+
 jobs:
   sync:
     runs-on: ubuntu-latest
