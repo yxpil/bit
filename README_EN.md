@@ -8,15 +8,36 @@ BIT is a desktop app built on **Tauri 2 + React 18**: an auditable, remotely acc
 
 > Frameless custom title bar · Dark/light themes · Minimal black-and-white design · [QQ group](https://qm.qq.com/q/qlFr8ct0ps)
 
+## Table of Contents
+
+[Features](#features) · [Tech Stack](#tech-stack) · [Installation](#installation) · [Remote Access & API](#remote-access--api) · [Documentation](#documentation) · [Security & Privacy](#security--privacy) · [Development](#development) · [Project Structure](#project-structure) · [License](#license)
+
 ## Features
 
-- **Streaming chat**: end-to-end streaming across frontend and backend (SSE + Tauri Event); model replies render character by character, and assistant messages support Markdown rendering (bold, lists, tables, code blocks, etc.).
-- **Multi-provider AI settings**: supports the OpenAI / Gemini / Claude protocols; multiple providers can be configured but **only one is active at a time** (mutually exclusive). Upstream connectivity can be tested before saving.
-- **Tool hub**: register, enable/disable, and invoke tools; detects and registers local interpreters (JS / Python, etc.) — the AI only needs to write a script that can communicate, and it becomes a tool.
-- **AI-built capabilities**: the AI can write its own plugins via built-in tools / execute scripts directly / promote scripts into persistent tools.
-- **Memory and skills**: the AI summarizes and stores knowledge by itself via the `add_memory` / `skill` tools — no manual triggering.
+**Chat & AI**
+
+- **Streaming chat**: end-to-end streaming across frontend and backend (SSE + Tauri Event); replies render character by character; the thinking process is shown separately; assistant messages support Markdown rendering (tables, code blocks, etc.); real-time cache-hit-rate stats.
+- **Multi-provider**: the OpenAI / Gemini / Claude protocols; multiple providers can be configured but **only one is active at a time** (mutually exclusive); test upstream connectivity before saving; "Fetch from API" pulls the model list in one click.
+- **Multimodal**: image input is supported and sent along with the message to multimodal models.
+- **Terminal mode**: type `bit` in any terminal to enter a minimal TUI — no window, no single-instance constraint, no port listening. Ideal for SSH / headless environments.
+
+**Agent capabilities**
+
+- **Tool hub**: register, enable/disable, and invoke tools; auto-detects and registers local interpreters (JS / Python, etc.) — the AI only needs to write a script that can communicate and it becomes a tool; tools hot-reload.
+- **AI-built capabilities**: the AI can write its own plugins via built-in tools / execute scripts directly / promote scripts into persistent tools (executed inside the restricted Rhai sandbox).
+- **Memory and skills**: the AI summarizes and stores knowledge by itself via the `add_memory` / `skill` tools, reused across sessions — no manual triggering.
+
+**Protocols & integration**
+
+- **MCP client**: connect to any standard MCP server (Streamable HTTP / JSON-RPC 2.0); external tools are merged into the registry automatically.
+- **MCP server**: BIT itself also exposes a standard MCP endpoint (`POST /mcp`); any MCP client such as Claude Desktop can directly call all of BIT's enabled tools.
+- **OpenAI-compatible endpoint**: `/v1/chat/completions` supports streaming, so third-party apps can use BIT as a local AI gateway.
+
+**Reliability & governance**
+
 - **Audit log**: all tool calls and key operations are logged, viewable on the **Audit** page.
-- **Remote access**: built-in HTTP API with client key and access password support; the key is generated automatically, no manual entry.
+- **Auto update**: checks, downloads, and swaps in new versions automatically on all platforms (can be disabled).
+- **Local-first data**: sessions, memory, skills, and settings all stay on your machine.
 
 ## Tech Stack
 
@@ -149,6 +170,56 @@ chmod +x BIT_0.5.6_amd64.AppImage
 ### First Run
 
 Open **AI Settings** → add a provider (protocol / Base URL / API Key / model; click "Fetch from API" to pull the model list) → click the play button to activate it → go back to **Chat** and start using it.
+
+For terminal users: after installing, type `bit` in any terminal to jump straight into the TUI chat.
+
+## Remote Access & API
+
+Once enabled on the **Remote** page, BIT serves an HTTP API (default `127.0.0.1:8600`; switch to `0.0.0.0` for LAN access; disabled by default — the client key and access password are generated automatically when you turn it on).
+
+**Authentication**
+
+- **Client Key** (`bit_` prefix, generated automatically): `Authorization: Bearer <key>` or `?key=<key>` — used for `/v1/*` and `/mcp`
+- **Access password**: `/api/*` admin endpoints additionally require an `X-Access-Password` header (OpenAI / MCP clients cannot carry custom headers, so those endpoints are exempt)
+
+**Endpoints**
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI-compatible chat (SSE streaming supported) |
+| `/v1/models` | GET | Model list |
+| `/mcp` | POST / DELETE | Standard MCP server (Streamable HTTP / JSON-RPC 2.0) |
+| `/api/*` | — | Admin endpoints for sessions / settings / audit (access password required) |
+| `/api/health` | GET | Health check (no auth) |
+
+```bash
+curl http://127.0.0.1:8600/v1/chat/completions \
+  -H "Authorization: Bearer $BIT_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"YOUR_MODEL","messages":[{"role":"user","content":"list the current directory"}]}'
+```
+
+See the wiki for details: [Remote Access & API](https://github.com/yxpil/bit/wiki/Remote-Access-and-API) · [MCP Integration](https://github.com/yxpil/bit/wiki/MCP-Integration)
+
+## Documentation
+
+Full documentation lives in the [Wiki](https://github.com/yxpil/bit/wiki) (bilingual — every page has a language switcher at the top):
+
+- **Usage**: [Installation Guide](https://github.com/yxpil/bit/wiki/Installation-Guide) · [Chips & OS Support](https://github.com/yxpil/bit/wiki/Chips-and-OS-Support) · [Quick Start](https://github.com/yxpil/bit/wiki/Quick-Start) · [Chat Features](https://github.com/yxpil/bit/wiki/Chat-Features) · [TUI Terminal Mode](https://github.com/yxpil/bit/wiki/TUI-Terminal-Mode) · [FAQ](https://github.com/yxpil/bit/wiki/FAQ-EN)
+- **Advanced**: [Tool System](https://github.com/yxpil/bit/wiki/Tool-System) · [MCP Integration](https://github.com/yxpil/bit/wiki/MCP-Integration) · [Memory & Skills](https://github.com/yxpil/bit/wiki/Memory-and-Skills) · [Remote Access & API](https://github.com/yxpil/bit/wiki/Remote-Access-and-API) · [Auto Update](https://github.com/yxpil/bit/wiki/Auto-Update) · [Audit Log](https://github.com/yxpil/bit/wiki/Audit-Log)
+- **Development**: [Development & Build](https://github.com/yxpil/bit/wiki/Development-and-Build)
+
+中文文档：[Wiki 首页](https://github.com/yxpil/bit/wiki)（每页顶部可切换语言）。
+
+Website: [osbt.space](https://osbt.space) · [Docs](https://osbt.space/docs.html)
+
+## Security & Privacy
+
+- **Local-first data**: sessions, memory, skills, and settings all stay in the app's local data directory — no telemetry uploaded.
+- **Two-factor auth**: Client Key (compared in constant time to prevent timing side channels) + access password; remote access is off by default.
+- **Sandboxing and limits**: AI-built scripts run inside the restricted Rhai sandbox (depth / operation / wall-clock budgets); subprocess tools get timeout kills, output caps, and resource reaping.
+- **MCP session governance**: sessions idle out after 30 minutes, are capped in count, and can be explicitly terminated via DELETE.
+- **Signing transparency**: macOS ad-hoc signing / no Windows EV certificate (a trade-off of not paying for certificates — see the installation notes above); the source and CI build pipeline are fully public.
 
 ## Development
 

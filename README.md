@@ -8,15 +8,36 @@ BIT 是一个基于 **Tauri 2 + React 18** 的桌面应用：一个可审计、�
 
 > 无边框自定义标题栏 · 深/浅色主题 · 黑白线性设计 · [QQ 交流群](https://qm.qq.com/q/qlFr8ct0ps)
 
+## 目录
+
+[功能特性](#功能特性) · [技术栈](#技术栈) · [安装使用](#安装使用) · [远程访问与 API](#远程访问与-api) · [文档](#文档) · [安全与隐私](#安全与隐私) · [开发](#开发) · [项目结构](#项目结构) · [许可](#许可)
+
 ## 功能特性
 
-- **流式对话**：前后端全链路流式（SSE + Tauri Event），模型回复逐字展示；助手消息支持 Markdown 渲染（加粗、列表、表格、代码块等）。
-- **多提供方 AI 设置**：支持 OpenAI / Gemini / Claude 三种协议，可配置多家但**同一时刻仅激活一个**（互斥）。上游连通性可先测试、通过后再保存。
-- **工具中枢**：注册、启停、调用工具；探测并注册本机解释器（JS / Python 等），AI 只需写一段能通讯的脚本即可成为工具。
-- **AI 自建能力**：AI 可通过内置工具自写插件 / 直接执行脚本 / 把脚本沉淀为常驻工具。
-- **记忆与技能**：AI 通过 `add_memory` / `skill` 工具自行总结沉淀，无需手动触发。
+**对话与 AI**
+
+- **流式对话**：前后端全链路流式（SSE + Tauri Event），回复逐字展示；思考过程独立显示；助手消息 Markdown 渲染（表格、代码块等）；缓存命中率实时统计。
+- **多提供方**：OpenAI / Gemini / Claude 三种协议，可配置多家、同一时刻激活一个（互斥）；先测试上游连通性再保存；「从 API 获取」一键拉取模型列表。
+- **多模态**：支持图片输入，随消息发给多模态模型。
+- **终端模式**：终端直接输入 `bit` 进入简约 TUI——无窗口、无单实例约束、不监听端口，适合 SSH / 无桌面环境。
+
+**Agent 能力**
+
+- **工具中枢**：注册、启停、调用工具；自动探测并注册本机解释器（JS / Python 等），AI 只需写一段能通讯的脚本即可成为工具；工具热更新。
+- **AI 自建能力**：AI 可通过内置工具自写插件 / 直接执行脚本 / 把脚本沉淀为常驻工具（Rhai 沙箱受限执行）。
+- **记忆与技能**：AI 通过 `add_memory` / `skill` 工具自行总结沉淀，跨会话复用，无需手动触发。
+
+**协议与集成**
+
+- **MCP 客户端**：接入任意标准 MCP 服务器（Streamable HTTP / JSON-RPC 2.0），外部工具自动并入注册表。
+- **MCP 服务器**：BIT 自身也暴露标准 MCP 端点（`POST /mcp`），Claude Desktop 等任何 MCP 客户端可直接调用 BIT 的全部启用工具。
+- **OpenAI 兼容端点**：`/v1/chat/completions` 支持流式，第三方应用可把 BIT 当本地 AI 网关使用。
+
+**可靠与治理**
+
 - **审计日志**：所有工具调用与关键操作留痕，可在「审计」页查看。
-- **远程访问**：内置 HTTP API，支持客户端密钥与访问密码，密钥自动生成、无需手填。
+- **自动更新**：全平台自动检查、下载、换装（可关闭）。
+- **数据本地化**：会话、记忆、技能、配置全部保存在本机。
 
 ## 技术栈
 
@@ -149,6 +170,56 @@ chmod +x BIT_0.5.6_amd64.AppImage
 ### 首次使用
 
 进入「AI 设置」→ 添加一个提供方（协议 / Base URL / API Key / 模型，可点"从 API 获取"拉取模型列表）→ 点击播放按钮激活 → 回到「对话」开始使用。
+
+终端场景：安装后在任意终端输入 `bit` 直接进入 TUI 对话。
+
+## 远程访问与 API
+
+「远程」页开启后，BIT 在本机监听 HTTP API（默认 `127.0.0.1:8600`，可改为 `0.0.0.0` 供局域网访问；默认关闭，开启时自动生成密钥与访问密码）。
+
+**认证**
+
+- **Client Key**（`bit_` 前缀，自动生成）：`Authorization: Bearer <key>` 或 `?key=<key>`——用于 `/v1/*` 与 `/mcp` 端点
+- **访问密码**：`/api/*` 管理端点额外要求 `X-Access-Password` 头（OpenAI / MCP 客户端无法携带自定义头，故豁免）
+
+**端点**
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI 兼容对话（支持 SSE 流式） |
+| `/v1/models` | GET | 模型列表 |
+| `/mcp` | POST / DELETE | 标准 MCP 服务器（Streamable HTTP / JSON-RPC 2.0） |
+| `/api/*` | — | 会话 / 配置 / 审计等管理接口（需访问密码） |
+| `/api/health` | GET | 健康检查（无需认证） |
+
+```bash
+curl http://127.0.0.1:8600/v1/chat/completions \
+  -H "Authorization: Bearer $BIT_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"YOUR_MODEL","messages":[{"role":"user","content":"列出当前目录"}]}'
+```
+
+详见 Wiki：[远程访问与 API](https://github.com/yxpil/bit/wiki/远程访问与-API) · [MCP-集成](https://github.com/yxpil/bit/wiki/MCP-集成)
+
+## 文档
+
+完整文档在 [Wiki](https://github.com/yxpil/bit/wiki)（中英双语，每页顶部可切换语言）：
+
+- **使用**：[安装指南](https://github.com/yxpil/bit/wiki/安装指南) · [芯片与操作系统支持](https://github.com/yxpil/bit/wiki/芯片与操作系统支持) · [快速上手](https://github.com/yxpil/bit/wiki/快速上手) · [对话功能](https://github.com/yxpil/bit/wiki/对话功能) · [TUI-终端模式](https://github.com/yxpil/bit/wiki/TUI-终端模式) · [FAQ](https://github.com/yxpil/bit/wiki/FAQ)
+- **进阶**：[工具系统](https://github.com/yxpil/bit/wiki/工具系统) · [MCP-集成](https://github.com/yxpil/bit/wiki/MCP-集成) · [记忆与技能](https://github.com/yxpil/bit/wiki/记忆与技能) · [远程访问与 API](https://github.com/yxpil/bit/wiki/远程访问与-API) · [自动更新](https://github.com/yxpil/bit/wiki/自动更新) · [审计日志](https://github.com/yxpil/bit/wiki/审计日志)
+- **参与**：[开发与构建](https://github.com/yxpil/bit/wiki/开发与构建)
+
+English wiki: [Home-EN](https://github.com/yxpil/bit/wiki/Home-EN) — every page has a language switcher at the top.
+
+在线站点：[osbt.space](https://osbt.space) · [文档](https://osbt.space/docs.html)
+
+## 安全与隐私
+
+- **数据本地化**：会话、记忆、技能、配置全部保存在本机应用数据目录，不上传遥测。
+- **双重认证**：Client Key（常数时间比较防时序侧信道）+ 访问密码；远程访问默认关闭。
+- **沙箱与限额**：AI 自建脚本经 Rhai 沙箱受限执行（深度 / 操作数 / 墙钟预算）；子进程工具带超时杀灭、输出上限与资源回收。
+- **MCP 会话治理**：会话 30 分钟空闲过期、数量上限、显式 DELETE 终止。
+- **签名透明**：macOS ad-hoc 签名 / Windows 无 EV 证书（均为无付费证书的取舍，见上方安装说明），源码与 CI 构建流程全部公开可查。
 
 ## 开发
 
