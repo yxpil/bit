@@ -53,6 +53,12 @@ jobs:
           print("patched: CMAKE_INSTALL_LIBDIR=lib")
           PY
 
+      # 沙盒内 npm 访问 registry 会黑洞挂死（8 分钟后 Exit handler never called）。
+      # 宿主机预热 npm 缓存目录：flatpak-builder 对 dir 源按 .gitignore 过滤拷贝，
+      # .npm-flatpak-cache 未被忽略会带入沙盒，沙盒内 --offline 纯缓存安装零网络依赖
+      - name: 宿主机预热 npm 缓存
+        run: npm install --cache .npm-flatpak-cache --no-audit --no-fund
+
       - name: 构建 Flatpak
         run: flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/space.osbt.bit.yml
 

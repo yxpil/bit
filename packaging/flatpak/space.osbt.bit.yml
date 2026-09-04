@@ -60,15 +60,9 @@ modules:
       env:
         npm_config_yes: 'true'
     build-commands:
-      - |
-        # 沙盒内 npm 拉 registry 偶发 "Exit handler never called"，重试 3 次兜底
-        npm config set fetch-retries 5
-        npm config set fetch-retry-maxtimeout 120000
-        for i in 1 2 3; do
-          if npm install --no-audit --no-fund; then break; fi
-          if [ "$i" = 3 ]; then echo "npm install failed after 3 attempts"; exit 1; fi
-          sleep 20
-        done
+      # 沙盒内直接访问 registry 会黑洞（Exit handler never called）：
+      # 用宿主机预热的缓存目录做 --offline 安装，零网络、失败快速可见
+      - npm install --offline --cache .npm-flatpak-cache --no-audit --no-fund
       - npm run tauri build -- --no-bundle
       - install -Dm755 src-tauri/target/release/bit /app/bin/bit
       - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/space.osbt.bit.png
