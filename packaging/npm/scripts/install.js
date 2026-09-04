@@ -7,7 +7,7 @@ const os = require("os");
 const path = require("path");
 
 const VERSION = require("../package.json").version;
-const BASE = `https://github.com/yxpil/bit/releases/download/v${VERSION}`;
+const BASE = `https://github.com/yxpil/OpenBit/releases/download/v${VERSION}`;
 const HOME = path.join(os.homedir(), ".bit-agent");
 
 function assetFor() {
@@ -111,6 +111,6 @@ async function main() {
 
 main().catch((e) => {
   console.error("[bit-agent] 安装失败:", e.message);
-  console.error("[bit-agent] 可到 https://github.com/yxpil/bit/releases 手动下载");
+  console.error("[bit-agent] 可到 https://github.com/yxpil/OpenBit/releases 手动下载");
   process.exit(0); // 不阻塞 npm 安装
 });

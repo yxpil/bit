@@ -7,7 +7,7 @@ npm install -g bit-agent
 bit-agent          # 启动 BIT（首次运行自动下载对应平台的应用）
 ```
 
-`postinstall` 会自动识别平台并从 [GitHub Releases](https://github.com/yxpil/bit/releases) 下载对应安装产物：
+`postinstall` 会自动识别平台并从 [GitHub Releases](https://github.com/yxpil/OpenBit/releases) 下载对应安装产物：
 
 | 平台 | 产物 |
 |---|---|
@@ -16,4 +16,4 @@ bit-agent          # 启动 BIT（首次运行自动下载对应平台的应用�
 | Linux RISC-V64 / LoongArch64（龙芯） | 裸二进制 tar.gz |
 | Windows x64 | 免安装便携版 |
 
-主项目：<https://github.com/yxpil/bit>
+主项目：<https://github.com/yxpil/OpenBit>
