@@ -26,13 +26,14 @@ jobs:
           fetch-depth: 0
       - name: 镜像推送到 Gitee
         run: |
-          # tag push 时 checkout 为 detached HEAD，本地没有任何 refs/heads——
-          # --prune 会把远端默认分支也标记为删除而被 Gitee 拒绝（refusing to delete the current branch）。
-          # 先把全部远端分支建立为本地分支，保证 --prune 只清理远端多余分支、绝不误删 main
-          git fetch origin "+refs/heads/*:refs/heads/*"
+          # ① tag push 时 checkout 为 detached HEAD，本地 refs/heads 为空——
+          #    用 refs/heads 做源 + --prune 会把远端默认分支也标记删除而被 Gitee 拒绝；
+          #    改用 origin/*（fetch-depth:0 后必含全部分支）做源，与 checkout 状态无关
+          # ② origin/HEAD 是符号引用，不删会被映射成垃圾分支 heads/HEAD
+          git update-ref -d refs/remotes/origin/HEAD 2>/dev/null || true
           git -c "http.extraheader=Authorization: Basic $(printf '%s:%s' "$GITEE_USER" "$GITEE_PASS" | base64)" \
             push --prune --force "https://gitee.com/yxpil/bit.git" \
-            "refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"
+            "refs/remotes/origin/*:refs/heads/*" "refs/tags/*:refs/tags/*"
         env:
           GITEE_USER: ${{ secrets.GITEE_USER }}
           GITEE_PASS: ${{ secrets.GITEE_PASS }}
