@@ -71,6 +71,8 @@ pub fn run_blocking(ctx: Arc<Ctx>, app: tauri::AppHandle) -> ! {
     });
 
     crate::audit::record(&ctx, "local-cli", "app.quit", "tui", serde_json::json!({}), true);
+    // Windows：还原 attach_console 改过的控制台代码页（UTF-8 → 原值），不污染用户终端
+    crate::restore_console_cp();
     // CLI 直接退出：不依赖 tauri 事件循环收尾（Linux 无窗口场景 app.exit 不可靠）
     std::process::exit(0)
 }

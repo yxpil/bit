@@ -228,11 +228,16 @@ fn attach_console() {
         fn AttachConsole(dw_process_id: u32) -> i32;
         fn SetStdHandle(n_std_handle: u32, handle: isize) -> i32;
         fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetConsoleOutputCP() -> u32;
+        fn SetConsoleOutputCP(w_code_page_id: u32) -> i32;
+        fn GetConsoleCP() -> u32;
+        fn SetConsoleCP(w_code_page_id: u32) -> i32;
     }
     const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
     const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
     const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
     const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+    const CP_UTF8: u32 = 65001;
     unsafe {
         // stdout 已有有效句柄（父进程管道重定向，如 E2E / CI）→ 绝不能覆盖，
         // 否则输出会改道 CONOUT$ 导致管道收不到任何内容
@@ -256,5 +261,47 @@ fn attach_console() {
             SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle() as _);
             std::mem::forget(f);
         }
+        // Rust 按 UTF-8 直写标准流：中文 Windows 控制台默认 GBK(936) 会把 TUI 中文打成乱码，
+        // 读入同理。切到 UTF-8 并记录原值，进程退出前 restore_console_cp() 还原，不污染用户终端。
+        let po = GetConsoleOutputCP();
+        if po != CP_UTF8 {
+            SetConsoleOutputCP(CP_UTF8);
+            PREV_OUTPUT_CP.store(po, std::sync::atomic::Ordering::Relaxed);
+        }
+        let pi = GetConsoleCP();
+        if pi != CP_UTF8 {
+            SetConsoleCP(CP_UTF8);
+            PREV_INPUT_CP.store(pi, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
+
+/// attach_console 切代码页前的原值（0 = 未改动，无需还原）
+#[cfg(windows)]
+static PREV_OUTPUT_CP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(windows)]
+static PREV_INPUT_CP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// TUI 退出前还原控制台代码页（attach 时改过才还原）
+#[cfg(windows)]
+pub fn restore_console_cp() {
+    extern "system" {
+        fn SetConsoleOutputCP(w_code_page_id: u32) -> i32;
+        fn SetConsoleCP(w_code_page_id: u32) -> i32;
+    }
+    let po = PREV_OUTPUT_CP.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if po != 0 {
+        unsafe {
+            SetConsoleOutputCP(po);
+        }
+    }
+    let pi = PREV_INPUT_CP.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if pi != 0 {
+        unsafe {
+            SetConsoleCP(pi);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn restore_console_cp() {}
