@@ -1,0 +1,46 @@
+# 全渠道云端自动同步：release 工作流跑完后，自动更新
+#   Homebrew tap (yxpil/homebrew-bit) / Scoop bucket (yxpil/scoop-bit) /
+#   APT 仓库 (yxpil/apt-repo) / winget PR
+# 需要 repo secret: CHANNELS_TOKEN（具备上述仓库 contents:write 权限的 PAT）
+name: sync-channels
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  channels:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "version=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+      - name: brew / scoop / apt
+        env:
+          GITHUB_TOKEN: ${{ secrets.CHANNELS_TOKEN }}
+        run: python3 packaging/channels/sync_channels.py "${{ github.event.workflow_run.head_branch }}"
+
+  winget:
+    if: github.event.workflow_run.conclusion == 'success'
+    needs: channels
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Submit winget manifest PR
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.CHANNELS_TOKEN }}
+        run: |
+          $v = "${{ needs.channels.outputs.version }}".TrimStart("v")
+          irm https://aka.ms/wingetcreate/latest -OutFile wg.exe
+          ./wg.exe update yxpil.BIT --version $v `
+            --urls "https://github.com/yxpil/bit/releases/download/v$v/BIT_${v}_x64-setup.exe" `
+                   "https://github.com/yxpil/bit/releases/download/v$v/BIT_${v}_aarch64-setup.exe" `
+            --submit --token $env:WINGET_TOKEN
