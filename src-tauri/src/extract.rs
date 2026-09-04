@@ -170,7 +170,7 @@ pub async fn fetch_webpage(url: &str) -> Result<(String, String), String> {
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (compatible; BIT/1.0; +https://github.com/yxpil/OpenBit)")
+        .user_agent("Mozilla/5.0 (compatible; BIT/1.0; +https://github.com/yxpil/bit)")
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client.get(url).send().await.map_err(|e| format!("请求失败: {e}"))?;

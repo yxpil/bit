@@ -26,8 +26,8 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yxpil/OpenBit.git"
+    "url": "git+https://github.com/yxpil/bit.git"
   },
-  "homepage": "https://github.com/yxpil/OpenBit",
-  "bugs": "https://github.com/yxpil/OpenBit/issues"
+  "homepage": "https://github.com/yxpil/bit",
+  "bugs": "https://github.com/yxpil/bit/issues"
 }

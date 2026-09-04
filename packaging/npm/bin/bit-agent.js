@@ -26,7 +26,7 @@ function install() {
   console.log("[bit-agent] 未找到应用，开始下载...");
   const r = spawnSync(process.execPath, [path.join(__dirname, "..", "scripts", "install.js")], { stdio: "inherit" });
   if (r.status !== 0) {
-    console.error("[bit-agent] 下载失败，请到 https://github.com/yxpil/OpenBit/releases 手动下载");
+    console.error("[bit-agent] 下载失败，请到 https://github.com/yxpil/bit/releases 手动下载");
     process.exit(r.status || 1);
   }
   return locate();
@@ -34,7 +34,7 @@ function install() {
 
 const binary = locate() || install();
 if (!binary) {
-  console.error("[bit-agent] 无法定位 BIT 应用，请到 https://github.com/yxpil/OpenBit/releases 手动下载");
+  console.error("[bit-agent] 无法定位 BIT 应用，请到 https://github.com/yxpil/bit/releases 手动下载");
   process.exit(1);
 }
 
