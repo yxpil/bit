@@ -60,7 +60,9 @@ jobs:
         run: npm install --cache .npm-flatpak-cache --no-audit --no-fund
 
       - name: 构建 Flatpak
-        run: flatpak-builder --user --force-clean --repo=repo build-dir packaging/flatpak/space.osbt.bit.yml
+        # --share=network：flatpak-builder 沙盒默认断网（DNS 不可达），
+        # cargo 拉 crates.io 必须联网；npm 已走离线缓存不依赖网络
+        run: flatpak-builder --user --force-clean --share=network --repo=repo build-dir packaging/flatpak/space.osbt.bit.yml
 
       - name: 导出 bundle
         run: |
