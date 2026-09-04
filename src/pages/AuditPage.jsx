@@ -34,10 +34,7 @@ export default function AuditPage() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => {
-              if (!window.confirm(t("audit.clearConfirm"))) return;
-              api.clearAudit().then(reload);
-            }}
+            onClick={() => api.clearAudit().then(reload)}
             className="pill pill-outline pill-hover"
           >
             <IconTrash size={14} />
