@@ -2,6 +2,7 @@
 // 覆盖：/help 对话 工具调用 会话管理 记忆 install-cli 桌面端/TUI 同跑
 // 用法：mock-ai(9901) 就绪后：node e2e/tui.cjs [BIT 二进制路径]
 const { spawn, execSync } = require("child_process");
+const { StringDecoder } = require("string_decoder");
 const http = require("http");
 const fs = require("fs");
 const os = require("os");
@@ -68,13 +69,30 @@ function launchTui(dir, extraEnv = {}) {
     stdio: ["pipe", "pipe", "pipe"],
   });
   let out = "";
-  proc.stdout.on("data", (d) => (out += d.toString()));
-  proc.stderr.on("data", (d) => (out += d.toString()));
+  // StringDecoder 按字节安全解码：直接 += d.toString() 会在 chunk 边界切断多字节字符
+  // 产生 U+FFFD 永久污染 out（T19a 断言"不得含 U+FFFD"必挂；mock-ai.cjs 已修过同款）
+  const decOut = new StringDecoder("utf8");
+  const decErr = new StringDecoder("utf8");
+  proc.stdout.on("data", (d) => (out += decOut.write(d)));
+  proc.stderr.on("data", (d) => (out += decErr.write(d)));
+  proc.on("exit", () => { out += decOut.end() + decErr.end(); });
   // 进程退出后再写 stdin 会触发 write EOF——吞掉避免测试脚本崩溃
   proc.stdin.on("error", () => {});
   proc.on("error", () => {});
   const send = (line) => proc.stdin.write(line + "\n");
   const close = () => proc.stdin.end();
+  // 等待 REPL 就绪（首个 "bit> " 提示符）：xvfb/无 GPU 环境 webkit 栈初始化可达数十秒，
+  // 就绪前发送的指令虽会被缓冲，但 AI 请求会挤占后续断言的轮询窗口（T17-ARRAY/T19a 假失败根因）
+  const ready = (timeout = 90000) =>
+    new Promise((resolve) => {
+      const t0 = Date.now();
+      const poll = () => {
+        if (out.includes("bit> ")) return resolve(true);
+        if (proc.exitCode !== null || proc.signalCode || Date.now() - t0 > timeout) return resolve(false);
+        setTimeout(poll, 200);
+      };
+      poll();
+    });
   // 超时不抛异常：SIGKILL 后返回 -1，由断言展示已收集的输出便于诊断
   const waitExit = (timeout = 60000) =>
     new Promise((resolve) => {
@@ -85,7 +103,7 @@ function launchTui(dir, extraEnv = {}) {
       }, timeout);
       proc.on("exit", (code) => { clearTimeout(t); resolve(code); });
     });
-  return { proc, get out() { return out; }, send, close, waitExit };
+  return { proc, get out() { return out; }, send, close, waitExit, ready };
 }
 
 async function main() {
@@ -106,6 +124,7 @@ async function main() {
   // ── T1 /help：命令清单完整 ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     tui.send("/help");
     tui.send("/quit");
     const code = await tui.waitExit();
@@ -117,6 +136,7 @@ async function main() {
   // ── T2 对话 + T3 工具调用 + T4 会话 + T5 记忆（一个 REPL 会话内顺序执行） ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     tui.send("TUI-MOCK-GREETING");
     tui.send("E2E-CMD-SHELL");
     tui.send("/new tui-test-session");
@@ -139,6 +159,7 @@ async function main() {
   {
     const CLI_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-cli-"));
     const tui = launchTui(DIR, { BIT_CLI_DIR: CLI_DIR });
+    await tui.ready();
     tui.send("/install-cli");
     tui.send("/quit");
     await tui.waitExit();
@@ -164,6 +185,7 @@ async function main() {
   // ── T8 非法命令与用法错误：各自得到提示，REPL 存活继续 ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     tui.send("/foobar");
     tui.send("/use");
     tui.send("/use deadbeef-0000");
@@ -185,6 +207,7 @@ async function main() {
   // ── T9 空行与纯空白被忽略；T16 /q 变体退出 ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     tui.send("");
     tui.send("   ");
     tui.send("\t");
@@ -198,6 +221,7 @@ async function main() {
   // ── T10 超长单行（200KB）+ T11 多字节/emoji 混合 ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     tui.send("LONG-" + "A".repeat(200 * 1024) + "-END");
     tui.send("你好 🌍 こんにちは 🚀 Привет مرحба");
     tui.send("/quit");
@@ -218,6 +242,7 @@ async function main() {
     const BAD = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-bad-"));
     fs.writeFileSync(path.join(BAD, "ai_config.json"), "{corrupted json!!!");
     const tui = launchTui(BAD);
+    await tui.ready();
     tui.send("/tools");
     tui.send("/quit");
     const code = await tui.waitExit();
@@ -234,6 +259,7 @@ async function main() {
       JSON.stringify({ providers: [{ id: "dead", name: "dead", protocol: "openai", base_url: "http://127.0.0.1:9888/v1", api_key: "x", model: "x", active: true }] })
     );
     const tui = launchTui(DEAD);
+    await tui.ready();
     tui.send("TUI-DEAD-ENDPOINT");
     tui.send("/tools"); // 报错后 REPL 必须仍然可用
     tui.send("/quit");
@@ -246,6 +272,7 @@ async function main() {
   // ── T14 EOF（无 /quit）干净退出；T15 命令风暴按序处理 ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     for (let i = 0; i < 30; i++) tui.send(`/new storm-${i}`);
     tui.close(); // 不发 /quit，直接 EOF
     const code = await tui.waitExit(120000);
@@ -262,6 +289,7 @@ async function main() {
   // ── T17 模糊格式识别：变体 AI 响应格式动态识别（content 数组/legacy text/output_text/MAX_TOKENS/垃圾体）──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     // 三种变体格式：严格路径解析不到 → 模糊识别应成功取到正文
     for (const [marker, expect] of [
       ["E2E-FMT-ARRAY", "E2E-FMT-ARRAY-OK"],
@@ -291,6 +319,7 @@ async function main() {
   // ── T18 AI 行为模拟：真实模型的高频调用习惯 ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     // 18a 参数缺失 → 错误反馈 → 自我纠正
     tui.send("E2E-AI-RETRY");
     for (let i = 0; i < 60 && !tui.out.includes("E2E-AI-RETRY-OK"); i++) await sleep(500);
@@ -318,6 +347,7 @@ async function main() {
   // ── T19 流式边界：多字节跨 chunk / 200 小块 / 流中输入模拟 / 立即 500 ──
   {
     const tui = launchTui(DIR);
+    await tui.ready();
     // 19a 多字节字符被 TCP 从中间切开：解码必须按完整行进行，emoji/中文不得损坏
     tui.send("E2E-STREAM-MULTIBYTE");
     for (let i = 0; i < 60 && !tui.out.includes("BIT-STREAM-OK"); i++) await sleep(500);
@@ -372,6 +402,7 @@ async function main() {
     if (up) {
       // TUI 与桌面端同时运行：对话仍可用（共用数据目录无冲突）
       const tui = launchTui(DIR);
+      await tui.ready();
       tui.send("TUI-PARALLEL-CHECK");
       // 轮询等待回复（最多 30s）
       for (let i = 0; i < 60 && !tui.out.includes("好的。"); i++) await sleep(500);
