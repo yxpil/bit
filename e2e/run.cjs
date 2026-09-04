@@ -88,9 +88,14 @@ function getStatus(path, headers) {
 }
 
 const results = [];
-// 保护真实 ai_config.json：备份 → 进程退出时恢复（含失败路径），杜绝 E2E 污染日常使用的提供方配置
+// 保护真实 ai_config.json：备份 → 进程退出时恢复（含失败路径），杜绝 E2E 污染日常使用的提供方配置。
+// 双保险：备份同时落盘（/tmp），进程被 kill -9 等异常退出时也能手动找回
 const AI_CFG = os.homedir() + "/Library/Application Support/com.bit.hub/ai_config.json";
+const AI_CFG_DISK_BACKUP = "/tmp/bit-ai-config-backup.json";
 const AI_CFG_BACKUP = fs.existsSync(AI_CFG) ? fs.readFileSync(AI_CFG) : null;
+if (AI_CFG_BACKUP !== null) {
+  try { fs.writeFileSync(AI_CFG_DISK_BACKUP, AI_CFG_BACKUP); } catch {}
+}
 process.on("exit", () => {
   if (AI_CFG_BACKUP === null) return;
   try { fs.writeFileSync(AI_CFG, AI_CFG_BACKUP); console.log("(ai_config.json restored)"); } catch {}
