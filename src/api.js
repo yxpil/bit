@@ -22,10 +22,11 @@ export const api = {
   getRemoteConfig: () => invoke("get_remote_config"),
   installCli: () => invoke("install_cli"),
   saveRemoteConfig: (remote_enabled, host, port) =>
-    invoke("save_remote_config", { remote_enabled, host, port }),
+    // Tauri v2 按 camelCase 匹配 Rust 多词参数：remote_enabled → remoteEnabled
+    invoke("save_remote_config", { remoteEnabled: remote_enabled, host, port }),
   regenerateClientKey: () => invoke("regenerate_client_key"),
   saveAccessPassword: (password, password_enabled) =>
-    invoke("save_access_password", { password, password_enabled }),
+    invoke("save_access_password", { password, passwordEnabled: password_enabled }),
   regenerateAccessPassword: () => invoke("regenerate_access_password"),
   testConnectivity: () => invoke("test_connectivity"),
   listProviders: () => invoke("list_providers"),
@@ -105,7 +106,7 @@ export const api = {
   updateGoalStatus: (id, status) => invoke("update_goal_status", { id, status }),
   removeGoal: (id) => invoke("remove_goal", { id }),
   listTodos: () => invoke("list_todos"),
-  addTodo: (content, goal_id) => invoke("add_todo", { content, goal_id }),
+  addTodo: (content, goal_id) => invoke("add_todo", { content, goalId: goal_id }),
   updateTodoStatus: (id, status) => invoke("update_todo_status", { id, status }),
   removeTodo: (id) => invoke("remove_todo", { id }),
   quitApp: () => invoke("quit_app"),

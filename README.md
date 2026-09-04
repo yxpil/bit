@@ -76,7 +76,7 @@ ChromeOS 内置 Linux 开发环境（Debian 12 容器），BIT 的 Linux 安装�
 2. 在 Linux 终端安装（Intel/AMD 选 amd64，ARM 选 arm64）：
 
 ```bash
-sudo apt install ./BIT_0.5.8_amd64.deb
+sudo apt install ./BIT_0.5.9_amd64.deb
 ```
 
 依赖（libwebkit2gtk-4.1、libgtk-3、libayatana-appindicator3）会由 Debian 12 仓库自动补齐；安装后 BIT 出现在「Linux 应用」文件夹，窗口经 Wayland 显示，与原生 Linux 体验一致。
@@ -167,8 +167,8 @@ xattr -cr /Applications/BIT.app
 ### Linux 运行 AppImage
 
 ```bash
-chmod +x BIT_0.5.8_amd64.AppImage
-./BIT_0.5.8_amd64.AppImage
+chmod +x BIT_0.5.9_amd64.AppImage
+./BIT_0.5.9_amd64.AppImage
 ```
 
 ### 首次使用

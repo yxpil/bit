@@ -76,7 +76,7 @@ ChromeOS ships with a built-in Linux development environment (a Debian 12 contai
 2. Install from the Linux terminal (amd64 for Intel/AMD, arm64 for ARM):
 
 ```bash
-sudo apt install ./BIT_0.5.8_amd64.deb
+sudo apt install ./BIT_0.5.9_amd64.deb
 ```
 
 The dependencies (libwebkit2gtk-4.1, libgtk-3, libayatana-appindicator3) are pulled in automatically from the Debian 12 repositories. After installation BIT appears in the "Linux apps" folder; the window is displayed via Wayland, matching the native Linux experience.
@@ -167,8 +167,8 @@ The installer is not code-signed (EV certificates also cost money). When the Sma
 ### Running the AppImage on Linux
 
 ```bash
-chmod +x BIT_0.5.8_amd64.AppImage
-./BIT_0.5.8_amd64.AppImage
+chmod +x BIT_0.5.9_amd64.AppImage
+./BIT_0.5.9_amd64.AppImage
 ```
 
 ### First Run
