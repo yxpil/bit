@@ -172,8 +172,14 @@ jobs:
         shell: bash
         run: |
           TAG="${{ needs.ensure-release.outputs.tag }}"
+          # Tauri NSIS 对 aarch64 目标输出 *_arm64-setup.exe，而 latest.json 与
+          # update.rs 回退命名统一用 *_aarch64-setup.exe（与 dmg/AppImage 一致）。
+          # 不改名的话 Windows ARM64 自动更新会 404。
+          NSIS_DIR=src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          mv "$NSIS_DIR/BIT_${VERSION}_arm64-setup.exe" "$NSIS_DIR/BIT_${VERSION}_aarch64-setup.exe"
           gh release upload "$TAG" \
-            src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe \
+            "$NSIS_DIR/BIT_${VERSION}_aarch64-setup.exe" \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   macos:
