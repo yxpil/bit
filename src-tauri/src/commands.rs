@@ -295,8 +295,10 @@ pub async fn save_remote_config(
         cfg.host = host;
         cfg.port = port;
         cfg.revision += 1; // 每次保存自动递增版本号
-        ctx.save_config();
     }
+    // save_config 内部会再取 config 锁：std Mutex 不可重入，持锁调用同线程二次
+    // 加锁在 macOS 上直接死锁（主线程卡死整个程序）。必须出锁后再落盘。
+    ctx.save_config();
     crate::audit::record(&ctx, "local-user", "remote.save", "config", json!({ "revision": ctx.config.lock().unwrap().revision }), true);
     let addr = crate::http_api::restart_server(&ctx).await?;
     // 远程地址变化，同步托盘菜单显示
@@ -311,9 +313,9 @@ pub fn regenerate_client_key(state: State<'_, Arc<Ctx>>) -> Result<serde_json::V
         let mut cfg = ctx.config.lock().unwrap();
         let key = cfg.new_client_key();
         cfg.revision += 1;
-        ctx.save_config();
         key
     };
+    ctx.save_config();
     crate::audit::record(&ctx, "local-user", "remote.rotate_key", "client_key", json!({}), true);
     Ok(json!({ "client_key": key }))
 }
@@ -384,8 +386,8 @@ pub fn save_access_password(
         }
         cfg.password_enabled = password_enabled;
         cfg.revision += 1;
-        ctx.save_config();
     }
+    ctx.save_config();
     crate::audit::record(&ctx, "local-user", "remote.save_password", "access_password", json!({ "enabled": password_enabled }), true);
     Ok(json!({ "saved": true }))
 }
@@ -398,9 +400,9 @@ pub fn regenerate_access_password(state: State<'_, Arc<Ctx>>) -> Result<serde_js
         let mut cfg = ctx.config.lock().unwrap();
         let pwd = cfg.new_access_password();
         cfg.revision += 1;
-        ctx.save_config();
         pwd
     };
+    ctx.save_config();
     crate::audit::record(&ctx, "local-user", "remote.rotate_password", "access_password", json!({}), true);
     Ok(json!({ "access_password": pwd }))
 }
