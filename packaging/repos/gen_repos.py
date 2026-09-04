@@ -17,7 +17,7 @@ import tarfile
 import time
 from pathlib import Path
 
-VERSION = "0.4.9"
+VERSION = "0.5.2"  # 兜底；实际版本从 deb control / rpm 头部动态读取
 DEB_TO_DEB_ARCH = {"amd64": "amd64", "arm64": "arm64", "riscv64": "riscv64", "loongarch64": "loongarch64"}
 DEB_TO_PAC_ARCH = {"amd64": "x86_64", "arm64": "aarch64", "riscv64": "riscv64", "loongarch64": "loongarch64"}
 PKGDESC = "BIT - 本地优先的 AI Agent 工具集（MCP / 工具注册 / 技能）"
@@ -149,8 +149,9 @@ def gen_pacman(debs, out: Path):
         depends = {"libwebkit2gtk-4.1-0": "webkit2gtk-4.1", "libgtk-3-0": "gtk3",
                    "libayatana-appindicator3-1": "libayatana-appindicator3", "librsvg2-2": "librsvg"}
         deps = [depends.get(d.strip().split()[0], d) for d in fields.get("Depends", "").split(",") if d.strip()]
+        ver = fields.get("Version", VERSION)
         pkginfo = "\n".join(
-            [f"pkgname = bit", f"pkgver = {VERSION}-1", f"pkgdesc = {PKGDESC}", f"url = {PKGURL}",
+            [f"pkgname = bit", f"pkgver = {ver}-1", f"pkgdesc = {PKGDESC}", f"url = {PKGURL}",
              f"builddate = {builddate}", f"packager = BIT Release <yxpil@users.noreply.github.com>",
              f"size = {total_size}", f"arch = {parch}", "license = Apache-2.0", "replaces = bit-git"]
             + [f"depend = {d}" for d in deps]
@@ -164,7 +165,7 @@ def gen_pacman(debs, out: Path):
         mtree.append("")
 
         # 重打包: .PKGINFO + .MTREE + 数据文件 → <name>.pkg.tar.gz
-        pkg_name = f"bit-{VERSION}-1-{parch}.pkg.tar.gz"
+        pkg_name = f"bit-{ver}-1-{parch}.pkg.tar.gz"
         with tarfile.open(pdir / pkg_name, "w:gz") as tf:
             def add(name, data):
                 info = tarfile.TarInfo(name)
@@ -183,14 +184,14 @@ def gen_pacman(debs, out: Path):
         # 仓库数据库 desc 条目
         pkg_data = (pdir / pkg_name).read_bytes()
         desc = (
-            f"%FILENAME%\n{pkg_name}\n\n%NAME%\nbit\n\n%BASE%\nbit\n\n%VERSION%\n{VERSION}-1\n\n"
+            f"%FILENAME%\n{pkg_name}\n\n%NAME%\nbit\n\n%BASE%\nbit\n\n%VERSION%\n{ver}-1\n\n"
             f"%DESC%\n{PKGDESC}\n\n%URL%\n{PKGURL}\n\n%ARCH%\n{parch}\n\n%BUILDDATE%\n{builddate}\n\n"
             f"%PACKAGER%\nBIT Release <yxpil@users.noreply.github.com>\n\n%SIZE%\n{len(pkg_data)}\n\n"
             f"%MD5SUM%\n{hashlib.md5(pkg_data).hexdigest()}\n\n%SHA256SUM%\n{hashlib.sha256(pkg_data).hexdigest()}\n\n"
             + "".join(f"%DEPENDS%\n{d}\n\n" for d in deps)
         )
         with tarfile.open(pdir / "bit.db.tar.gz", "w:gz") as tf:
-            info = tarfile.TarInfo(f"bit-{VERSION}-1/desc")
+            info = tarfile.TarInfo(f"bit-{ver}-1/desc")
             info.size = len(desc.encode())
             info.mtime = builddate
             tf.addfile(info, io.BytesIO(desc.encode()))
