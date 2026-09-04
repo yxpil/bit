@@ -403,9 +403,9 @@ pub async fn chat_turn(
         // 拿到本轮回复：原生 function calling 优先，未探测过/已支持时尝试；失败降级文本约定
         let round_thinking = Arc::new(std::sync::Mutex::new(String::new()));
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
-            // select! 让整段生成的原生请求也能被中断即时打断（150ms 内）
+            // 流式原生请求（文本/思考增量实时到达；HTTP API 无事件通道，回调仅作聚合）
             let attempt = tokio::select! {
-                r = ai::chat_native_round(ctx, &convo, round_images, &native_exchanges) => r,
+                r = ai::chat_native_round_stream(ctx, &convo, round_images, &native_exchanges, |_ev| true) => r,
                 _ = wait_interrupt(ctx, &target) => Err(ai::NativeErr::Other(String::new())),
             };
             if interrupted(ctx, &target) {
@@ -700,9 +700,20 @@ pub async fn chat_turn_stream(
 
         // 拿到本轮回复：原生 function calling 优先，失败降级文本约定
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
-            // select!：整段生成的原生请求同样可被中断即时打断
+            // 流式原生请求：文本/思考增量实时推送（tool_calls 增量在 ai 层聚合，结束后一次性返回）
+            let emit_native = &emit;
+            let think_native = round_thinking.clone();
             let attempt = tokio::select! {
-                r = ai::chat_native_round(ctx, &convo, round_images, &native_exchanges) => r,
+                r = ai::chat_native_round_stream(ctx, &convo, round_images, &native_exchanges, move |ev| {
+                    match ev {
+                        ai::NativeEvent::Think(t) => {
+                            think_native.lock().unwrap().push_str(t);
+                            emit_native(json!({ "type": "think", "text": t }));
+                        }
+                        ai::NativeEvent::Text(t) => emit_native(json!({ "type": "delta", "text": t })),
+                    }
+                    true
+                }) => r,
                 _ = wait_interrupt(ctx, &target) => Err(ai::NativeErr::Other(String::new())),
             };
             if interrupted(ctx, &target) {
@@ -796,14 +807,7 @@ pub async fn chat_turn_stream(
             (reply, calls)
         };
 
-        // 原生模式下没有逐 token 流式：思考过程与文本一次性下发
-        let native_thinking = round_thinking.lock().unwrap().clone();
-        if native_mode && !native_thinking.is_empty() {
-            emit(json!({ "type": "think", "text": native_thinking }));
-        }
-        if native_mode && !reply.is_empty() {
-            emit(json!({ "type": "delta", "text": &reply }));
-        }
+        // 原生模式已走流式（增量实时推送）；端点不支持流式时由 chat_native_round_stream 整段补发，无需在此重复下发
 
         if !native_calls.is_empty() {
             // 并发执行全部工具调用（上限 16）：互不依赖的工具同时跑，结果仍按调用顺序回喂

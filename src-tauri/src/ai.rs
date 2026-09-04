@@ -1342,16 +1342,30 @@ async fn read_json_native(resp: reqwest::Response) -> Result<serde_json::Value, 
     serde_json::from_str(&text).map_err(|e| NativeErr::Other(format!("响应解析失败: {e}")))
 }
 
-async fn native_round_openai(
-    client: &reqwest::Client,
+/// 非 2xx 响应分类（流式与一次性共用）：错误体含 tool/function/schema → Unsupported
+/// （探测失败，调用方降级文本约定）；其余 → Other（流式路径可退回一次性请求）。
+/// 仅在非 2xx 时调用（会消耗响应体读取错误详情）
+async fn native_err_from_resp(status: reqwest::StatusCode, resp: reqwest::Response) -> NativeErr {
+    let text = resp.text().await.unwrap_or_default();
+    let short = crate::registry::safe_trunc(&text, 400);
+    if status.is_client_error() {
+        let low = text.to_lowercase();
+        if low.contains("tool") || low.contains("function") || low.contains("schema") {
+            return NativeErr::Unsupported(format!("HTTP {status}: {short}"));
+        }
+    }
+    NativeErr::Other(format!("HTTP {status}: {short}"))
+}
+
+/// 构造 OpenAI 原生工具调用请求体（流式/一次性共用）
+fn openai_native_body(
     p: &Provider,
     convo: &[ChatMessage],
     images: &[String],
     exchanges: &[ToolExchange],
     defs: &[serde_json::Value],
     params: &AiConfig,
-) -> Result<NativeRound, NativeErr> {
-    let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
+) -> serde_json::Value {
     let mut msgs = openai_messages(convo, images);
     for ex in exchanges {
         let tcs: Vec<serde_json::Value> = ex
@@ -1393,6 +1407,564 @@ async fn native_round_openai(
         "tool_choice": "auto",
     });
     apply_params("openai", &mut body, params);
+    body
+}
+
+/// 构造 Claude 原生工具调用请求体（流式/一次性共用）
+fn claude_native_body(
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+) -> serde_json::Value {
+    let (system_txt, mut msgs) = claude_messages(convo, images);
+    for ex in exchanges {
+        let blocks: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.args})
+            })
+            .collect();
+        if !blocks.is_empty() {
+            msgs.push(serde_json::json!({"role": "assistant", "content": blocks}));
+        }
+        // user：tool_result 块
+        let results: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .zip(ex.results.iter())
+            .map(|(c, r)| {
+                serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": c.id,
+                    "content": serde_json::to_string(&r.value).unwrap_or_default(),
+                    "is_error": !r.ok,
+                })
+            })
+            .collect();
+        if !results.is_empty() {
+            msgs.push(serde_json::json!({"role": "user", "content": results}));
+        }
+    }
+    let tools: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d["name"], "description": d["description"], "input_schema": d["parameters"],
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "model": p.model,
+        "max_tokens": 8192,
+        "messages": msgs,
+        "tools": tools,
+        "tool_choice": {"type": "auto"},
+    });
+    apply_params("claude", &mut body, params);
+    claude_apply_cache(&mut body, &system_txt, &mut msgs);
+    body["messages"] = serde_json::json!(msgs);
+    body
+}
+
+/// 构造 Gemini 原生工具调用请求体（流式/一次性共用）
+fn gemini_native_body(
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+) -> serde_json::Value {
+    let (system_txt, mut contents) = gemini_contents(convo, images);
+    for ex in exchanges {
+        // model：functionCall 部分
+        let model_parts: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({"functionCall": {"name": c.name, "args": c.args}})
+            })
+            .collect();
+        if !model_parts.is_empty() {
+            contents.push(serde_json::json!({"role": "model", "parts": model_parts}));
+        }
+        // user：functionResponse 部分（Gemini v1beta 按名字对应，无 id）
+        let user_parts: Vec<serde_json::Value> = ex
+            .calls
+            .iter()
+            .zip(ex.results.iter())
+            .map(|(c, r)| {
+                serde_json::json!({
+                    "functionResponse": {
+                        "name": c.name,
+                        "response": {"ok": r.ok, "result": r.value},
+                    },
+                })
+            })
+            .collect();
+        if !user_parts.is_empty() {
+            contents.push(serde_json::json!({"role": "user", "parts": user_parts}));
+        }
+    }
+    let decls: Vec<serde_json::Value> = defs
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d["name"], "description": d["description"], "parameters": d["parameters"],
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "contents": contents,
+        "tools": [{"functionDeclarations": decls}],
+    });
+    apply_params("gemini", &mut body, params);
+    if !system_txt.is_empty() {
+        body["systemInstruction"] =
+            serde_json::json!({"parts": [{"text": system_txt}]});
+    }
+    body
+}
+
+/// 原生工具调用流式增量事件：Text = 正文增量，Think = 思考过程增量
+#[derive(Clone, Copy, Debug)]
+pub enum NativeEvent<'a> {
+    Text(&'a str),
+    Think(&'a str),
+}
+
+/// 原生一轮（流式）：文本/思考增量实时回调，工具调用增量在本地聚合；
+/// 回调返回 false 立即停止（会话中断，返回 STREAM_STOP 哨兵）。
+/// 端点拒绝流式/工具参数（Unsupported）原样上抛（调用方降级文本约定）；
+/// 其他流式失败在尚未输出任何增量时自动退回一次性请求（整段以单事件补发）。
+pub async fn chat_native_round_stream<F: FnMut(NativeEvent) -> bool + Send>(
+    ctx: &Arc<crate::state::Ctx>,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    mut on_event: F,
+) -> Result<NativeRound, NativeErr> {
+    let (p, params) = {
+        let cfg = ctx.ai_config.lock().unwrap();
+        match cfg.active() {
+            Some(p) => (p.clone(), cfg.clone()),
+            None => return Err(NativeErr::Other("未配置任何 AI 提供方".into())),
+        }
+    };
+    if p.api_key.is_empty() {
+        return Err(NativeErr::Other(format!(
+            "提供方「{}」未填写 API Key",
+            p.name
+        )));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| NativeErr::Other(e.to_string()))?;
+    let defs = native_tool_defs(ctx);
+
+    // 记录是否已向调用方发出过增量：发出过就不能再退回一次性重发（会造成文本重复）
+    let mut emitted = false;
+    let result = {
+        let emitted_ref = &mut emitted;
+        let inner = &mut on_event;
+        let mut wrapped = |ev: NativeEvent| {
+            *emitted_ref = true;
+            inner(ev)
+        };
+        match p.protocol.as_str() {
+            "claude" => {
+                native_round_claude_stream(&client, &p, convo, images, exchanges, &defs, &params, &mut wrapped).await
+            }
+            "gemini" => {
+                native_round_gemini_stream(&client, &p, convo, images, exchanges, &defs, &params, &mut wrapped).await
+            }
+            _ => {
+                native_round_openai_stream(&client, &p, convo, images, exchanges, &defs, &params, &mut wrapped).await
+            }
+        }
+    };
+    match result {
+        Ok(round) => Ok(round),
+        Err(NativeErr::Unsupported(e)) => Err(NativeErr::Unsupported(e)),
+        Err(NativeErr::Other(e)) if e == STREAM_STOP => Err(NativeErr::Other(e)),
+        Err(_) if !emitted => {
+            // 流式不可用（端点不支持 stream/参数被拒等）：退回一次性请求，整段以单事件补发
+            let round = chat_native_round(ctx, convo, images, exchanges).await?;
+            let t = round.thinking.clone();
+            if !t.is_empty() {
+                on_event(NativeEvent::Think(&t));
+            }
+            let c = round.content.clone();
+            if !c.is_empty() {
+                on_event(NativeEvent::Text(&c));
+            }
+            Ok(round)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn native_round_openai_stream(
+    client: &reqwest::Client,
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+    on_event: &mut (dyn FnMut(NativeEvent) -> bool + Send),
+) -> Result<NativeRound, NativeErr> {
+    let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
+    let mut body = openai_native_body(p, convo, images, exchanges, defs, params);
+    body["stream"] = serde_json::json!(true);
+    // 末 chunk 携带 usage（主流端点支持；不支持的端点报错则由入口退回一次性请求）
+    body["stream_options"] = serde_json::json!({"include_usage": true});
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", p.api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(native_err_from_resp(status, resp).await);
+    }
+
+    let mut content = String::new();
+    let mut thinking = String::new();
+    let mut stopped = false;
+    // index → (id, name, arguments 字符串增量拼接)
+    let mut tcs: std::collections::BTreeMap<usize, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    let mut finish = String::new();
+    let mut usage = TokenUsage::default();
+    let mut got_any = false;
+    read_sse(resp, |data| {
+        got_any = true;
+        if data == "[DONE]" {
+            return true;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return false };
+        if v.get("usage").is_some_and(|u| u.is_object()) {
+            usage = usage_from_openai(&v);
+        }
+        let Some(delta) = v.pointer("/choices/0/delta") else { return false };
+        if let Some(t) = delta.get("content").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+            content.push_str(t);
+            if !on_event(NativeEvent::Text(t)) {
+                stopped = true;
+                return true;
+            }
+        }
+        if let Some(t) = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            thinking.push_str(t);
+            if !on_event(NativeEvent::Think(t)) {
+                stopped = true;
+                return true;
+            }
+        }
+        if let Some(arr) = delta.get("tool_calls").and_then(|x| x.as_array()) {
+            for tc in arr {
+                let i = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                let e = tcs.entry(i).or_default();
+                if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
+                    if !id.is_empty() {
+                        e.0 = id.to_string();
+                    }
+                }
+                if let Some(n) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                    if !n.is_empty() {
+                        e.1.push_str(n);
+                    }
+                }
+                if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                    e.2.push_str(a);
+                }
+            }
+        }
+        if let Some(f) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
+            finish = f.to_string();
+        }
+        stopped
+    })
+    .await
+    .map_err(NativeErr::Other)?;
+    if stopped {
+        return Err(NativeErr::Other(STREAM_STOP.into()));
+    }
+    // 端点忽略 stream 参数返回整段 JSON：SSE 解析无任何事件 → 交由入口退回一次性请求
+    if !got_any {
+        return Err(NativeErr::Other("端点未返回 SSE 流".into()));
+    }
+
+    let calls: Vec<NativeToolCall> = tcs
+        .into_iter()
+        .filter(|(_, (_, name, _))| !name.is_empty())
+        .map(|(i, (id, name, args))| NativeToolCall {
+            id: if id.is_empty() { format!("stream-{i}") } else { id },
+            name,
+            args: serde_json::from_str(&args).unwrap_or(serde_json::json!({})),
+        })
+        .collect();
+    let mut content = content;
+    if finish_truncated(&finish) {
+        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+    }
+    Ok(NativeRound { content, thinking, calls, usage })
+}
+
+async fn native_round_claude_stream(
+    client: &reqwest::Client,
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+    on_event: &mut (dyn FnMut(NativeEvent) -> bool + Send),
+) -> Result<NativeRound, NativeErr> {
+    let url = format!("{}/v1/messages", p.base_url.trim_end_matches('/'));
+    let mut body = claude_native_body(p, convo, images, exchanges, defs, params);
+    body["stream"] = serde_json::json!(true);
+    let resp = client
+        .post(&url)
+        .header("x-api-key", &p.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(native_err_from_resp(status, resp).await);
+    }
+
+    // index → 内容块聚合（text/thinking 累积文本；tool_use 拼接 partial_json）
+    struct Blk {
+        btype: String,
+        text: String,
+        tool_id: String,
+        tool_name: String,
+        tool_json: String,
+    }
+    let mut blocks: std::collections::BTreeMap<u64, Blk> = std::collections::BTreeMap::new();
+    let mut stopped = false;
+    let mut usage = TokenUsage::default();
+    let mut stop_reason = String::new();
+    let mut got_any = false;
+    read_sse(resp, |data| {
+        got_any = true;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return false };
+        match v.get("type").and_then(|x| x.as_str()) {
+            Some("message_start") => {
+                usage.prompt_tokens = v.pointer("/message/usage/input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                usage.cache_read_tokens = v.pointer("/message/usage/cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                usage.cache_write_tokens = v.pointer("/message/usage/cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            }
+            Some("content_block_start") => {
+                let i = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+                let cb = v.get("content_block").cloned().unwrap_or(serde_json::json!({}));
+                let e = blocks.entry(i).or_insert(Blk {
+                    btype: String::new(), text: String::new(), tool_id: String::new(),
+                    tool_name: String::new(), tool_json: String::new(),
+                });
+                e.btype = cb.get("type").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                e.tool_id = cb.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                e.tool_name = cb.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            }
+            Some("content_block_delta") => {
+                let i = v.get("index").and_then(|x| x.as_u64()).unwrap_or(0);
+                let Some(d) = v.get("delta") else { return false };
+                let dt = d.get("type").and_then(|x| x.as_str()).unwrap_or_default();
+                let e = blocks.entry(i).or_insert(Blk {
+                    btype: String::new(), text: String::new(), tool_id: String::new(),
+                    tool_name: String::new(), tool_json: String::new(),
+                });
+                match dt {
+                    "text_delta" => {
+                        if let Some(t) = d.get("text").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+                            e.text.push_str(t);
+                            if !on_event(NativeEvent::Text(t)) {
+                                stopped = true;
+                                return true;
+                            }
+                        }
+                    }
+                    "thinking_delta" => {
+                        if let Some(t) = d.get("thinking").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+                            e.text.push_str(t);
+                            if !on_event(NativeEvent::Think(t)) {
+                                stopped = true;
+                                return true;
+                            }
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(t) = d.get("partial_json").and_then(|x| x.as_str()) {
+                            e.tool_json.push_str(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("message_delta") => {
+                stop_reason = v.pointer("/delta/stop_reason").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                usage.completion_tokens = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            }
+            Some("message_stop") => return true,
+            _ => {}
+        }
+        stopped
+    })
+    .await
+    .map_err(NativeErr::Other)?;
+    if stopped {
+        return Err(NativeErr::Other(STREAM_STOP.into()));
+    }
+    // 端点忽略 stream 参数返回整段 JSON：SSE 解析无任何事件 → 交由入口退回一次性请求
+    if !got_any {
+        return Err(NativeErr::Other("端点未返回 SSE 流".into()));
+    }
+
+    let mut content = String::new();
+    let mut thinking = String::new();
+    let mut calls = Vec::new();
+    for (_, b) in blocks {
+        match b.btype.as_str() {
+            "text" => content.push_str(&b.text),
+            "thinking" => thinking.push_str(&b.text),
+            "tool_use" => {
+                if !b.tool_name.is_empty() {
+                    calls.push(NativeToolCall {
+                        id: b.tool_id,
+                        name: b.tool_name,
+                        args: serde_json::from_str(&b.tool_json).unwrap_or(serde_json::json!({})),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    if finish_truncated(&stop_reason) {
+        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+    }
+    Ok(NativeRound { content, thinking, calls, usage })
+}
+
+async fn native_round_gemini_stream(
+    client: &reqwest::Client,
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+    on_event: &mut (dyn FnMut(NativeEvent) -> bool + Send),
+) -> Result<NativeRound, NativeErr> {
+    let url = format!(
+        "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+        p.base_url.trim_end_matches('/'),
+        p.model
+    );
+    let body = gemini_native_body(convo, images, exchanges, defs, params);
+    let resp = client
+        .post(&url)
+        .header("x-goog-api-key", &p.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| NativeErr::Other(format!("请求失败: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        return Err(native_err_from_resp(status, resp).await);
+    }
+
+    let mut content = String::new();
+    let mut thinking = String::new();
+    let mut calls = Vec::new();
+    let mut stopped = false;
+    let mut usage = TokenUsage::default();
+    let mut finish = String::new();
+    let mut got_any = false;
+    read_sse(resp, |data| {
+        got_any = true;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return false };
+        if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(|x| x.as_array()) {
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+                    // thought=true 的 part 是思考过程，不混入正文
+                    if part.get("thought").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        thinking.push_str(t);
+                        if !on_event(NativeEvent::Think(t)) {
+                            stopped = true;
+                            return true;
+                        }
+                    } else {
+                        content.push_str(t);
+                        if !on_event(NativeEvent::Text(t)) {
+                            stopped = true;
+                            return true;
+                        }
+                    }
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    if !name.is_empty() {
+                        calls.push(NativeToolCall {
+                            id: format!("gemini-{}", calls.len()),
+                            name,
+                            args: fc.get("args").cloned().unwrap_or(serde_json::json!({})),
+                        });
+                    }
+                }
+            }
+        }
+        if v.get("usageMetadata").is_some_and(|u| u.is_object()) {
+            usage = usage_from_gemini(&v);
+        }
+        if let Some(f) = v.pointer("/candidates/0/finishReason").and_then(|x| x.as_str()) {
+            finish = f.to_string();
+        }
+        stopped
+    })
+    .await
+    .map_err(NativeErr::Other)?;
+    if stopped {
+        return Err(NativeErr::Other(STREAM_STOP.into()));
+    }
+    // 端点忽略 alt=sse 参数返回 JSON 数组：SSE 解析无任何事件 → 交由入口退回一次性请求
+    if !got_any {
+        return Err(NativeErr::Other("端点未返回 SSE 流".into()));
+    }
+
+    let mut content = content;
+    if finish_truncated(&finish) {
+        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+    }
+    Ok(NativeRound { content, thinking, calls, usage })
+}
+
+async fn native_round_openai(
+    client: &reqwest::Client,
+    p: &Provider,
+    convo: &[ChatMessage],
+    images: &[String],
+    exchanges: &[ToolExchange],
+    defs: &[serde_json::Value],
+    params: &AiConfig,
+) -> Result<NativeRound, NativeErr> {
+    let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
+    let body = openai_native_body(p, convo, images, exchanges, defs, params);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", p.api_key))
@@ -1489,54 +2061,7 @@ async fn native_round_claude(
     defs: &[serde_json::Value],
     params: &AiConfig,
 ) -> Result<NativeRound, NativeErr> {
-    let (system_txt, mut msgs) = claude_messages(convo, images);
-    for ex in exchanges {
-        let blocks: Vec<serde_json::Value> = ex
-            .calls
-            .iter()
-            .map(|c| {
-                serde_json::json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.args})
-            })
-            .collect();
-        if !blocks.is_empty() {
-            msgs.push(serde_json::json!({"role": "assistant", "content": blocks}));
-        }
-        // user：tool_result 块
-        let results: Vec<serde_json::Value> = ex
-            .calls
-            .iter()
-            .zip(ex.results.iter())
-            .map(|(c, r)| {
-                serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": c.id,
-                    "content": serde_json::to_string(&r.value).unwrap_or_default(),
-                    "is_error": !r.ok,
-                })
-            })
-            .collect();
-        if !results.is_empty() {
-            msgs.push(serde_json::json!({"role": "user", "content": results}));
-        }
-    }
-    let tools: Vec<serde_json::Value> = defs
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "name": d["name"], "description": d["description"], "input_schema": d["parameters"],
-            })
-        })
-        .collect();
-    let mut body = serde_json::json!({
-        "model": p.model,
-        "max_tokens": 8192,
-        "messages": msgs,
-        "tools": tools,
-        "tool_choice": {"type": "auto"},
-    });
-    apply_params("claude", &mut body, params);
-    claude_apply_cache(&mut body, &system_txt, &mut msgs);
-    body["messages"] = serde_json::json!(msgs);
+    let body = claude_native_body(p, convo, images, exchanges, defs, params);
     let url = format!("{}/v1/messages", p.base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
@@ -1604,54 +2129,7 @@ async fn native_round_gemini(
     defs: &[serde_json::Value],
     params: &AiConfig,
 ) -> Result<NativeRound, NativeErr> {
-    let (system_txt, mut contents) = gemini_contents(convo, images);
-    for ex in exchanges {
-        // model：functionCall 部分
-        let model_parts: Vec<serde_json::Value> = ex
-            .calls
-            .iter()
-            .map(|c| {
-                serde_json::json!({"functionCall": {"name": c.name, "args": c.args}})
-            })
-            .collect();
-        if !model_parts.is_empty() {
-            contents.push(serde_json::json!({"role": "model", "parts": model_parts}));
-        }
-        // user：functionResponse 部分（Gemini v1beta 按名字对应，无 id）
-        let user_parts: Vec<serde_json::Value> = ex
-            .calls
-            .iter()
-            .zip(ex.results.iter())
-            .map(|(c, r)| {
-                serde_json::json!({
-                    "functionResponse": {
-                        "name": c.name,
-                        "response": {"ok": r.ok, "result": r.value},
-                    },
-                })
-            })
-            .collect();
-        if !user_parts.is_empty() {
-            contents.push(serde_json::json!({"role": "user", "parts": user_parts}));
-        }
-    }
-    let decls: Vec<serde_json::Value> = defs
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "name": d["name"], "description": d["description"], "parameters": d["parameters"],
-            })
-        })
-        .collect();
-    let mut body = serde_json::json!({
-        "contents": contents,
-        "tools": [{"functionDeclarations": decls}],
-    });
-    apply_params("gemini", &mut body, params);
-    if !system_txt.is_empty() {
-        body["systemInstruction"] =
-            serde_json::json!({"parts": [{"text": system_txt}]});
-    }
+    let body = gemini_native_body(convo, images, exchanges, defs, params);
     let url = format!(
         "{}/v1beta/models/{}:generateContent",
         p.base_url.trim_end_matches('/'),
@@ -1776,6 +2254,80 @@ mod native_tests {
             model: "test-model".into(),
             active: true,
         }
+    }
+
+    #[tokio::test]
+    async fn test_native_openai_stream() {
+        // 原生流式：tool_calls 增量跨 chunk 聚合、reasoning_content → Think、content → Text、末 chunk usage
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got_body = Arc::new(StdMutex::new(String::new()));
+        let gb = got_body.clone();
+        tauri::async_runtime::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 65536];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            *gb.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            let frames = [
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"add","arguments":"{\"a\":"}}]}}]}).to_string(),
+                json!({"choices":[{"delta":{"reasoning_content":"想"}}]}).to_string(),
+                json!({"choices":[{"delta":{"content":"答"}}]}).to_string(),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}).to_string(),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}).to_string(),
+                json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":8}}}).to_string(),
+            ];
+            for f in &frames {
+                let ev = format!("data: {f}\n\n");
+                let _ = sock.write_all(format!("{:x}\r\n{}\r\n", ev.len(), ev).as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+            let done = "data: [DONE]\n\n";
+            let _ = sock.write_all(format!("{:x}\r\n{}\r\n", done.len(), done).as_bytes()).await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        let p = test_provider("openai", &format!("http://{addr}"));
+        let client = reqwest::Client::new();
+        let convo = vec![ChatMessage::user("1+2".to_string())];
+        let mut events: Vec<(&'static str, String)> = Vec::new();
+        let r = native_round_openai_stream(
+            &client, &p, &convo, &[], &[], &[],
+            &AiConfig::default(),
+            &mut |ev| {
+                match ev {
+                    NativeEvent::Text(t) => events.push(("text", t.to_string())),
+                    NativeEvent::Think(t) => events.push(("think", t.to_string())),
+                }
+                true
+            },
+        )
+        .await
+        .unwrap();
+        // 事件顺序：思考先于正文，增量实时回调
+        assert_eq!(
+            events,
+            vec![("think", "想".to_string()), ("text", "答".to_string())],
+            "流式增量应按到达顺序回调"
+        );
+        // tool_calls 增量跨 chunk 聚合 + usage 来自末 chunk
+        assert_eq!(r.content, "答");
+        assert_eq!(r.thinking, "想");
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].id, "call-1");
+        assert_eq!(r.calls[0].name, "add");
+        assert_eq!(r.calls[0].args["a"], 1);
+        assert_eq!(r.usage.prompt_tokens, 10);
+        assert_eq!(r.usage.cache_read_tokens, 8);
+        assert_eq!(r.usage.completion_tokens, 5);
+        // 请求体应带 stream + include_usage
+        let sent = got_body.lock().unwrap();
+        let body_start = sent.find('{').unwrap();
+        let req: serde_json::Value = serde_json::from_str(&sent[body_start..]).unwrap_or(json!({}));
+        assert_eq!(req["stream"], true);
+        assert_eq!(req["stream_options"]["include_usage"], true);
     }
 
     #[tokio::test]
