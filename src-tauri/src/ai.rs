@@ -867,6 +867,23 @@ fn fuzzy_text(v: &serde_json::Value) -> Option<String> {
     fuzzy_walk(v, 0).filter(|s| !s.trim().is_empty())
 }
 
+/// OpenAI 正文取值：字符串直取；content 为内容块数组（网关转换常见，[{type:"text",text},...]）时拼接各块文本
+fn content_str(v: Option<&serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let mut out = String::new();
+            for b in arr {
+                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
+                    out.push_str(t);
+                }
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+        _ => None,
+    }
+}
+
 fn fuzzy_walk(v: &serde_json::Value, depth: usize) -> Option<String> {
     if depth > 16 {
         return None;
@@ -1644,56 +1661,80 @@ async fn native_round_openai_stream(
     let mut finish = String::new();
     let mut usage = TokenUsage::default();
     let mut got_any = false;
+    let mut bad_data = 0usize; // 非 JSON 的 data 行数（垃圾响应容错判断用）
     read_sse(resp, |data| {
         got_any = true;
         if data == "[DONE]" {
             return true;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return false };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            bad_data += 1;
+            return false;
+        };
         if v.get("usage").is_some_and(|u| u.is_object()) {
             usage = usage_from_openai(&v);
         }
-        let Some(delta) = v.pointer("/choices/0/delta") else { return false };
-        if let Some(t) = delta.get("content").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
-            content.push_str(t);
-            if !on_event(NativeEvent::Text(t)) {
-                stopped = true;
-                return true;
-            }
-        }
-        if let Some(t) = delta
-            .get("reasoning_content")
-            .or_else(|| delta.get("reasoning"))
-            .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            thinking.push_str(t);
-            if !on_event(NativeEvent::Think(t)) {
-                stopped = true;
-                return true;
-            }
-        }
-        if let Some(arr) = delta.get("tool_calls").and_then(|x| x.as_array()) {
-            for tc in arr {
-                let i = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                let e = tcs.entry(i).or_default();
-                if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
-                    if !id.is_empty() {
-                        e.0 = id.to_string();
-                    }
-                }
-                if let Some(n) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
-                    if !n.is_empty() {
-                        e.1.push_str(n);
-                    }
-                }
-                if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
-                    e.2.push_str(a);
-                }
-            }
-        }
         if let Some(f) = v.pointer("/choices/0/finish_reason").and_then(|x| x.as_str()) {
-            finish = f.to_string();
+            if !f.is_empty() {
+                finish = f.to_string();
+            }
+        }
+        let mut usable = false;
+        if let Some(delta) = v.pointer("/choices/0/delta") {
+            // 正文：字符串直取；内容块数组（网关转换常见）拼接各块文本
+            if let Some(t) = content_str(delta.get("content")).filter(|s| !s.is_empty()) {
+                usable = true;
+                content.push_str(&t);
+                if !on_event(NativeEvent::Text(&t)) {
+                    stopped = true;
+                    return true;
+                }
+            }
+            if let Some(t) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                usable = true;
+                thinking.push_str(t);
+                if !on_event(NativeEvent::Think(t)) {
+                    stopped = true;
+                    return true;
+                }
+            }
+            if let Some(arr) = delta.get("tool_calls").and_then(|x| x.as_array()) {
+                if !arr.is_empty() {
+                    usable = true;
+                }
+                for tc in arr {
+                    let i = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    let e = tcs.entry(i).or_default();
+                    if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
+                        if !id.is_empty() {
+                            e.0 = id.to_string();
+                        }
+                    }
+                    if let Some(n) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
+                        if !n.is_empty() {
+                            e.1.push_str(n);
+                        }
+                    }
+                    if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                        e.2.push_str(a);
+                    }
+                }
+            }
+        }
+        // 模糊回退：本 chunk 无任何可识别内容时（旧版 choices[0].text / Responses API output_text 等变体）
+        if !usable {
+            if let Some(t) = fuzzy_text(&v) {
+                content.push_str(&t);
+                if !on_event(NativeEvent::Text(&t)) {
+                    stopped = true;
+                    return true;
+                }
+            }
         }
         stopped
     })
@@ -1705,6 +1746,11 @@ async fn native_round_openai_stream(
     // 端点忽略 stream 参数返回整段 JSON：SSE 解析无任何事件 → 交由入口退回一次性请求
     if !got_any {
         return Err(NativeErr::Other("端点未返回 SSE 流".into()));
+    }
+    // 全程无可识别内容且存在非 JSON 数据行 → 响应体是垃圾：
+    // 交由入口退回一次性请求，由一次性路径报出明确的解析失败
+    if content.is_empty() && thinking.is_empty() && tcs.is_empty() && bad_data > 0 {
+        return Err(NativeErr::Other("流式响应体不可解析".into()));
     }
 
     let calls: Vec<NativeToolCall> = tcs
