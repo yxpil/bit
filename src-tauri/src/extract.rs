@@ -107,31 +107,31 @@ fn docx_to_text(bytes: &[u8]) -> Result<String, String> {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
+            // quick-xml 0.42：str reader 的 QName::as_ref() 返回 &str，直接匹配字符串
             Ok(Event::Start(e)) => {
-                let name = e.name();
-                match name.as_ref() {
-                    b"w:t" => in_text = true,
-                    _ => {}
+                if e.name().as_ref() == "w:t" {
+                    in_text = true;
                 }
             }
             Ok(Event::End(e)) => {
                 match e.name().as_ref() {
-                    b"w:t" => in_text = false,
+                    "w:t" => in_text = false,
                     // 段落 / 换行结束 → 换行
-                    b"w:p" => out.push('\n'),
+                    "w:p" => out.push('\n'),
                     _ => {}
                 }
             }
             Ok(Event::Empty(e)) => {
                 // <w:br/> 软换行、<w:tab/> 制表
                 match e.name().as_ref() {
-                    b"w:br" => out.push('\n'),
-                    b"w:tab" => out.push('\t'),
+                    "w:br" => out.push('\n'),
+                    "w:tab" => out.push('\t'),
                     _ => {}
                 }
             }
             Ok(Event::Text(t)) if in_text => {
-                out.push_str(&t.unescape().unwrap_or_default());
+                // 0.42 移除 unescape()：reader 解析期已反转义，xml_content 做 EOL 归一
+                out.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(format!("解析 docx 失败: {e}")),

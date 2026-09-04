@@ -1427,6 +1427,8 @@ fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         // CREATE_NO_WINDOW：避免后台命令闪黑框
+        // 统一走 explorer.exe：不能用 `cmd /C start` 中转——路径/URL 含 & | ^ 等
+        // cmd 元字符且无空格时 std 不加引号，cmd.exe 会把它们当命令分隔符执行（注入）
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         if reveal {
@@ -1437,8 +1439,8 @@ fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|e| format!("打开失败: {e}"));
         }
-        return std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
+        // explorer 对文件按默认关联程序打开、对目录打开文件夹（exit code 不可靠，只 spawn 不判状态）
+        return std::process::Command::new("explorer")
             .arg(p)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
@@ -1478,8 +1480,11 @@ pub fn open_external(url: String) -> Result<(), String> {
     };
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", &url]);
+        // 不能用 `cmd /C start` 中转：URL 查询串普遍含 &，无空格时 std 不加引号，
+        // cmd.exe 会把 & 当命令分隔符（如 https://x/?a=1&calc 会执行 calc）→ 注入。
+        // rundll32 FileProtocolHandler 直接调系统 URL 关联处理，不经 cmd
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", &url]);
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
