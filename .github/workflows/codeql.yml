@@ -26,38 +26,16 @@ jobs:
         include:
           - language: javascript-typescript
             build-mode: none
+          # Rust 用 none 模式直接分析源码（新版 CodeQL 已移除 autobuild 支持）
           - language: rust
-            build-mode: autobuild
+            build-mode: none
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        if: matrix.language == 'rust'
-        with:
-          node-version: 20
-          cache: npm
-
-      # Tauri Linux 编译依赖（Rust 分析需要真实构建过程）
-      - name: 安装 Tauri Linux 依赖
-        if: matrix.language == 'rust'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
-
-      # Rust 侧 cargo build 需要 vite 产物 dist 存在
-      - name: 构建前端
-        if: matrix.language == 'rust'
-        run: |
-          npm ci
-          npm run build
 
       - uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-
-      - uses: github/codeql-action/autobuild@v3
-        if: matrix.build-mode == 'autobuild'
 
       - uses: github/codeql-action/analyze@v3
         with:
