@@ -28,18 +28,18 @@ fn main() {
     // 终端模式：`bit tui` 或交互式终端里的裸 `bit` 进入简约 TUI（无窗口 / 无单实例 / 不监听端口，
     // 可与桌面端同时运行，共用数据目录）。generate_context! 只能展开一次，
     // 所以 TUI 与桌面端共用同一个 Builder，仅按模式注册不同的插件与启动逻辑。
-    // 裸 `bit` 的判定：stdin 是 TTY（交互终端）才进 TUI——Finder 双击 / .desktop 图标 /
-    // `open -a` / 自动更新重启均无 TTY，仍走桌面端；BIT_HEADLESS（e2e）强制桌面路径。
+    // Windows 关键顺序：release 版是 GUI 子系统（无控制台），从终端启动时标准流全部无效，
+    // 必须先 attach_console 挂接父进程控制台（CONIN$→stdin），stdin 的 TTY 检测才有意义；
+    // 双击 / open 等无父控制台的启动方式 AttachConsole 自然失败，仍走桌面端。
+    // stdout 已被管道占用（E2E / CI）时 attach_console 自动跳过，标准流保持原样。
+    #[cfg(windows)]
+    attach_console();
     let explicit_tui = std::env::args().any(|a| a == "tui");
     let bare_tty_tui = !explicit_tui
         && std::env::args().count() == 1
         && std::env::var_os("BIT_HEADLESS").is_none()
         && std::io::IsTerminal::is_terminal(&std::io::stdin());
     let tui_mode = explicit_tui || bare_tty_tui;
-    if tui_mode {
-        #[cfg(windows)]
-        attach_console();
-    }
 
     // WebView2 默认遵循系统代理，而安装版前端经 http://tauri.localhost 加载；
     // 系统代理（如 Clash）未排除该主机时会白屏。前端资源全部本地内嵌，禁用代理无副作用。
@@ -243,13 +243,18 @@ fn attach_console() {
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             return;
         }
+        // File 对象 Drop 会 CloseHandle：SetStdHandle 登记后若放任作用域结束，
+        // 标准流句柄立即失效（句柄值还可能被后续 CreateFile 复用），TUI 秒退且输出全丢。
+        // 故意 mem::forget 泄漏，让句柄存活到进程结束。
         use std::os::windows::io::AsRawHandle;
         if let Ok(f) = std::fs::OpenOptions::new().read(true).open("CONIN$") {
             SetStdHandle(STD_INPUT_HANDLE, f.as_raw_handle() as _);
+            std::mem::forget(f);
         }
         if let Ok(f) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
             SetStdHandle(STD_OUTPUT_HANDLE, f.as_raw_handle() as _);
             SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle() as _);
+            std::mem::forget(f);
         }
     }
 }
