@@ -15,6 +15,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # gh release upload 需要 contents:write（GitHub 默认只给 read，403: Resource not accessible by integration）
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 

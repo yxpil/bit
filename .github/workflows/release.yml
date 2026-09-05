@@ -359,10 +359,11 @@ jobs:
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           PLATFORM="${{ matrix.platform }}"
+          # alpine:edge 基础镜像已不再预装 bash（2026-09 起），先 apk 装 bash 再跑构建脚本
           docker run --rm --platform "$PLATFORM" \
             -v "$PWD":/repo -w /repo \
             alpine:edge \
-            bash packaging/musl/build.sh ${{ matrix.arch }} "${VERSION#v}"
+            sh -c "apk add --no-cache bash && bash packaging/musl/build.sh ${{ matrix.arch }} \"${VERSION#v}\""
       - name: 上传到 Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
