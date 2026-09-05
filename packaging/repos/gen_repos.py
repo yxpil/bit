@@ -2,7 +2,7 @@
 """从 .deb 生成自托管 APT 仓库（GitHub Pages）+ pacman 仓库。
 
 用法: python3 gen_repos.py <deb目录> <输出目录>
-deb 目录下应有 BIT_<version>_<arch>.deb（arch ∈ amd64/arm64/riscv64/loongarch64）
+deb 目录下应有 BIT_<version>_<arch>.deb（arch ∈ amd64/arm64/riscv64/loongarch64/ppc64le）
 输出: <out>/apt  (dists + pool 结构)   <out>/pacman  (按架构的 [bit] 仓库)
 
 apt 使用: deb [trusted=yes] https://yxpil.github.io/apt-repo stable main
@@ -18,8 +18,10 @@ import time
 from pathlib import Path
 
 VERSION = "0.5.2"  # 兜底；实际版本从 deb control / rpm 头部动态读取
-DEB_TO_DEB_ARCH = {"amd64": "amd64", "arm64": "arm64", "riscv64": "riscv64", "loongarch64": "loongarch64"}
-DEB_TO_PAC_ARCH = {"amd64": "x86_64", "arm64": "aarch64", "riscv64": "riscv64", "loongarch64": "loongarch64"}
+DEB_TO_DEB_ARCH = {"amd64": "amd64", "arm64": "arm64", "riscv64": "riscv64",
+                   "loongarch64": "loongarch64", "ppc64le": "ppc64le"}
+DEB_TO_PAC_ARCH = {"amd64": "x86_64", "arm64": "aarch64", "riscv64": "riscv64",
+                   "loongarch64": "loongarch64", "ppc64le": "powerpc64le"}
 PKGDESC = "BIT - 本地优先的 AI Agent 工具集（MCP / 工具注册 / 技能）"
 PKGURL = "https://github.com/yxpil/bit"
 

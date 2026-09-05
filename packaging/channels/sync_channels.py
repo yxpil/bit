@@ -27,9 +27,10 @@ DL = "https://github.com/yxpil/bit/releases/download/{v}/{f}"
 # brew/scoop 渠道必需的资产；apt 各架构缺失时跳过不阻塞
 BREW_ASSETS = ["BIT_{v}_aarch64.dmg", "BIT_{v}_x64.dmg"]
 SCOOP_ASSETS = ["BIT_{v}_x64-portable.zip"]
-APT_ARCHES = ["amd64", "arm64", "loongarch64", "riscv64"]
+APT_ARCHES = ["amd64", "arm64", "loongarch64", "riscv64", "ppc64le"]
 APT_NAMES = {"amd64": "BIT_{v}_amd64.deb", "arm64": "BIT_{v}_arm64.deb",
-             "loongarch64": "bit_{v}_loongarch64.deb", "riscv64": "bit_{v}_riscv64.deb"}
+             "loongarch64": "bit_{v}_loongarch64.deb", "riscv64": "bit_{v}_riscv64.deb",
+             "ppc64le": "bit_{v}_ppc64le.deb"}
 RPM_NAMES = {"x86_64": "BIT_{v}-1.x86_64.rpm", "aarch64": "BIT_{v}-1.aarch64.rpm"}
 # gen_repos.py（纯 Python 生成器，无系统依赖）位于 packaging/repos/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "repos"))

@@ -19,7 +19,7 @@ on:
         required: false
         default: true
       include_exotic:
-        description: "是否构建国产/新兴架构（riscv64 / loongarch64，QEMU 模拟编译较慢）"
+        description: "是否构建国产/新兴架构与 musl（riscv64 / loongarch64 / ppc64le / alpine，QEMU 模拟编译较慢）"
         type: boolean
         required: false
         default: true
@@ -244,10 +244,13 @@ jobs:
 
   linux-exotic:
     needs: ensure-release
-    # 国产/新兴架构：龙芯 LoongArch64（3A5000/3A6000）与 RISC-V 64（VisionFive 2 等）。
-    # GitHub 无原生 runner，用 QEMU binfmt 跑对应架构 Debian 容器原生编译（模拟编译较慢，约 1~3 小时）。
-    # 产出 deb + 裸二进制 tar.gz（AppImageKit 不支持这两种架构）。
-    # 飞腾/鲲鹏/麒麟 ARM = linux-arm 的 aarch64 包；兆芯/海光 = linux 的 x86_64 包；申威 SW64 无 Rust 工具链，无法支持。
+    # 国产/新兴架构：龙芯 LoongArch64（3A5000/3A6000）、RISC-V 64（VisionFive 2 等）与
+    # ppc64le（POWER9/10 小端，Raptor/Talos 工作站）。GitHub 无原生 runner，
+    # 用 QEMU binfmt 跑对应架构 Debian 容器原生编译（模拟编译较慢，约 1~3 小时）。
+    # 产出 deb + 裸二进制 tar.gz（AppImageKit 不支持这三种架构）。
+    # armv7/armhf 无法支持：WebKitGTK 上游已放弃 32 位构建，wry 硬依赖 webkit。
+    # 申威 SW64 无 Rust 工具链，无法支持。s390x 因大端生态缺失同样放弃。
+    # 飞腾/鲲鹏/麒麟 ARM = linux-arm 的 aarch64 包；兆芯/海光 = linux 的 x86_64 包。
     if: github.event_name == 'push' || inputs.include_exotic != false
     runs-on: ubuntu-latest
     strategy:
@@ -262,6 +265,10 @@ jobs:
           - arch: loongarch64
             image: ghcr.io/loong64/debian@sha256:df06b06128d3b935288d4f601bab42ba68fd61730fd0957b1ef197f1df79346c
             platform: ""
+          # ppc64le：trixie 官方架构，libwebkit2gtk-4.1-dev 有构建，rustup 分发官方 rustup-init
+          - arch: ppc64le
+            image: debian:trixie
+            platform: linux/ppc64le
     steps:
       - uses: actions/checkout@v4
         with:
@@ -271,13 +278,14 @@ jobs:
           node-version: 20
       - name: 构建前端 dist（宿主机 x64 完成，容器内只编译 Rust）
         run: npm ci && npm run build
-      - name: 安装 QEMU 模拟器（riscv64 + loongarch64）
+      - name: 安装 QEMU 模拟器（riscv64 + loongarch64 + ppc64le）
         run: |
           # tonistiigi/binfmt 不含 loongarch64，改用 Ubuntu 自带 qemu-user-static（qemu 8.2，含 loongarch64）
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user-static
           ls /proc/sys/fs/binfmt_misc/ | grep -qx "qemu-loongarch64"
           ls /proc/sys/fs/binfmt_misc/ | grep -qx "qemu-riscv64"
+          ls /proc/sys/fs/binfmt_misc/ | grep -qx "qemu-ppc64le"
       - name: 容器内构建（${{ matrix.arch }}）
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
@@ -302,6 +310,53 @@ jobs:
           # finalize 先于本 job 完成，其触发的 mirror-pages 同步拿不到 exotic 资产
           # （0.5.5 的龙芯/RISC-V 包因此从未上镜像）。上传完成后补一次同步；两条 matrix 各触发一次，幂等。
           gh workflow run mirror-pages.yml -f tag="${{ needs.ensure-release.outputs.tag }}" --repo "$GITHUB_REPOSITORY"
+
+  # Alpine (musl) 构建：裸二进制 tar.gz（webkit 等运行时依赖由用户侧 apk 提供）。
+  # musl 生态对 Tauri 无官方支持，构建可能因上游 crate 兼容性失败——允许失败，不阻塞发布。
+  linux-musl:
+    needs: ensure-release
+    if: github.event_name == 'push' || inputs.include_exotic != false
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 构建前端 dist（宿主机 x64 完成，容器内只编译 Rust）
+        run: npm ci && npm run build
+      - name: 安装 QEMU 模拟器（aarch64）
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+          ls /proc/sys/fs/binfmt_misc/ | grep -qx "qemu-aarch64"
+      - name: 容器内构建（alpine ${{ matrix.arch }}）
+        run: |
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          PLATFORM="${{ matrix.platform }}"
+          docker run --rm --platform "$PLATFORM" \
+            -v "$PWD":/repo -w /repo \
+            alpine:edge \
+            bash packaging/musl/build.sh ${{ matrix.arch }} "${VERSION#v}"
+      - name: 上传到 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.ensure-release.outputs.tag }}"
+          gh release upload "$TAG" \
+            packaging/musl/out/bit_*-musl.tar.gz \
+            --clobber --repo "$GITHUB_REPOSITORY"
 
   # 收尾：核心平台构建完成后，自动生成 latest.json 上传到 Release，
   # 并触发 mirror-pages 刷新 GitHub Pages 镜像（更新检测三级回退的第一级）。

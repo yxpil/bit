@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# 国产/新兴架构（riscv64 / loongarch64）构建脚本——在对应架构的 Debian 容器内运行。
+# 国产/新兴架构（riscv64 / loongarch64 / ppc64le）构建脚本——在对应架构的 Debian 容器内运行。
 # 宿主机（CI x64）已通过 QEMU binfmt 运行容器，前端 dist 已由宿主机构建好；
 # 本脚本在容器内装工具链 → 原生编译 BIT → 手工打 deb 包 + 裸二进制 tar.gz。
 # 用法: build.sh <deb-arch> <version>   例如: build.sh riscv64 0.4.5
+# armv7/armhf 无法支持：WebKitGTK 上游已放弃 32 位构建（wry 硬依赖 webkit）。
 set -euo pipefail
 DEB_ARCH="$1"
 VERSION="$2"
