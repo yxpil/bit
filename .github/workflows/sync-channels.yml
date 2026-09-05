@@ -44,6 +44,31 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.CHANNELS_TOKEN }}
         run: python3 packaging/channels/sync_channels.py "${{ steps.v.outputs.version }}"
 
+  npm:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    needs: channels
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Publish bit-agent
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          V: ${{ needs.channels.outputs.version }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "NPM_TOKEN 未配置，跳过 npm 发布"; exit 0; fi
+          v="${V#v}"
+          if npm view "bit-agent@$v" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "bit-agent@$v 已存在，跳过"; exit 0
+          fi
+          cd packaging/npm
+          npm version "$v" --no-git-tag-version --allow-same-version
+          npm publish --access public
+
   winget:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     needs: channels
