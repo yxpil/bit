@@ -1,10 +1,22 @@
 # 全渠道云端自动同步：release 工作流跑完后，自动更新
 #   Homebrew tap (yxpil/homebrew-bit) / Scoop bucket (yxpil/scoop-bit) /
-#   APT 仓库 (yxpil/apt-repo) / winget PR
+#   APT 仓库 (yxpil/apt-repo) / pacman 仓库 (yxpil/pacman-repo) /
+#   dnf 仓库 (yxpil/dnf-repo) / winget PR
 # 需要 repo secret: CHANNELS_TOKEN（具备上述仓库 contents:write 权限的 PAT）
+#
+# 两条触发路径：
+#   1. release.yml finalize（仅等核心平台）在收尾时 dispatch 本工作流 → 渠道分钟级跟进
+#   2. workflow_run 兜底：release 整体（含 exotic QEMU 慢任务）结束后再跑一次，
+#      把后上传的 loongarch64/riscv64/ppc64le 等 exotic 资产补进各仓库
 name: sync-channels
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要同步的 tag（如 v0.5.11）；缺省取最新 release"
+        required: false
+        type: string
   workflow_run:
     workflows: [release]
     types: [completed]
@@ -14,21 +26,26 @@ permissions:
 
 jobs:
   channels:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - id: v
-        run: echo "version=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
-      - name: brew / scoop / apt
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "version=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: brew / scoop / apt / pacman / dnf
         env:
           GITHUB_TOKEN: ${{ secrets.CHANNELS_TOKEN }}
-        run: python3 packaging/channels/sync_channels.py "${{ github.event.workflow_run.head_branch }}"
+        run: python3 packaging/channels/sync_channels.py "${{ steps.v.outputs.version }}"
 
   winget:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     needs: channels
     runs-on: windows-latest
     continue-on-error: true

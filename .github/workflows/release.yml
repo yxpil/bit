@@ -413,4 +413,7 @@ jobs:
           cat latest.json
           gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
           gh workflow run mirror-pages.yml -f tag="$TAG" --repo "$GITHUB_REPOSITORY"
+          # 渠道同步不等 exotic 慢任务：核心平台一出包就推 brew/scoop/apt/pacman/dnf/winget；
+          # release 整体结束后 sync-channels 的 workflow_run 兜底再补 exotic 资产
+          gh workflow run sync-channels.yml -f tag="$TAG" --repo "$GITHUB_REPOSITORY"
           echo "latest.json 已上传，Pages 镜像已触发（tag=$TAG）"
