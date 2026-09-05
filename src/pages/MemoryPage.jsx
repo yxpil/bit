@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { IconPlus, IconMemory, IconTrash } from "../components/Icons.jsx";
 import { useLang } from "../i18n.js";
+import { listen } from "@tauri-apps/api/event";
 
 // 记忆页：计划目标 / 待办事项管理（可删除）+ 原始记忆（单条删除与多选批量删除）
 export default function MemoryPage({ onStats }) {
@@ -36,6 +37,13 @@ export default function MemoryPage({ onStats }) {
   };
   useEffect(() => {
     reload();
+    // AI 可能在任意会话里完成目标/待办：轮询 + 窗口聚焦时重拉，保证列表实时
+    const timer = setInterval(reload, 3000);
+    const unFocus = listen("tauri://focus", reload);
+    return () => {
+      clearInterval(timer);
+      unFocus.then((fn) => fn());
+    };
   }, []);
 
   const add = async (e) => {
@@ -144,7 +152,7 @@ export default function MemoryPage({ onStats }) {
         <h3 className="px-1 text-sm font-semibold">{t("memory.goalsTitle")}</h3>
         <p className="mb-2 px-1 text-xs text-neutral-500">{t("memory.goalsDesc")}</p>
         <div className="flex flex-col gap-2.5">
-          {goals.map((g) => (
+          {goals.filter((g) => g.status === "active").map((g) => (
             <div key={g.id} className="card group flex gap-3 py-4">
               <div className="min-w-0 flex-1">
                 <div className="mb-1.5 flex flex-wrap items-center gap-2">
@@ -188,11 +196,11 @@ export default function MemoryPage({ onStats }) {
       </div>
 
       {/* 待办事项 */}
-      {todos.length > 0 && (
+      {todos.some((td) => td.status !== "completed") && (
         <div>
           <h3 className="mb-2 px-1 text-sm font-semibold">{t("memory.todosTitle")}</h3>
           <div className="flex flex-col gap-2.5">
-            {todos.map((td) => (
+            {todos.filter((td) => td.status !== "completed").map((td) => (
               <div key={td.id} className="card group flex gap-3 py-3.5">
                 <div className="min-w-0 flex-1">
                   <div className="mb-1 flex flex-wrap items-center gap-2">

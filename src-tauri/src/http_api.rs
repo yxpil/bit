@@ -611,6 +611,7 @@ async fn debug_state(State(ctx): State<Arc<Ctx>>) -> Response {
     let total_messages: usize = sessions.sessions.iter().map(|s| s.messages.len()).sum();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "data_dir": ctx.data_dir.display().to_string(),
         "remote": { "port": cfg.port, "access_password_enabled": cfg.password_enabled },
         "provider": active,
         "reasoning_effort": ai.reasoning_effort,

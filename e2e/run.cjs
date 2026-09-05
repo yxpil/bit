@@ -114,6 +114,26 @@ function record(name, ok, detail) {
     try { await new Promise((res, rej) => { const q = http.get({ host: BASE, port: PORT, path: "/api/health", timeout: 2000 }, (r) => { r.resume(); res(); }); q.on("error", rej); q.on("timeout", () => { q.destroy(); rej(new Error("t")); }); }); break; } catch { await new Promise((r) => setTimeout(r, 2000)); }
   }
 
+  // 隔离预检：拒绝对真实数据目录跑 E2E（曾污染 goals/todos/ai_config）
+  try {
+    const st = await new Promise((resolve, reject) => {
+      const q = http.get({ host: BASE, port: PORT, path: "/api/debug/state",
+        headers: { Authorization: `Bearer ${KEY}`, "X-Access-Password": PASSWORD }, timeout: 5000 },
+        (r) => { let b = ""; r.on("data", (c) => (b += c)); r.on("end", () => { try { resolve(JSON.parse(b)); } catch { reject(new Error("bad json")); } }); });
+      q.on("error", reject); q.on("timeout", () => { q.destroy(); reject(new Error("timeout")); });
+    });
+    const dd = String(st.data_dir || "");
+    if (process.env.E2E_ALLOW_REAL_DATA !== "1" && !/e2e/i.test(dd)) {
+      console.error(`\n[拒绝执行] 被测实例数据目录不是 E2E 隔离目录: ${dd || "(未知)"}`);
+      console.error("请用隔离目录启动实例，例如: BIT_DATA_DIR=/tmp/bit-e2e ... ；确需对真实目录跑请设 E2E_ALLOW_REAL_DATA=1");
+      process.exit(1);
+    }
+    console.log(`(data_dir: ${dd})`);
+  } catch (e) {
+    console.error(`\n[拒绝执行] 无法确认被测实例数据目录（${e.message}）——可能实例过旧，请升级后重试`);
+    process.exit(1);
+  }
+
   // T1 普通对话
   try {
     const r = await chat(sid(1), "E2E-PLAIN ping");
