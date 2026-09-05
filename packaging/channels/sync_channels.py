@@ -31,7 +31,7 @@ APT_ARCHES = ["amd64", "arm64", "loongarch64", "riscv64", "ppc64le"]
 APT_NAMES = {"amd64": "BIT_{v}_amd64.deb", "arm64": "BIT_{v}_arm64.deb",
              "loongarch64": "bit_{v}_loongarch64.deb", "riscv64": "bit_{v}_riscv64.deb",
              "ppc64le": "bit_{v}_ppc64le.deb"}
-RPM_NAMES = {"x86_64": "BIT_{v}-1.x86_64.rpm", "aarch64": "BIT_{v}-1.aarch64.rpm"}
+RPM_NAMES = {"x86_64": "BIT-{v}-1.x86_64.rpm", "aarch64": "BIT-{v}-1.aarch64.rpm"}
 # gen_repos.py（纯 Python 生成器，无系统依赖）位于 packaging/repos/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "repos"))
 import gen_repos  # noqa: E402
@@ -322,7 +322,8 @@ def sync_pacman(version, token, tmp, dry):
         return
     for f in sorted(out.rglob("*")):
         if f.is_file():
-            put_binary(PACMAN, f.relative_to(out).as_posix(), f.read_bytes(),
+            # gen_pacman 在 out 下多写了一层 pacman/，仓库结构需要去掉这层
+            put_binary(PACMAN, f.relative_to(out / "pacman").as_posix(), f.read_bytes(),
                        token, f"pacman {v}", dry)
 
 
@@ -356,6 +357,7 @@ def main():
     ap.add_argument("--token", default=os.environ.get("GITHUB_TOKEN") or
                     subprocess.run(["gh", "auth", "token"], capture_output=True, text=True).stdout.strip())
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--only", help="只跑指定渠道（brew/scoop/apt/pacman/dnf），逗号分隔")
     a = ap.parse_args()
     if not a.token:
         sys.exit("需要 --token 或 GITHUB_TOKEN / gh auth token")
@@ -367,6 +369,8 @@ def main():
     results = {}
     for name, fn in [("brew", sync_brew), ("scoop", sync_scoop), ("apt", sync_apt),
                      ("pacman", sync_pacman), ("dnf", sync_dnf)]:
+        if a.only and name not in [x.strip() for x in a.only.split(",")]:
+            continue
         try:
             fn(a.version, a.token, tmp, a.dry_run)
             results[name] = "ok"
