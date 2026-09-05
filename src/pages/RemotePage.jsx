@@ -267,7 +267,7 @@ export default function RemotePage({ onStats }) {
         </div>
 
         {testState === "pass" && (
-          <p className="flex items-center gap-2 rounded-full bg-neutral-100 px-4 py-2 text-xs">
+          <p className="flex items-center gap-2 rounded-full bg-neutral-100 px-4 py-2 text-xs text-neutral-800 dark:bg-neutral-800 dark:text-neutral-200">
             <IconCheck size={14} />
             {t("remote.testPass")}http://{cfg.host}:{cfg.port}
           </p>
