@@ -47,12 +47,17 @@
   .dark body {
     @apply bg-black text-neutral-100;
   }
+  /* 滚动条：悬浮小胶囊。thumb 用透明边框内缩（background-clip: padding-box），
+     上下端不贴轨道两端、左右不贴容器边缘，圆角容器里也不会顶出圆角 */
   ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+    width: 8px;
+    height: 8px;
   }
   ::-webkit-scrollbar-thumb {
     @apply rounded-full bg-neutral-300;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    min-height: 32px;
   }
   .dark ::-webkit-scrollbar-thumb {
     @apply bg-neutral-700;
