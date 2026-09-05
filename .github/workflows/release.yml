@@ -66,6 +66,12 @@ jobs:
         run: |
           npm ci
           npx tauri build
+      - name: 打包通用二进制 tar.gz（Gentoo/Void 等无 deb/rpm 系发行版）
+        run: |
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          tar -czf "bit_${VERSION}_x86_64.tar.gz" -C src-tauri/target/release bit
+          # 运行时依赖（webkit2gtk-4.1 等）由发行版提供
       - name: 上传到 Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -75,6 +81,7 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb \
             src-tauri/target/release/bundle/rpm/*.rpm \
             src-tauri/target/release/bundle/appimage/*.AppImage \
+            bit_*_x86_64.tar.gz \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   linux-arm:
@@ -97,6 +104,12 @@ jobs:
         run: |
           npm ci
           npx tauri build
+      - name: 打包通用二进制 tar.gz（Gentoo/Void 等无 deb/rpm 系发行版）
+        run: |
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          tar -czf "bit_${VERSION}_aarch64.tar.gz" -C src-tauri/target/release bit
+          # 运行时依赖（webkit2gtk-4.1 等）由发行版提供
       - name: 上传到 Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -106,6 +119,7 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb \
             src-tauri/target/release/bundle/rpm/*.rpm \
             src-tauri/target/release/bundle/appimage/*.AppImage \
+            bit_*_aarch64.tar.gz \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   windows:
