@@ -45,7 +45,8 @@ jobs:
         run: python3 packaging/channels/sync_channels.py "${{ steps.v.outputs.version }}"
 
   npm:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # 渠道同步失败（如个别仓库 404）不应连坐阻塞 npm/winget
+    if: always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     needs: channels
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -58,9 +59,11 @@ jobs:
       - name: Publish bit-agent
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           V: ${{ needs.channels.outputs.version }}
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then echo "NPM_TOKEN 未配置，跳过 npm 发布"; exit 0; fi
+          if [ -z "$V" ]; then V=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name); fi
           v="${V#v}"
           if npm view "bit-agent@$v" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
             echo "bit-agent@$v 已存在，跳过"; exit 0
@@ -70,7 +73,7 @@ jobs:
           npm publish --access public
 
   winget:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     needs: channels
     runs-on: windows-latest
     continue-on-error: true
