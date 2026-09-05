@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "packaging/flatpak/**"
       - "src/**"
@@ -76,3 +77,13 @@ jobs:
         with:
           name: flatpak-bundle
           path: bit-*.flatpak
+
+      # v* 标签构建时直接挂到对应 Release（0.5.7/0.5.8 曾因只产 artifact 忘传 bundle）
+      - name: 上传到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          gh release upload "$GITHUB_REF_NAME" "bit-$VERSION.flatpak" --clobber -R "$GITHUB_REPOSITORY"
+          echo "已上传 bit-$VERSION.flatpak → $GITHUB_REF_NAME"
