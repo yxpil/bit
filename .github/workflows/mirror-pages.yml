@@ -10,6 +10,11 @@ on:
         description: "要镜像的 tag（留空自动取最新 Release）"
         required: false
         default: ""
+  # 兜底：release 整体结束（exotic 慢任务传完）后再镜像一次，把后上传的
+  # loongarch64/riscv64/ppc64le 等资产补进版本页；finalize 的主动 dispatch 负责快速路径
+  workflow_run:
+    workflows: [release]
+    types: [completed]
 
 permissions:
   contents: read
@@ -23,6 +28,7 @@ concurrency:
 
 jobs:
   mirror:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
