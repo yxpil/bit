@@ -983,8 +983,8 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
     let skill_lines: Vec<String> = skills
         .iter()
         .rev()
-        .take(12)
-        .map(|s| format!("- {}: {}", s.name, s.summary))
+        .take(100)
+        .map(|s| format!("- {}", s.name))
         .collect();
     drop(skills);
 
@@ -1057,7 +1057,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             NEVER announce an action and then stop — if your reply says you are going to do something, the same turn MUST contain the actual tool call. \
             The system executes each call and returns its result to you as a tool message; keep reasoning or calling more tools based on the results. \
             When everything is done, output the final answer in natural language (do NOT output any call-format explanation or JSON call arrays in your reply).",
-            "Write/search SKILLs with Tool 6 · skill: action=save writes a skill (same name overwrites), action=search finds existing skills.",
+            "The SKILL list in this prompt shows names only. When a skill name looks relevant to the current task, fetch its full content first via Tool 6 · skill with action=search and query=that name, then follow it. action=save writes a skill (same name overwrites), action=search finds existing skills.",
             "When no more tool calls are needed, just output the final answer in natural language.",
         )
     } else {
@@ -1068,7 +1068,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             Never invent marker syntax (like <xxx_function_call>), never output a bare object without the square brackets, never split multiple calls into multiple lines — \
             multiple calls must stay in ONE array: [{{...}},{{...}}]. When no action is needed, just answer in natural language.\n\
             Single call example: [{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]",
-            "Write/search SKILLs with Tool 6 · skill: save writes a skill, search finds existing skills. Examples:\n\
+            "The SKILL list in this prompt shows names only. When a skill name looks relevant to the current task, fetch its full content first via Tool 6 · skill with action=search and query=that name, then follow it. save writes a skill, search finds existing skills. Examples:\n\
             - save a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"batch-rename\",\"summary\":\"use shell to walk the directory and mv-rename files…\"}}}}]\n\
             - search a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"rename\"}}}}]",
             "When you need to call a capability, output a JSON array, each element {{\"tool\":string,\"params\":object}}, on its own line, with nothing else wrapped around it.",
