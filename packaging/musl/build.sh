@@ -9,7 +9,7 @@ ARCH="$1"
 VERSION="$2"
 
 apk add --no-cache \
-  build-base pkg-config openssl-dev file \
+  build-base pkgconf openssl-dev file \
   webkit2gtk-4.1-dev gtk+3.0-dev libayatana-appindicator-dev librsvg-dev \
   rust cargo
 
