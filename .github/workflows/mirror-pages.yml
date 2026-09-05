@@ -42,13 +42,74 @@ jobs:
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "site/$VERSION"
           # latest.json 提到站点根：客户端自动更新检测优先请求 /bit/latest.json
           if [ -f "site/$VERSION/latest.json" ]; then cp "site/$VERSION/latest.json" site/latest.json; fi
-          # 站点首页：版本内全部文件的直链清单
-          {
-            echo "<!doctype html><meta charset=utf-8><title>BIT $VERSION downloads</title>"
-            echo "<h1>BIT $VERSION</h1><ul>"
-            (cd "site/$VERSION" && ls -1 | sed "s/.*/<li><a href=\"$VERSION\/&\">&<\/a><\/li>/")
-            echo "</ul>"
-          } > site/index.html
+
+          # 版本目录内的资产清单行：文件名 + 人类可读大小（黑白极简 pill 风格）
+          ITEM_LIST=$(cd "site/$VERSION" && ls -1 | while read -r f; do
+            s=$(wc -c < "$f" | tr -d ' ')
+            h=$(numfmt --to=iec --suffix=B "$s" 2>/dev/null || printf '%sB' "$s")
+            printf '<li><a href="./%s"><span>%s</span><span class="size">%s</span></a></li>\n' "$f" "$f" "$h"
+          done)
+
+          CSS=$(cat <<'CSSEOF'
+          :root{color-scheme:light}
+          *{box-sizing:border-box}
+          body{margin:0;padding:44px 16px;background:#fff;color:#111;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;text-align:center}
+          h1{font-size:22px;margin:0 0 4px;letter-spacing:.5px}
+          .sub{color:#666;font-size:13px;margin:0 0 28px}
+          ul{list-style:none;margin:0 auto;padding:0;max-width:560px;display:flex;flex-direction:column;gap:8px;text-align:left}
+          li{margin:0;min-width:0}
+          a{display:flex;justify-content:space-between;align-items:center;gap:12px;border:1px solid #111;border-radius:999px;padding:10px 18px;color:#111;text-decoration:none;font-size:14px;min-width:0}
+          a span:first-child{overflow-wrap:anywhere}
+          a:hover{background:#111;color:#fff}
+          .size{color:inherit;opacity:.55;font-variant-numeric:tabular-nums;white-space:nowrap;flex:none}
+          .foot{margin-top:32px;font-size:12px;color:#666}
+          .foot a{display:inline;border:0;padding:0;border-radius:0;color:#666;text-decoration:underline}
+          .foot a:hover{background:none;color:#111}
+          CSSEOF
+          )
+
+          # 版本页：/bit/<版本>/ —— 该版本全部资产的直链列表
+          cat > "site/$VERSION/index.html" <<PAGEEOF
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+          <meta charset=utf-8>
+          <meta name=viewport content="width=device-width,initial-scale=1">
+          <title>BIT $VERSION 下载 / Downloads</title>
+          <style>$CSS</style>
+          </head>
+          <body>
+          <h1>BIT $VERSION</h1>
+          <p class=sub>全部资产直链 · All release assets（GitHub Pages 镜像 / mirror）</p>
+          <ul>
+          $ITEM_LIST
+          </ul>
+          <p class=foot>BIT 永久免费 / BIT is free forever · <a href="https://osbt.space">osbt.space</a> · <a href="https://github.com/yxpil/bit">GitHub</a> · <a href="./latest.json">latest.json</a></p>
+          </body>
+          </html>
+          PAGEEOF
+
+          # 站点首页：/bit/ —— 最新版本入口
+          cat > site/index.html <<ROOTEOF
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+          <meta charset=utf-8>
+          <meta name=viewport content="width=device-width,initial-scale=1">
+          <title>BIT 下载 / Downloads</title>
+          <style>$CSS</style>
+          </head>
+          <body>
+          <h1>BIT</h1>
+          <p class=sub>最新版本 / Latest: v$VERSION</p>
+          <ul>
+          <li><a href="$VERSION/"><span>v$VERSION 全部文件 / All files</span></a></li>
+          <li><a href="latest.json"><span>自动更新清单 / Update manifest (latest.json)</span></a></li>
+          </ul>
+          <p class=foot>BIT 永久免费 / BIT is free forever · <a href="https://osbt.space">osbt.space</a> · <a href="https://github.com/yxpil/bit">GitHub</a></p>
+          </body>
+          </html>
+          ROOTEOF
           ls -la "site/$VERSION"
       - uses: actions/upload-pages-artifact@v3
         with:
