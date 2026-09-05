@@ -1093,6 +1093,7 @@ pub async fn compress_session(
 #[tauri::command]
 pub fn list_sessions(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
+    crate::session::refresh_from_disk(&ctx);
     let store = ctx.sessions.lock().unwrap();
     let mut list: Vec<serde_json::Value> = store
         .sessions
@@ -1117,6 +1118,7 @@ pub fn list_sessions(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
 #[tauri::command]
 pub fn get_session(state: State<'_, Arc<Ctx>>, session_id: String) -> serde_json::Value {
     let ctx = ctx(state);
+    crate::session::refresh_from_disk(&ctx);
     let store = ctx.sessions.lock().unwrap();
     let id = if session_id.is_empty() { store.active.clone() } else { session_id };
     let msgs = store
@@ -1425,12 +1427,40 @@ pub async fn run_autopilot_now(state: State<'_, Arc<Ctx>>) -> Result<serde_json:
 
 /// 用系统默认程序打开文件；reveal=true 时打开所在文件夹并定位该文件
 #[tauri::command]
-pub fn open_path(path: String, reveal: Option<bool>) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
-    if !p.exists() {
-        return Err(format!("路径不存在: {path}"));
+pub fn open_path(state: State<'_, Arc<Ctx>>, path: String, reveal: Option<bool>) -> Result<(), String> {
+    let cleaned = normalize_user_path(&path);
+    let mut p = std::path::PathBuf::from(&cleaned);
+    if !p.exists() && p.is_relative() {
+        // 兼容旧卡片里的相对路径：send_file 曾原样存储 AI 给的路径
+        p = state.data_dir.join(&p);
     }
-    open_target(p, reveal.unwrap_or(false))
+    if !p.exists() {
+        return Err(format!("路径不存在: {cleaned}"));
+    }
+    // 绝对化：消除符号链接与相对段，确保 Finder/资源管理器定位到真实位置
+    let abs = std::fs::canonicalize(&p).unwrap_or(p);
+    open_target(&abs, reveal.unwrap_or(false))
+}
+
+/// 清理 AI/用户给的路径：去首尾空白、去成对引号、展开 ~。send_file 与 open_path 共用。
+pub(crate) fn normalize_user_path(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        let first = bytes[0];
+        let last = bytes[s.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            s = s[1..s.len() - 1].trim().to_string();
+        }
+    }
+    if let Some(rest) = s.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            if let Some(home) = std::env::var_os("HOME") {
+                s = format!("{}{}", home.to_string_lossy(), rest);
+            }
+        }
+    }
+    s
 }
 
 fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
@@ -1441,10 +1471,18 @@ fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
             cmd.arg("-R");
         }
         cmd.arg(p);
-        return cmd
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("打开失败: {e}"));
+        // open 是快速返回的 LaunchServices 调用：必须等退出码，失败时不能静默——
+        // 否则 Finder 停在原窗口，用户看到的是"定位到了错误的位置"
+        let out = cmd.output().map_err(|e| format!("打开失败: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let reason = stderr.trim();
+            return Err(format!(
+                "打开失败: {}",
+                if reason.is_empty() { format!("系统拒绝打开 {}", p.display()) } else { reason.to_string() }
+            ));
+        }
+        return Ok(());
     }
     #[cfg(target_os = "windows")]
     {
@@ -1454,8 +1492,10 @@ fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         if reveal {
+            // /select, 与路径必须是单个参数且路径自带引号：std 会给含空格的参数整体加引号，
+            // explorer 解析 "/select,C:\a b\c.txt" 会定位到错误位置——必须 raw_arg 预引号
             return std::process::Command::new("explorer")
-                .arg(format!("/select,{}", p.display()))
+                .raw_arg(format!("/select,\"{}\"", p.display()))
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
                 .map(|_| ())

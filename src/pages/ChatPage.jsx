@@ -299,6 +299,9 @@ export default function ChatPage({ onStats, visible }) {
 
   useEffect(() => {
     loadSessions();
+    // bit 命令行等外部进程创建的会话也要出现：定期重拉列表（后端按 mtime 合并磁盘变更，代价极低）
+    const timer = setInterval(loadSessions, 5000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -424,8 +427,9 @@ export default function ChatPage({ onStats, visible }) {
         if (!ev || typeof ev !== "object") return;
         switch (ev.type) {
           case "round_start":
-            // 新一轮开始：清空本轮实时文本与思考过程，保留此前已完成轮次的工具卡片
-            setLiveMap((m) => ({ ...m, [sid]: { text: "", think: "", cards: m[sid]?.cards || [] } }));
+            // 新一轮开始：清空本轮实时文本，保留此前已完成轮次的工具卡片；
+            // 思考过程跨轮累积（落库的是整个回合的思考，实时面板保持一致）
+            setLiveMap((m) => ({ ...m, [sid]: { text: "", think: m[sid]?.think || "", cards: m[sid]?.cards || [] } }));
             break;
           case "think":
             // 思考过程增量（reasoning/thinking）：实时展示

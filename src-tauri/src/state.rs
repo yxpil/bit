@@ -68,6 +68,8 @@ pub struct Ctx {
     pub goals: Mutex<Vec<Goal>>,
     pub todos: Mutex<Vec<Todo>>,
     pub sessions: Mutex<SessionStore>,
+    /// sessions.json 上次已知 mtime：判断文件是否被其他进程（bit 命令行等）改过
+    pub sessions_disk_ts: Mutex<Option<std::time::SystemTime>>,
     /// 已接入的 MCP 服务器（Streamable HTTP）
     pub mcp: Mutex<Vec<crate::mcp::McpServer>>,
     /// BIT 作为 MCP 服务器时分配的会话（session_id → 最后活跃时刻）。
@@ -162,6 +164,7 @@ impl Ctx {
             goals: Mutex::new(goals),
             todos: Mutex::new(todos),
             sessions: Mutex::new(sessions),
+            sessions_disk_ts: Mutex::new(None),
             mcp: Mutex::new(mcp),
             mcp_sessions: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
@@ -242,6 +245,10 @@ impl Ctx {
             self.data_dir.join("sessions.json"),
             serde_json::to_string(&*store).unwrap(),
         );
+        drop(store);
+        *self.sessions_disk_ts.lock().unwrap() = fs::metadata(self.data_dir.join("sessions.json"))
+            .and_then(|m| m.modified())
+            .ok();
     }
 
     pub fn save_mcp(&self) {

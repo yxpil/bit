@@ -119,6 +119,45 @@ pub fn persist(ctx: &Arc<crate::state::Ctx>) {
         ctx.data_dir.join("sessions.json"),
         serde_json::to_string(&*store).unwrap_or_default(),
     );
+    drop(store);
+    *ctx.sessions_disk_ts.lock().unwrap() = disk_mtime(ctx);
+}
+
+fn disk_mtime(ctx: &Arc<crate::state::Ctx>) -> Option<std::time::SystemTime> {
+    std::fs::metadata(ctx.data_dir.join("sessions.json"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// 其他进程（bit 命令行等）可能写过 sessions.json：按 id 合并磁盘侧变更（updated 新者胜），
+/// 磁盘上已消失的会话视为被外部删除。mtime 未变则直接返回，避免每次列表都全量解析。
+/// 由 list_sessions / get_session 在读取前调用，让 GUI 无需重启即可看到命令行的会话变更。
+pub fn refresh_from_disk(ctx: &Arc<crate::state::Ctx>) {
+    let mtime = disk_mtime(ctx);
+    {
+        let mut seen = ctx.sessions_disk_ts.lock().unwrap();
+        if *seen == mtime {
+            return;
+        }
+        *seen = mtime.clone();
+    }
+    let Some(disk) = read_json::<SessionStore>(&ctx.data_dir.join("sessions.json")) else {
+        return;
+    };
+    let disk_ids: std::collections::HashSet<String> =
+        disk.sessions.iter().map(|s| s.id.clone()).collect();
+    let mut store = ctx.sessions.lock().unwrap();
+    for d in disk.sessions {
+        match store.sessions.iter_mut().find(|s| s.id == d.id) {
+            Some(s) => {
+                if d.updated > s.updated {
+                    *s = d;
+                }
+            }
+            None => store.sessions.push(d),
+        }
+    }
+    store.sessions.retain(|s| disk_ids.contains(&s.id));
 }
 
 #[cfg(test)]

@@ -537,12 +537,18 @@ async fn builtin_invoke(
         }
         // ── 2.5 发送文件给用户 ──
         "send_file" => {
-            let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
-            let p = std::path::Path::new(path);
-            let meta = std::fs::metadata(p).map_err(|_| format!("File not found: {path}"))?;
+            let raw = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
+            // 规范化 + 绝对化：卡片存自包含的绝对路径，点击打开/定位时不再受当时上下文影响
+            let path = crate::commands::normalize_user_path(raw);
+            let p = std::path::Path::new(&path);
+            let meta = std::fs::metadata(p).map_err(|_| format!("File not found: {raw}"))?;
             if meta.is_dir() {
                 return Err(format!("`{path}` is a directory; send_file only accepts a single file"));
             }
+            let card_path = std::fs::canonicalize(p)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&path))
+                .to_string_lossy()
+                .to_string();
             let name = p
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -551,7 +557,7 @@ async fn builtin_invoke(
             let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
             Ok(serde_json::json!({
                 "sent": true,
-                "path": path,
+                "path": card_path,
                 "name": name,
                 "bytes": meta.len(),
                 "note": note,
