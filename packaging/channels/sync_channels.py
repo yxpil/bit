@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""全渠道自动同步：Homebrew tap / Scoop bucket / APT 仓库。
+"""全渠道自动同步：Homebrew tap / Scoop bucket / APT / pacman / dnf 仓库。
 用法: python3 sync_channels.py v0.5.9 [--token GHTOKEN] [--dry-run]
 在 GitHub Actions 中由 sync-channels.yml 于 release 工作流完成后自动调用；
 也可本地手动运行（--token 缺省时用 GITHUB_TOKEN / gh auth token）。
@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,8 @@ from pathlib import Path
 TAP = "yxpil/homebrew-bit"
 SCOOP = "yxpil/scoop-bit"
 APT = "yxpil/apt-repo"
+PACMAN = "yxpil/pacman-repo"
+DNF = "yxpil/dnf-repo"
 DL = "https://github.com/yxpil/bit/releases/download/{v}/{f}"
 # brew/scoop 渠道必需的资产；apt 各架构缺失时跳过不阻塞
 BREW_ASSETS = ["BIT_{v}_aarch64.dmg", "BIT_{v}_x64.dmg"]
@@ -27,6 +30,10 @@ SCOOP_ASSETS = ["BIT_{v}_x64-portable.zip"]
 APT_ARCHES = ["amd64", "arm64", "loongarch64", "riscv64"]
 APT_NAMES = {"amd64": "BIT_{v}_amd64.deb", "arm64": "BIT_{v}_arm64.deb",
              "loongarch64": "bit_{v}_loongarch64.deb", "riscv64": "bit_{v}_riscv64.deb"}
+RPM_NAMES = {"x86_64": "BIT_{v}-1.x86_64.rpm", "aarch64": "BIT_{v}-1.aarch64.rpm"}
+# gen_repos.py（纯 Python 生成器，无系统依赖）位于 packaging/repos/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "repos"))
+import gen_repos  # noqa: E402
 
 
 def gh(method, url, token, payload=None, expect=(200, 201)):
@@ -263,6 +270,85 @@ def sync_apt(version, token, tmp, dry):
     put_file(APT, rel_path, "\n".join(lines), token, f"apt Release {v}", dry)
 
 
+# ── pacman / dnf 仓库（复用 gen_repos 生成器） ────────────────────────────
+def blob_sha(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+
+
+def put_binary(repo, path, data: bytes, token, msg, dry, retries=4):
+    """contents API 写二进制文件：blob-sha 未变则跳过，401 抖动退避重试"""
+    if dry:
+        print(f"  [dry] {repo}/{path} ← {len(data)} bytes")
+        return
+    payload = {"message": msg, "content": base64.b64encode(data).decode(), "branch": "main"}
+    try:
+        payload["sha"] = gh("GET", f"/repos/{repo}/contents/{path}", token)["sha"]
+        if payload["sha"] == blob_sha(data):
+            print(f"  · {repo}/{path} 未变跳过")
+            return
+    except RuntimeError:
+        pass
+    for attempt in range(retries):
+        try:
+            gh("PUT", f"/repos/{repo}/contents/{path}", token, payload)
+            print(f"  ✓ {repo}/{path} ({len(data)}B)")
+            return
+        except RuntimeError as e:
+            if "401" in str(e) and attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))  # 认证抖动，退避重试
+                continue
+            raise
+    raise RuntimeError(f"{repo}/{path}: 重试耗尽")
+
+
+def sync_pacman(version, token, tmp, dry):
+    print(f"== pacman {PACMAN} ==")
+    v = version.lstrip("v")
+    debs = []
+    for arch in APT_ARCHES:
+        try:
+            d = fetch_asset(version, APT_NAMES[arch].format(v=v), tmp)
+        except Exception as e:
+            print(f"  ! 跳过 {arch}: {e}")
+            continue
+        debs.append((d, arch, gen_repos.deb_control(d)))
+    if not debs:
+        raise RuntimeError("pacman: 没有任何 deb 可用")
+    out = tmp / "pacman-out"
+    gen_repos.gen_pacman(debs, out)
+    if dry:
+        print("  [dry] 上传各架构 pkg.tar.gz + bit.db.tar.gz")
+        return
+    for f in sorted(out.rglob("*")):
+        if f.is_file():
+            put_binary(PACMAN, f.relative_to(out).as_posix(), f.read_bytes(),
+                       token, f"pacman {v}", dry)
+
+
+def sync_dnf(version, token, tmp, dry):
+    print(f"== dnf {DNF} ==")
+    v = version.lstrip("v")
+    rpms = []
+    for arch, name_tpl in RPM_NAMES.items():
+        try:
+            r = fetch_asset(version, name_tpl.format(v=v), tmp)
+        except Exception as e:
+            print(f"  ! 跳过 {arch}: {e}")
+            continue
+        rpms.append((r, arch, {}))
+    if not rpms:
+        raise RuntimeError("dnf: 没有任何 rpm 可用")
+    out = tmp / "dnf-out"
+    gen_repos.gen_dnf(rpms, out)
+    if dry:
+        print("  [dry] 上传 packages/*.rpm + repodata/*")
+        return
+    for f in sorted(out.rglob("*")):
+        if f.is_file():
+            put_binary(DNF, f.relative_to(out).as_posix(), f.read_bytes(),
+                       token, f"dnf {v}", dry)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("version", help="如 v0.5.9")
@@ -278,7 +364,8 @@ def main():
         sys.exit(f"{a.version} 是预发布版本，跳过渠道同步")
     tmp = Path(tempfile.mkdtemp(prefix="bit-channels-"))
     results = {}
-    for name, fn in [("brew", sync_brew), ("scoop", sync_scoop), ("apt", sync_apt)]:
+    for name, fn in [("brew", sync_brew), ("scoop", sync_scoop), ("apt", sync_apt),
+                     ("pacman", sync_pacman), ("dnf", sync_dnf)]:
         try:
             fn(a.version, a.token, tmp, a.dry_run)
             results[name] = "ok"
