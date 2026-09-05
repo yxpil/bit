@@ -56,11 +56,20 @@ def gh(method, url, token, payload=None, expect=(200, 201)):
 
 
 def download(url, dest: Path):
+    import time
     req = urllib.request.Request(url)
-    with urllib.request.urlopen(req) as r, open(dest, "wb") as f:
-        while chunk := r.read(1 << 20):
-            f.write(chunk)
-    return dest.stat().st_size
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+                while chunk := r.read(1 << 20):
+                    f.write(chunk)
+            return dest.stat().st_size
+        except Exception as e:
+            if attempt == 3:
+                raise
+            print(f"  ! 下载重试 {attempt + 1}/3: {e}")
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError("unreachable")
 
 
 def sha256_of(p: Path) -> str:
