@@ -218,6 +218,7 @@ fn main() {
             commands::save_stun_servers,
             commands::get_lan_info,
             commands::get_remote_qr,
+            commands::qr_svg_url,
             commands::save_access_password,
             commands::regenerate_access_password,
             commands::test_connectivity,

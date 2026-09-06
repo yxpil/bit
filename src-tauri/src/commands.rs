@@ -554,6 +554,24 @@ pub async fn get_remote_qr(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Val
     Ok(json!({ "payload": payload, "svg": svg }))
 }
 
+/// 任意 URL 的二维码 SVG（离线渲染，黑码白底，深浅主题下均可识别）。
+/// 用于「关于」弹窗的安卓版扫码下载等公开链接场景（连接凭据二维码走 get_remote_qr 加密通道）
+#[tauri::command]
+pub fn qr_svg_url(url: String) -> Result<String, String> {
+    let url = url.trim().to_string();
+    // 仅放行 https 链接：本命令面向公开下载地址，防止被滥用构造任意协议码
+    if !url.starts_with("https://") {
+        return Err("only https URLs are allowed".into());
+    }
+    Ok(qrcode::QrCode::new(url.as_bytes())
+        .map_err(|e| e.to_string())?
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build())
+}
+
 #[tauri::command]
 pub fn regenerate_client_key(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);

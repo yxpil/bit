@@ -74,6 +74,8 @@ const dict = {
     "app.aboutDesc":
       "可自我扩展的工具型助手：注册本机解释器，AI 只需写一段 JS/PY 即可成为工具。",
     "app.qqGroup": "QQ 交流群",
+    "app.android": "安卓版",
+    "app.androidQr": "扫码下载安卓版（bit-mobile）",
     // 标题栏
     "title.minimize": "最小化",
     "title.maximize": "最大化",
@@ -421,6 +423,8 @@ const dict = {
     "app.aboutDesc":
       "A self-extensible tool-based assistant: register local interpreters and any JS/PY snippet written by AI becomes a tool.",
     "app.qqGroup": "QQ Group",
+    "app.android": "Android",
+    "app.androidQr": "Scan to download the Android companion (bit-mobile)",
     // Title bar
     "title.minimize": "Minimize",
     "title.maximize": "Maximize",

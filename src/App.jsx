@@ -74,6 +74,15 @@ export default function App() {
     invoke("ui_mounted").catch(() => {});
   }, []);
 
+  // 安卓版扫码下载（bit-mobile 仓库 Releases）：打开「关于」时懒加载二维码 SVG（后端离线渲染）
+  const [androidQr, setAndroidQr] = useState("");
+  const ANDROID_URL = "https://github.com/yxpil/bit-mobile/releases/latest";
+  useEffect(() => {
+    if (showAbout && !androidQr) {
+      invoke("qr_svg_url", { url: ANDROID_URL }).then(setAndroidQr).catch(() => {});
+    }
+  }, [showAbout, androidQr]);
+
   // 远程服务端口被占用自动切换：事件实时推送；启动时事件可能早于 JS 监听丢失，
   // 故挂载时再查一次 get_remote_status 兜底（switched_from 有值即展示提示条）
   const [portSwitched, setPortSwitched] = useState(null); // { from, to }
@@ -305,12 +314,29 @@ export default function App() {
             <p className="mt-3 text-xs leading-relaxed text-neutral-500 dark:text-neutral-400">
               {t("app.aboutDesc")}
             </p>
+            {/* 安卓版扫码下载：二维码黑码白底（扫码可靠性优先于主题） */}
+            <div className="mt-4 flex flex-col items-center gap-1.5">
+              <div className="rounded-xl border border-neutral-200 bg-white p-2 dark:border-neutral-700">
+                {androidQr ? (
+                  <div className="h-28 w-28 [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: androidQr }} />
+                ) : (
+                  <div className="flex h-28 w-28 items-center justify-center text-xs text-neutral-400">…</div>
+                )}
+              </div>
+              <p className="text-[10px] text-neutral-400">{t("app.androidQr")}</p>
+            </div>
             <div className="mt-3 flex items-center justify-center gap-2">
               <button
                 onClick={() => invoke("open_external", { url: "https://qm.qq.com/q/qlFr8ct0ps" })}
                 className="pill pill-outline pill-hover px-3 py-1 text-xs"
               >
                 {t("app.qqGroup")}
+              </button>
+              <button
+                onClick={() => invoke("open_external", { url: ANDROID_URL })}
+                className="pill pill-outline pill-hover px-3 py-1 text-xs"
+              >
+                {t("app.android")}
               </button>
               <button
                 onClick={() => invoke("open_external", { url: "https://github.com/yxpil/bit" })}

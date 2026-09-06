@@ -102,7 +102,8 @@ async fn stun_mapped(server: &str) -> (Option<SocketAddr>, Option<SocketAddr>) {
 
 /// 内置免费 STUN 服务器（host:port，v4/v6 由解析结果决定）：全部并发探测，
 /// 取前两个成功映射做 NAT 粗判。国内（腾讯/小米）与海外（Cloudflare/Google/Twilio/
-/// Nextcloud）混编，任一可达即可用；用户可在设置里整体替换为自定列表
+/// Nextcloud/Syncthing/sipgate/ideasiP/voipgate）混编，任一可达即可用；
+/// 不可达条目仅 3s UDP 超时无副作用；用户可在设置里整体替换为自定列表
 pub const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",
     "stun.qq.com:3478",
@@ -110,6 +111,10 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.miwifi.com:3478",
     "global.stun.twilio.com:3478",
     "stun.nextcloud.com:443",
+    "stun.syncthing.net:3478",
+    "stun.sipgate.net:3478",
+    "stun.ideasip.com:3478",
+    "stun.voipgate.com:3478",
 ];
 
 /// 局域网/公网候选地址快照：手机端按 lan → lan6 → pub6/pub4 依次尝试直连。
