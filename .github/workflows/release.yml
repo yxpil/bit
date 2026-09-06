@@ -58,8 +58,6 @@ jobs:
           node-version: 20
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
-      - name: 前端静态检查（no-undef 闸门：漏声明变量渲染期 ReferenceError → 黑屏，构建前拦截）
-        run: npm run lint
       - name: 安装 Linux 系统依赖
         run: |
           sudo apt-get update
@@ -67,6 +65,8 @@ jobs:
       - name: 构建
         run: |
           npm ci
+          # 前端静态检查（no-undef 闸门：漏声明变量渲染期 ReferenceError → 黑屏，构建前拦截）
+          npm run lint
           npx tauri build
       - name: UI 冒烟测试（无头启动验证前端渲染树完整挂载，防黑屏包上传）
         run: xvfb-run -a node e2e/smoke-ui.cjs src-tauri/target/release/bit
@@ -100,8 +100,6 @@ jobs:
         with:
           node-version: 20
       - uses: dtolnay/rust-toolchain@stable
-      - name: 前端静态检查（no-undef 闸门）
-        run: npm run lint
       - name: 安装 Linux 系统依赖
         run: |
           sudo apt-get update
@@ -109,6 +107,8 @@ jobs:
       - name: 构建
         run: |
           npm ci
+          # 前端静态检查（no-undef 闸门）
+          npm run lint
           npx tauri build
       - name: UI 冒烟测试（防黑屏包上传）
         run: xvfb-run -a node e2e/smoke-ui.cjs src-tauri/target/release/bit
@@ -184,11 +184,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
-      - name: 前端静态检查（no-undef 闸门）
-        run: npm run lint
       - name: 构建
         run: |
           npm ci
+          # 前端静态检查（no-undef 闸门）
+          npm run lint
           npx tauri build --target aarch64-pc-windows-msvc --bundles nsis
       - name: UI 冒烟测试（防黑屏包上传）
         shell: pwsh
@@ -224,11 +224,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - name: 前端静态检查（no-undef 闸门）
-        run: npm run lint
       - name: 构建 arm64 + x86_64
         run: |
           npm ci
+          # 前端静态检查（no-undef 闸门）
+          npm run lint
           npx tauri build --target aarch64-apple-darwin
           npx tauri build --target x86_64-apple-darwin
       - name: UI 冒烟测试（无头启动验证前端渲染树完整挂载，防黑屏包上传；Runner 为 arm64，冒烟 arm64 产物）
