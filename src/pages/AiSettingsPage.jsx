@@ -49,6 +49,9 @@ export default function AiSettingsPage({ onStats, stats }) {
   const [remoteModels, setRemoteModels] = useState(null);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [fetchModelsErr, setFetchModelsErr] = useState("");
+  // 高权限模式：elevation=null=探测中；elevErr=上次授权失败原因（v0.5.14 黑屏修复：声明漏写导致渲染期 ReferenceError 整树卸载）
+  const [elevation, setElevation] = useState(null);
+  const [elevErr, setElevErr] = useState("");
 
   const load = () =>
     api.listProviders().then((r) => setProviders(r.providers || [])).catch(() => {});

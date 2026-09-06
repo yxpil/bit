@@ -185,6 +185,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::is_headless,
+            commands::ui_mounted,
             commands::check_updates,
             commands::update_download,
             commands::update_apply,

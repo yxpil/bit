@@ -154,7 +154,8 @@ export default function ChatPage({ onStats, visible }) {
       }
     });
     return () => un.then((f) => f());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // 仅随 activeId 重挂监听；loadSessions/loadMessages 闭包引用刻意冻结
+    // eslint-disable-next-line
   }, [activeId]);
 
   // 派生：当前会话状态与全局运行数
@@ -1404,7 +1405,9 @@ function CopyBtn({ text }) {
       await navigator.clipboard.writeText(text);
       setDone(true);
       setTimeout(() => setDone(false), 1200);
-    } catch {}
+    } catch {
+      // 剪贴板不可用（非安全上下文/无权限）时静默放弃
+    }
   };
   return (
     <button

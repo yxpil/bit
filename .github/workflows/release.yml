@@ -58,14 +58,18 @@ jobs:
           node-version: 20
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
+      - name: 前端静态检查（no-undef 闸门：漏声明变量渲染期 ReferenceError → 黑屏，构建前拦截）
+        run: npm run lint
       - name: 安装 Linux 系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev xvfb
       - name: 构建
         run: |
           npm ci
           npx tauri build
+      - name: UI 冒烟测试（无头启动验证前端渲染树完整挂载，防黑屏包上传）
+        run: xvfb-run -a node e2e/smoke-ui.cjs src-tauri/target/release/bit
       - name: 打包通用二进制 tar.gz（Gentoo/Void 等无 deb/rpm 系发行版）
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
@@ -96,14 +100,18 @@ jobs:
         with:
           node-version: 20
       - uses: dtolnay/rust-toolchain@stable
+      - name: 前端静态检查（no-undef 闸门）
+        run: npm run lint
       - name: 安装 Linux 系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev xvfb
       - name: 构建
         run: |
           npm ci
           npx tauri build
+      - name: UI 冒烟测试（防黑屏包上传）
+        run: xvfb-run -a node e2e/smoke-ui.cjs src-tauri/target/release/bit
       - name: 打包通用二进制 tar.gz（Gentoo/Void 等无 deb/rpm 系发行版）
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
@@ -176,10 +184,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-pc-windows-msvc
+      - name: 前端静态检查（no-undef 闸门）
+        run: npm run lint
       - name: 构建
         run: |
           npm ci
           npx tauri build --target aarch64-pc-windows-msvc --bundles nsis
+      - name: UI 冒烟测试（防黑屏包上传）
+        shell: pwsh
+        run: node e2e/smoke-ui.cjs src-tauri/target/aarch64-pc-windows-msvc/release/BIT.exe
       - name: 上传到 Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -211,11 +224,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: 前端静态检查（no-undef 闸门）
+        run: npm run lint
       - name: 构建 arm64 + x86_64
         run: |
           npm ci
           npx tauri build --target aarch64-apple-darwin
           npx tauri build --target x86_64-apple-darwin
+      - name: UI 冒烟测试（无头启动验证前端渲染树完整挂载，防黑屏包上传；Runner 为 arm64，冒烟 arm64 产物）
+        run: node e2e/smoke-ui.cjs src-tauri/target/aarch64-apple-darwin/release/bit
       - name: 补全 ad-hoc bundle 签名（避免 Gatekeeper 报"已损坏"）
         run: |
           # tauri bundler 只对二进制做 linker 签名，bundle 缺 CodeResources/PkgInfo，
@@ -291,7 +308,10 @@ jobs:
         with:
           node-version: 20
       - name: 构建前端 dist（宿主机 x64 完成，容器内只编译 Rust）
-        run: npm ci && npm run build
+        run: |
+          npm ci
+          npm run lint
+          npm run build
       - name: 安装 QEMU 模拟器（riscv64 + loongarch64 + ppc64le）
         run: |
           # tonistiigi/binfmt 不含 loongarch64，改用 Ubuntu 自带 qemu-user-static（qemu 8.2，含 loongarch64）
@@ -348,7 +368,10 @@ jobs:
         with:
           node-version: 20
       - name: 构建前端 dist（宿主机 x64 完成，容器内只编译 Rust）
-        run: npm ci && npm run build
+        run: |
+          npm ci
+          npm run lint
+          npm run build
       - name: 安装 QEMU 模拟器（aarch64）
         if: matrix.arch == 'aarch64'
         run: |

@@ -46,6 +46,20 @@ pub fn is_headless() -> bool {
         .unwrap_or(false)
 }
 
+/// 前端挂载信号：App 首帧成功渲染后由前端调用，落审计供 CI 冒烟断言
+/// 「渲染树完整挂载」（页面渲染崩溃时本事件缺席 → Windows 冒烟判失败，拦住黑屏包）
+#[tauri::command]
+pub fn ui_mounted(state: State<'_, Arc<Ctx>>) {
+    crate::audit::record(
+        &ctx(state),
+        "local-app",
+        "ui.mounted",
+        "BIT",
+        json!({}),
+        true,
+    );
+}
+
 /// 本进程内存占用（字节）：页眉仪表盘展示，前端每 3 秒轮询
 #[tauri::command]
 pub fn mem_usage() -> u64 {

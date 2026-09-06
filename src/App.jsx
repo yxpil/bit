@@ -69,6 +69,9 @@ export default function App() {
   const [appVersion, setAppVersion] = useState("");
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
+    // 前端挂载信号：供 CI 冒烟检测「渲染期异常导致黑屏」（v0.5.14 elevErr 事故的回归闸门）。
+    // 树挂载成功才会执行本 effect；任何页面渲染崩溃都会让它缺席，Windows 冒烟据此判失败
+    invoke("ui_mounted").catch(() => {});
   }, []);
 
   // 远程服务端口被占用自动切换：事件实时推送；启动时事件可能早于 JS 监听丢失，
