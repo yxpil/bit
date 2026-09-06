@@ -95,7 +95,7 @@ export default function AuditPage() {
               {diag.version} · {diag.platform}
               {diag.crashes?.length > 0 && (
                 <span className="ml-2 text-red-500 dark:text-red-400">
-                  {t("diag.crashBadge", { n: diag.crashes.length })}
+                  {diag.crashes.length} {t("diag.crashBadge")}
                 </span>
               )}
             </span>
