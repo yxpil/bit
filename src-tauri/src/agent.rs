@@ -1,9 +1,33 @@
+// yxpil · BIT
+use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ai::{self, ChatMessage};
 use crate::state::{Ctx, CHAT_MAX};
+
+/// 同会话回合互斥守卫：Drop 时自动释放（覆盖错误路径与 panic），杜绝并发回合交错写会话历史
+pub struct TurnGuard {
+    ctx: Arc<Ctx>,
+    sid: String,
+}
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.ctx.turn_locks.lock().unwrap().remove(&self.sid);
+    }
+}
+
+/// 进入回合前抢占会话锁：已有回合在跑时快速失败（而非交叠执行导致历史错乱/僵尸流）。
+/// 子任务（registry 的 task 工具）使用独立新会话 id，不受影响
+fn acquire_turn(ctx: &Arc<Ctx>, sid: &str) -> Result<TurnGuard, String> {
+    let mut locks = ctx.turn_locks.lock().unwrap();
+    if locks.contains_key(sid) {
+        return Err("该会话已有正在执行的回合，请等待完成后再发送新消息".into());
+    }
+    locks.insert(sid.to_string(), ());
+    Ok(TurnGuard { ctx: ctx.clone(), sid: sid.to_string() })
+}
 
 /// 会话中断：注册标志（chat_interrupt 置位后，执行循环在各检查点停止）
 fn register_interrupt(ctx: &Arc<Ctx>, target: &str) -> Arc<AtomicBool> {
@@ -15,8 +39,17 @@ fn register_interrupt(ctx: &Arc<Ctx>, target: &str) -> Arc<AtomicBool> {
     flag
 }
 
-pub fn clear_interrupt(ctx: &Arc<Ctx>, target: &str) {
-    ctx.interrupts.lock().unwrap().remove(target);
+pub fn clear_interrupt(ctx: &Arc<Ctx>, target: &str, flag: &Arc<AtomicBool>) {
+    let mut map = ctx.interrupts.lock().unwrap();
+    // 仅当映射中仍是本回合注册的标志时才摘除：防止误删并发/更新回合刚注册的
+    // 标志（误删后新回合将永远收不到中断请求，变成打不断的僵尸回合）
+    if map
+        .get(target)
+        .map(|f| Arc::ptr_eq(f, flag))
+        .unwrap_or(false)
+    {
+        map.remove(target);
+    }
 }
 
 pub fn interrupted(ctx: &Arc<Ctx>, target: &str) -> bool {
@@ -58,6 +91,36 @@ fn opt_thinking(t: &std::sync::Mutex<String>) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// 把已流出的部分回复落库（中断 / 上游中途断流时调用），返回清洗后的可见文本。
+/// 空文本不落库返回空串；可见文本为空时保留原文，避免什么都不剩
+fn persist_partial(
+    ctx: &Arc<Ctx>,
+    target: &str,
+    partial: String,
+    thinking: &Arc<std::sync::Mutex<String>>,
+) -> String {
+    let p = partial.trim().to_string();
+    if p.is_empty() {
+        return String::new();
+    }
+    let cleaned = strip_tool_json(&strip_think_blocks(&p));
+    let visible = if cleaned.is_empty() { p } else { cleaned };
+    let mut msg = ChatMessage::assistant(visible.clone());
+    msg.thinking = opt_thinking(thinking);
+    let mut store = ctx.sessions.lock().unwrap();
+    if let Some(sess) = store.get_mut(target) {
+        sess.messages.push(msg);
+        sess.touch();
+        if sess.messages.len() > CHAT_MAX {
+            let drop_n = sess.messages.len() - CHAT_MAX;
+            sess.messages.drain(0..drop_n);
+        }
+    }
+    drop(store);
+    crate::session::persist(ctx);
+    visible
+}
+
 /// 累计本会话 token 用量，返回带命中率的 usage 事件负载
 fn record_and_payload(ctx: &Arc<Ctx>, session: &str, usage: &ai::TokenUsage) -> serde_json::Value {
     let stats = crate::state::record_usage(ctx, session, usage);
@@ -74,23 +137,33 @@ fn record_and_payload(ctx: &Arc<Ctx>, session: &str, usage: &ai::TokenUsage) -> 
 /// 工具审批：弹出询问卡片等待用户应答（120 秒超时自动拒绝）。
 /// 是否需要询问由 auto_pass() 在调用方判定，这里只负责"问"。
 /// 等待期间每 500ms 轮询一次会话中断标志：用户点「停止」可立即取消审批中的工具
-async fn request_approval(
+/// 应答渠道：本地 UI（tool-approval 事件）或远程 POST /api/approvals/{id}
+pub(crate) async fn request_approval(
     ctx: &Arc<Ctx>,
     tool: &str,
     params: &serde_json::Value,
     session_id: Option<&str>,
+    actor: &str,
 ) -> Result<(), String> {
     use tauri::Emitter;
     let id = format!("ap-{}", ctx.approval_seq.fetch_add(1, Ordering::Relaxed));
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-    ctx.approvals.lock().unwrap().insert(id.clone(), tx);
+    ctx.approvals.lock().unwrap().insert(
+        id.clone(),
+        crate::state::PendingApproval {
+            tx,
+            tool: tool.to_string(),
+            params: params.clone(),
+            created: std::time::Instant::now(),
+        },
+    );
     let _ = ctx.app.emit(
         "tool-approval",
         json!({ "id": id, "tool": tool, "params": params }),
     );
     crate::audit::record(
         ctx,
-        "ai-self",
+        actor,
         "tool.approval_request",
         tool,
         json!({ "params": params }),
@@ -142,7 +215,7 @@ async fn request_approval(
 /// - allow_all：全部放行
 /// - auto：安全工具（沉淀类 / 只读类）放行，其余询问
 /// - ask（及其他值）：一律询问
-fn auto_pass(mode: &str, tool: &str) -> bool {
+pub(crate) fn auto_pass(mode: &str, tool: &str) -> bool {
     mode == "allow_all" || (mode == "auto" && is_safe_tool(tool))
 }
 
@@ -183,8 +256,10 @@ pub async fn execute_tool_call(
     params: &serde_json::Value,
     session_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    // 模型偶尔输出带空白的工具名（" shell "）：去空白再匹配
+    let name = name.trim();
     if !auto_pass(&ctx.config.lock().unwrap().tool_approval.clone(), name) {
-        request_approval(ctx, name, params, session_id).await?;
+        request_approval(ctx, name, params, session_id, "ai-self").await?;
     }
     match name {
         // ---- AI 基础能力：为自己写插件并注册 ----
@@ -335,6 +410,145 @@ pub async fn execute_tool_call(
     }
 }
 
+/// 幻觉防护备注：工具轮熔断 / 单词异常重复时在回复尾部追加标记行。
+/// 标记同时作为 auto-drive 的暂停信号（幻觉循环里继续自驱只会空烧 token）。
+fn guard_suffix(ctx: &Arc<Ctx>, visible: &str, tool_capped: bool, tool_rounds: usize, loop_max: u32) -> String {
+    let mut out = visible.to_string();
+    if tool_capped {
+        let note = format!("[tool-loop-guard] stopped after {tool_rounds} tool rounds (limit {loop_max}).");
+        if out.trim().is_empty() {
+            out = note;
+        } else {
+            out.push_str("\n\n");
+            out.push_str(&note);
+        }
+    }
+    let wmax = ctx.config.lock().unwrap().word_repeat_max;
+    if let Some((w, n)) = crate::repetition::find_repeat(&out, wmax) {
+        out.push_str(&format!(
+            "\n\n[repetition-guard] word \"{w}\" repeated {n} times (limit {wmax}); auto-continue paused."
+        ));
+    }
+    out
+}
+
+/// 目标自动推进判定：回合结束后调用。返回 Some(下一回合合成消息) 继续跑，None 停止。
+/// 停止条件：AI 回复以 [WAIT] 开头（请求用户决策/输入）、连续两轮回复完全一致（空转）、
+/// 本会话没有 active 目标、或该目标自动推进已达 AUTO_DRIVE_MAX 轮。
+fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> Option<String> {
+    // 幻觉防护命中（工具死循环 / 词重复刷屏）：停止自驱，等用户介入
+    if reply.contains("[tool-loop-guard]") || reply.contains("[repetition-guard]") {
+        return None;
+    }
+    if reply.trim_start().starts_with("[WAIT]") {
+        return None;
+    }
+    if !last_reply.is_empty() && last_reply == reply {
+        return None;
+    }
+    // 本会话的 active 目标（用户手动建的全局目标 session_id=None 不自动推进）
+    let goals = ctx.goals.lock().unwrap();
+    let todos = ctx.todos.lock().unwrap();
+    let goal = goals
+        .iter()
+        .find(|g| g.status == "active" && g.session_id.as_deref() == Some(sid))?;
+    let gid = goal.id.clone();
+    let title = goal.title.clone();
+    let all: Vec<crate::goal::Todo> = todos
+        .iter()
+        .filter(|t| t.goal_id.as_deref() == Some(gid.as_str()))
+        .cloned()
+        .collect();
+    drop(todos);
+    drop(goals);
+    let pending: Vec<&crate::goal::Todo> = all.iter().filter(|t| t.status != "completed").collect();
+    // 安全上限：同一目标最多 AUTO_DRIVE_MAX 轮自动推进
+    let mut counts = ctx.auto_drive_counts.lock().unwrap();
+    let n = counts.entry(gid).or_insert(0);
+    *n += 1;
+    if *n > crate::config::AUTO_DRIVE_MAX {
+        return None;
+    }
+    drop(counts);
+    let done = all.len() - pending.len();
+    let next_step = match pending.first() {
+        Some(t) => format!("下一步：「{}」。请执行这一步。", t.content),
+        // 待办全部完成但目标还挂着：让 AI 收尾（标记 achieved 并总结）
+        None => "所有待办均已完成。请调用 goal_update 将本目标标记为 achieved，并简要总结成果。".to_string(),
+    };
+    Some(format!(
+        "继续（自动推进）：目标「{title}」尚未完成（待办 {done}/{}）。{next_step}全部完成后调用 goal_update 将目标标记为 achieved。若必须等用户决策或输入才能继续，回复以 [WAIT] 开头并说明需要什么。",
+        all.len()
+    ))
+}
+
+/// 带目标自动推进的对话回合（非流式）：回合成功结束后，本会话存在 active 目标且未完成时
+/// 自动把规划的下一步作为新回合发给 AI，直到目标完成 / [WAIT] / 空转 / 达到上限。
+pub async fn chat_turn_auto(
+    ctx: &Arc<Ctx>,
+    session_id: &str,
+    user_input: &str,
+    images: Vec<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    if !ctx.config.lock().unwrap().auto_drive {
+        return chat_turn(ctx, session_id, user_input, images).await;
+    }
+    let mut msg = user_input.to_string();
+    let mut imgs = images;
+    let mut last_reply = String::new();
+    loop {
+        let msgs = chat_turn(ctx, session_id, &msg, std::mem::take(&mut imgs)).await?;
+        let reply = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        match auto_drive_next(ctx, session_id, &reply, &last_reply) {
+            Some(next) => {
+                last_reply = reply;
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                msg = next;
+            }
+            None => return Ok(msgs),
+        }
+    }
+}
+
+/// 带目标自动推进的对话回合（流式）：每个自动续跑的回合独立走完整流式事件，
+/// 前端通过每回合的 final 事件刷新消息列表，合成用户消息照常落库展示。
+pub async fn chat_turn_stream_auto(
+    ctx: &Arc<Ctx>,
+    session_id: &str,
+    user_input: &str,
+    event_name: &str,
+    images: Vec<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    if !ctx.config.lock().unwrap().auto_drive {
+        return chat_turn_stream(ctx, session_id, user_input, event_name, images).await;
+    }
+    let mut msg = user_input.to_string();
+    let mut imgs = images;
+    let mut last_reply = String::new();
+    loop {
+        let msgs = chat_turn_stream(ctx, session_id, &msg, event_name, std::mem::take(&mut imgs)).await?;
+        let reply = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        match auto_drive_next(ctx, session_id, &reply, &last_reply) {
+            Some(next) => {
+                last_reply = reply;
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                msg = next;
+            }
+            None => return Ok(msgs),
+        }
+    }
+}
+
 /// 对话主循环：调用模型 → 解析工具调用 → 执行 → 回喂结果 → 直到无工具调用
 /// 结果写入指定会话（session_id 为空则写入当前激活会话），返回该会话最新完整消息列表
 pub async fn chat_turn(
@@ -344,6 +558,13 @@ pub async fn chat_turn(
     images: Vec<String>,
 ) -> Result<Vec<ChatMessage>, String> {
     use tauri::Emitter;
+    // 0) 同会话回合互斥：先抢锁后写历史，被拒绝的并发请求不落任何消息
+    let target = if session_id.is_empty() {
+        ctx.sessions.lock().unwrap().active.clone()
+    } else {
+        session_id.to_string()
+    };
+    let _turn = acquire_turn(ctx, &target)?;
     // 1) 追加用户消息到目标会话
     {
         let mut store = ctx.sessions.lock().unwrap();
@@ -366,12 +587,7 @@ pub async fn chat_turn(
     }
     crate::session::persist(ctx);
 
-    let target = if session_id.is_empty() {
-        ctx.sessions.lock().unwrap().active.clone()
-    } else {
-        session_id.to_string()
-    };
-    register_interrupt(ctx, &target);
+    let iflag = register_interrupt(ctx, &target);
 
     // 原生工具调用探测：每个会话只探测一次（内存缓存不持久化，新会话自动重新探测，
     // 模型/接口更新后自适应）；探测过不支持的会话直接用文本约定提示词
@@ -399,10 +615,15 @@ pub async fn chat_turn(
     let mut native_exchanges: Vec<ai::ToolExchange> = Vec::new();
     let mut pending_images: Vec<String> = Vec::new();
     let mut round = 0usize;
+    let mut continues = 0usize; // 自动续发（截断重试）计数：整个回合最多 3 次
+    // 瞬态网络错误（流被截断/连接失败/超时）自动重试本轮的剩余次数
+    let mut net_retries = 2usize;
+    // 幻觉防护：本回合已执行的「工具调用轮」计数（tool_loop_max 熔断）
+    let mut tool_rounds = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
-            clear_interrupt(ctx, &target);
+            clear_interrupt(ctx, &target, &iflag);
             return Err("对话已中断".into());
         }
         // 图片只在第一轮（真正的用户轮）随请求发送；view_image 看过的图从第二轮起随请求注入
@@ -417,7 +638,7 @@ pub async fn chat_turn(
                 _ = wait_interrupt(ctx, &target) => Err(ai::NativeErr::Other(String::new())),
             };
             if interrupted(ctx, &target) {
-                clear_interrupt(ctx, &target);
+                clear_interrupt(ctx, &target, &iflag);
                 return Err("对话已中断".into());
             }
             match attempt {
@@ -450,19 +671,37 @@ pub async fn chat_turn(
                     round -= 1; // 重走本轮（保留第一轮携带图片的语义）
                     continue;
                 }
-                Err(ai::NativeErr::Other(e)) => return Err(e),
+                // 瞬态网络错误（流截断/连接失败）：自动重走本轮，业务错误不重试
+                Err(ai::NativeErr::Other(ref e)) if ai::is_transient_net_error(e) && net_retries > 0 => {
+                    net_retries -= 1;
+                    round -= 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(600 * (2 - net_retries) as u64)).await;
+                    continue;
+                }
+                Err(ai::NativeErr::Other(e)) => return Err(ai::user_err(&e)),
             }
         } else {
             // 文本协议统一走 SSE 流式（与桌面端一致）：非流式请求会被仅支持流式的端点拒绝
             // 思考过程增量（reasoning/thinking）累积进 round_thinking，随消息落库
             let think_buf = round_thinking.clone();
-            let (reply, usage) = ai::chat_stream_with_images(ctx, &convo, round_images, move |kind, tok| {
+            let stream = ai::chat_stream_with_images(ctx, &convo, round_images, move |kind, tok| {
                 if kind == ai::TokenKind::Think {
                     think_buf.lock().unwrap().push_str(tok);
                 }
                 true
             })
-            .await?;
+            .await;
+            let (reply, usage) = match stream {
+                Ok(r) => r,
+                // 瞬态网络错误（流截断/连接失败）：自动重走本轮，业务错误不重试
+                Err(ref e) if ai::is_transient_net_error(e) && net_retries > 0 => {
+                    net_retries -= 1;
+                    round -= 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(600 * (2 - net_retries) as u64)).await;
+                    continue;
+                }
+                Err(e) => return Err(ai::user_err(&e)),
+            };
             // 记录本轮用量并推送缓存命中率统计
             let payload = record_and_payload(ctx, &target, &usage);
             let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
@@ -473,25 +712,32 @@ pub async fn chat_turn(
             (reply, calls)
         };
 
-        if !native_calls.is_empty() {
-            // 并发执行全部工具调用（上限 16）：互不依赖的工具同时跑，结果仍按调用顺序回喂
-            let calls: Vec<ai::NativeToolCall> = native_calls.iter().take(16).cloned().collect();
-            let outcomes = futures_util::future::join_all(calls.iter().map(|call| {
-                let target = target.clone();
-                async move {
-                    if call.name.is_empty() {
-                        Err("Missing tool field".to_string())
-                    } else {
-                        tokio::select! {
-                            r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
-                            _ = wait_interrupt(ctx, &target) => Err(String::new()),
+        // 幻觉防护：工具调用轮达到配置上限时不再执行（回合走收尾，附熔断说明，0=不设限）
+        let loop_max = ctx.config.lock().unwrap().tool_loop_max;
+        let tool_capped = loop_max > 0 && tool_rounds >= loop_max as usize;
+        if !native_calls.is_empty() && !tool_capped {
+            tool_rounds += 1;
+            // 全量执行全部工具调用（不静默丢弃超限调用），并发上限 16，结果仍按调用顺序回喂
+            let calls: Vec<ai::NativeToolCall> = native_calls.clone();
+            let outcomes: Vec<Result<serde_json::Value, String>> = futures_util::stream::iter(calls.iter().cloned())
+                .map(|call| {
+                    let target = target.clone();
+                    async move {
+                        if call.name.is_empty() {
+                            Err("Missing tool field".to_string())
+                        } else {
+                            tokio::select! {
+                                r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
+                                _ = wait_interrupt(ctx, &target) => Err(String::new()),
+                            }
                         }
                     }
-                }
-            }))
-            .await;
+                })
+                .buffered(16)
+                .collect()
+                .await;
             if interrupted(ctx, &target) {
-                clear_interrupt(ctx, &target);
+                clear_interrupt(ctx, &target, &iflag);
                 return Err("对话已中断".into());
             }
             let mut records: Vec<crate::ai::ToolCallRecord> = Vec::new();
@@ -558,8 +804,11 @@ pub async fn chat_turn(
             continue;
         }
 
-        // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」，次数不限制（仅文本约定模式）
-        if !native_mode && looks_truncated(&reply) {
+        // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」（仅文本约定模式）。
+        // 续发上限 3 次：模型反复输出不完整回复时（如永远撑爆 max_tokens 的超大 JSON），
+        // 无限续发会无限烧 token——超限后落库可见部分并按普通回复结束回合
+        if !native_mode && looks_truncated(&reply) && continues < 3 {
+            continues += 1;
             let visible = strip_tool_json(&strip_think_blocks(&reply));
             if !visible.is_empty() {
                 let mut msg = ChatMessage::assistant(visible);
@@ -576,17 +825,26 @@ pub async fn chat_turn(
                 drop(store);
                 crate::session::persist(ctx);
             }
-            convo.push(ChatMessage::assistant(reply.clone()));
+            // 空回复（纯思考残渣）不压入上下文：部分端点（如 DeepSeek）拒收空 content
+            // 的 assistant 消息，会让续发轮直接 400 断线
+            if !reply.trim().is_empty() {
+                convo.push(ChatMessage::assistant(reply.clone()));
+            }
             convo.push(ChatMessage::user(CONTINUE_PROMPT));
             continue;
         }
         // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
         let visible = strip_tool_json(&strip_think_blocks(&reply));
         let visible = if visible.is_empty() { reply.clone() } else { visible };
+        // 幻觉防护备注：工具熔断 / 词重复（标记同时作为 auto-drive 的暂停信号）
+        let visible = guard_suffix(ctx, &visible, tool_capped, tool_rounds, loop_max);
         {
+            // 思考过程随最终回复落库（与流式路径一致，否则 TUI/远程对话重启后思考丢失）
+            let mut msg = ChatMessage::assistant(visible);
+            msg.thinking = opt_thinking(&round_thinking);
             let mut store = ctx.sessions.lock().unwrap();
             if let Some(sess) = store.get_mut(&target) {
-                sess.messages.push(ChatMessage::assistant(visible));
+                sess.messages.push(msg);
                 sess.touch();
                 if sess.messages.len() > CHAT_MAX {
                     let drop_n = sess.messages.len() - CHAT_MAX;
@@ -595,7 +853,7 @@ pub async fn chat_turn(
             }
         }
         crate::session::persist(ctx);
-        clear_interrupt(ctx, &target);
+        clear_interrupt(ctx, &target, &iflag);
         let out = ctx
             .sessions
             .lock()
@@ -638,6 +896,14 @@ pub async fn chat_turn_stream(
         let _ = app.emit(&ev, payload);
     };
 
+    // 0) 同会话回合互斥：先抢锁后写历史，被拒绝的并发请求不落任何消息；
+    // 中断标志注册到映射，各检查点查询、停止后按指针比对摘除，不留脏标志影响下一回合
+    let target = if session_id.is_empty() {
+        ctx.sessions.lock().unwrap().active.clone()
+    } else {
+        session_id.to_string()
+    };
+    let _turn = acquire_turn(ctx, &target)?;
     // 1) 追加用户消息
     {
         let mut store = ctx.sessions.lock().unwrap();
@@ -660,11 +926,6 @@ pub async fn chat_turn_stream(
     }
     crate::session::persist(ctx);
 
-    let target = if session_id.is_empty() {
-        ctx.sessions.lock().unwrap().active.clone()
-    } else {
-        session_id.to_string()
-    };
     let iflag = register_interrupt(ctx, &target);
 
     // 原生工具调用探测：每个会话只探测一次（内存缓存不持久化，新会话自动重新探测）；
@@ -691,10 +952,15 @@ pub async fn chat_turn_stream(
     let mut native_exchanges: Vec<ai::ToolExchange> = Vec::new();
     let mut pending_images: Vec<String> = Vec::new();
     let mut round = 0usize;
+    let mut continues = 0usize; // 自动续发（截断重试）计数：整个回合最多 3 次
+    // 瞬态网络错误（流被截断/连接失败/超时）自动重试本轮的剩余次数
+    let mut net_retries = 2usize;
+    // 幻觉防护：本回合已执行的「工具调用轮」计数（tool_loop_max 熔断）
+    let mut tool_rounds = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
-            clear_interrupt(ctx, &target);
+            clear_interrupt(ctx, &target, &iflag);
             let e = "对话已中断".to_string();
             emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
             return Err(e);
@@ -725,7 +991,7 @@ pub async fn chat_turn_stream(
                 _ = wait_interrupt(ctx, &target) => Err(ai::NativeErr::Other(String::new())),
             };
             if interrupted(ctx, &target) {
-                clear_interrupt(ctx, &target);
+                clear_interrupt(ctx, &target, &iflag);
                 let e = "对话已中断".to_string();
                 emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
                 return Err(e);
@@ -759,22 +1025,37 @@ pub async fn chat_turn_stream(
                     round -= 1;
                     continue;
                 }
+                // 瞬态网络错误（流截断/连接失败）：自动重走本轮；本轮已流出的半截内容由前端清空
+                Err(ai::NativeErr::Other(ref e)) if ai::is_transient_net_error(e) && net_retries > 0 => {
+                    net_retries -= 1;
+                    round -= 1;
+                    emit(json!({ "type": "net_retry", "attempt": 2 - net_retries, "error": ai::user_err(e) }));
+                    tokio::time::sleep(std::time::Duration::from_millis(600 * (2 - net_retries) as u64)).await;
+                    continue;
+                }
                 Err(ai::NativeErr::Other(e)) => {
-                    clear_interrupt(ctx, &target);
+                    clear_interrupt(ctx, &target, &iflag);
+                    let e = ai::user_err(&e);
                     emit(json!({ "type": "error", "error": e.clone() }));
                     return Err(e);
                 }
             }
         } else {
-            // 流式过程中若收到中断请求：回调返回 false 立即断开 SSE 读取（不再等流自然结束）
+            // 流式过程中若收到中断请求：回调返回 false 立即断开 SSE 读取（不再等流自然结束）。
+            // 直接查 interrupts 映射而非开局捕获的 Arc：同会话新回合会替换映射条目，
+            // 旧回合若还持有旧 Arc 就永远收不到置位（僵尸流持续推事件、无法停止）
             let stream_cancelled = Arc::new(AtomicBool::new(false));
+            // 服务器侧同步累积已流出的正文：中断/上游断流时把部分回复落库，避免内容"消失"
+            let text_buf = Arc::new(std::sync::Mutex::new(String::new()));
             let result = {
                 let emit_ref = &emit;
                 let sc = stream_cancelled.clone();
-                let iflag2 = iflag.clone();
+                let icheck_ctx = ctx.clone();
+                let icheck_target = target.clone();
                 let think_buf = round_thinking.clone();
+                let text_acc = text_buf.clone();
                 ai::chat_stream_with_images(ctx, &convo, round_images, move |kind, tok| {
-                    if iflag2.load(Ordering::Relaxed) {
+                    if interrupted(&icheck_ctx, &icheck_target) {
                         sc.store(true, Ordering::Relaxed);
                         return false;
                     }
@@ -784,23 +1065,44 @@ pub async fn chat_turn_stream(
                             think_buf.lock().unwrap().push_str(tok);
                             emit_ref(json!({ "type": "think", "text": tok }));
                         }
-                        ai::TokenKind::Text => emit_ref(json!({ "type": "delta", "text": tok })),
+                        ai::TokenKind::Text => {
+                            text_acc.lock().unwrap().push_str(tok);
+                            emit_ref(json!({ "type": "delta", "text": tok }));
+                        }
                     }
                     true
                 })
                 .await
             };
             if interrupted(ctx, &target) || stream_cancelled.load(Ordering::Relaxed) {
-                clear_interrupt(ctx, &target);
+                clear_interrupt(ctx, &target, &iflag);
+                // 中断时已流出的部分回复同样落库：用户点停止前的半截答案保留在历史里
+                let _ = persist_partial(ctx, &target, text_buf.lock().unwrap().clone(), &round_thinking);
                 let e = "对话已中断".to_string();
                 emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
                 return Err(e);
             }
             let (reply, round_usage) = match result {
                 Ok(r) => r,
+                // 瞬态网络错误（流截断/连接失败）：自动重走本轮，本轮半截内容直接丢弃
+                // （历史未落库、前端在 net_retry 事件里清空实时区），业务错误不重试
+                Err(ref e) if ai::is_transient_net_error(e) && net_retries > 0 => {
+                    net_retries -= 1;
+                    round -= 1;
+                    emit(json!({ "type": "net_retry", "attempt": 2 - net_retries, "error": ai::user_err(e) }));
+                    tokio::time::sleep(std::time::Duration::from_millis(600 * (2 - net_retries) as u64)).await;
+                    continue;
+                }
                 Err(e) => {
-                    clear_interrupt(ctx, &target);
-                    emit(json!({ "type": "error", "error": e.clone() }));
+                    // 上游中途断流：部分回复落库并随 error 事件带回，前端保住已显示的内容
+                    let visible = persist_partial(ctx, &target, text_buf.lock().unwrap().clone(), &round_thinking);
+                    clear_interrupt(ctx, &target, &iflag);
+                    let e = ai::user_err(&e);
+                    let mut ev = json!({ "type": "error", "error": e.clone() });
+                    if !visible.is_empty() {
+                        ev["partial"] = json!(visible);
+                    }
+                    emit(ev);
                     return Err(e);
                 }
             };
@@ -817,25 +1119,32 @@ pub async fn chat_turn_stream(
 
         // 原生模式已走流式（增量实时推送）；端点不支持流式时由 chat_native_round_stream 整段补发，无需在此重复下发
 
-        if !native_calls.is_empty() {
-            // 并发执行全部工具调用（上限 16）：互不依赖的工具同时跑，结果仍按调用顺序回喂
-            let calls: Vec<ai::NativeToolCall> = native_calls.iter().take(16).cloned().collect();
-            let outcomes = futures_util::future::join_all(calls.iter().map(|call| {
-                let target = target.clone();
-                async move {
-                    if call.name.is_empty() {
-                        Err("Missing tool field".to_string())
-                    } else {
-                        tokio::select! {
-                            r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
-                            _ = wait_interrupt(ctx, &target) => Err(String::new()),
+        // 幻觉防护：工具调用轮达到配置上限时不再执行（回合走收尾，附熔断说明，0=不设限）
+        let loop_max = ctx.config.lock().unwrap().tool_loop_max;
+        let tool_capped = loop_max > 0 && tool_rounds >= loop_max as usize;
+        if !native_calls.is_empty() && !tool_capped {
+            tool_rounds += 1;
+            // 全量执行全部工具调用（不静默丢弃超限调用），并发上限 16，结果仍按调用顺序回喂
+            let calls: Vec<ai::NativeToolCall> = native_calls.clone();
+            let outcomes: Vec<Result<serde_json::Value, String>> = futures_util::stream::iter(calls.iter().cloned())
+                .map(|call| {
+                    let target = target.clone();
+                    async move {
+                        if call.name.is_empty() {
+                            Err("Missing tool field".to_string())
+                        } else {
+                            tokio::select! {
+                                r = execute_tool_call(ctx, &call.name, &call.args, Some(&target)) => r,
+                                _ = wait_interrupt(ctx, &target) => Err(String::new()),
+                            }
                         }
                     }
-                }
-            }))
-            .await;
+                })
+                .buffered(16)
+                .collect()
+                .await;
             if interrupted(ctx, &target) {
-                clear_interrupt(ctx, &target);
+                clear_interrupt(ctx, &target, &iflag);
                 let e = "对话已中断".to_string();
                 emit(json!({ "type": "error", "error": e.clone(), "interrupted": true }));
                 return Err(e);
@@ -905,8 +1214,10 @@ pub async fn chat_turn_stream(
             continue;
         }
 
-        // 回复不完整（截断/纯思考残渣）：不结束回合，自动补发「继续」（仅文本约定模式）
-        if !native_mode && looks_truncated(&reply) {
+        // 回复不完整（截断/纯思考残渣）：不结束回合，自动补发「继续」（仅文本约定模式）。
+        // 续发上限 3 次：模型反复截断时超限落库可见部分并结束回合，避免无限烧 token
+        if !native_mode && looks_truncated(&reply) && continues < 3 {
+            continues += 1;
             let visible = strip_tool_json(&strip_think_blocks(&reply));
             if !visible.is_empty() {
                 let mut msg = ChatMessage::assistant(visible.clone());
@@ -925,13 +1236,18 @@ pub async fn chat_turn_stream(
             }
             // 通知前端：本轮是不完整回复 → 用清洗后的片段替换原始流式文本
             emit(json!({ "type": "continue", "visible": visible }));
-            convo.push(ChatMessage::assistant(reply.clone()));
+            // 空回复不压入上下文（DeepSeek 等端点拒收空 content 的 assistant 消息）
+            if !reply.trim().is_empty() {
+                convo.push(ChatMessage::assistant(reply.clone()));
+            }
             convo.push(ChatMessage::user(CONTINUE_PROMPT));
             continue;
         }
         // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
         let visible = strip_tool_json(&strip_think_blocks(&reply));
         let visible = if visible.is_empty() { reply.clone() } else { visible };
+        // 幻觉防护备注：工具熔断 / 词重复（标记同时作为 auto-drive 的暂停信号）
+        let visible = guard_suffix(ctx, &visible, tool_capped, tool_rounds, loop_max);
         {
             let mut msg = ChatMessage::assistant(visible);
             msg.thinking = opt_thinking(&round_thinking);
@@ -946,7 +1262,7 @@ pub async fn chat_turn_stream(
             }
         }
         crate::session::persist(ctx);
-        clear_interrupt(ctx, &target);
+        clear_interrupt(ctx, &target, &iflag);
         let out = ctx
             .sessions
             .lock()
@@ -1165,6 +1481,136 @@ fn find_unterminated_tool_json(reply: &str) -> Option<usize> {
     None
 }
 
+/// 归一化一条文本协议工具调用（兼容模型跑偏的输出形态）：
+/// ① 协议标准 {"tool":"name","params":{...}}；② OpenAI 风格 {"name":..,"arguments":..}
+/// （arguments 可为内嵌 JSON 字符串或对象）；③ 嵌套 {"function":{"name","arguments"}}；
+/// ④ params 缺失/null 补 {}；⑤ params 写成字符串时尝试按 JSON 解析，失败包成 {"input":..}；
+/// ⑥ 工具名去首尾空白。仅凭 "name" 字段不认（散文里的 {"name":"John"} 会误判），
+/// name 风格必须伴随 arguments/params/function 字段
+fn normalize_tool_call(v: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    if v.get("tool").is_none()
+        && v.get("arguments").is_none()
+        && v.get("function").is_none()
+        && v.get("params").is_none()
+    {
+        return None;
+    }
+    let name = v
+        .get("tool")
+        .or_else(|| v.get("name"))
+        .or_else(|| v.pointer("/function/name"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let mut params = v
+        .get("params")
+        .or_else(|| v.get("arguments"))
+        .or_else(|| v.pointer("/function/arguments"))
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    if params.is_null() {
+        params = serde_json::json!({});
+    }
+    if let Some(s) = params.as_str() {
+        params = serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .filter(|p| p.is_object())
+            .unwrap_or(serde_json::json!({ "input": s }));
+    }
+    Some((name, params))
+}
+
+fn normalize_calls(calls: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    calls
+        .iter()
+        .filter_map(|c| {
+            normalize_tool_call(c).map(|(name, params)| serde_json::json!({ "tool": name, "params": params }))
+        })
+        .collect()
+}
+
+/// 把模型跑偏的 JSON「修」回可解析形态（仅在标准解析失败时作兜底重试）：
+/// ① 智能引号 “ ” ‘ ’ → ASCII 引号；② 结构位置的全角 ： ， → 半角；③ ] } 前的尾逗号删除。
+/// 字符串内部的字符一律不动（避免破坏命令/文件内容语义）。修不出平衡结构返回 None
+fn jsonish_repair(reply: &str) -> Option<String> {
+    let chars: Vec<char> = reply.chars().collect();
+    let mut out = String::with_capacity(reply.len());
+    let mut str_open: Option<char> = None; // 开引号（'"' 为 ASCII 串，转义感知）
+    let mut esc = false;
+    let mut depth = 0i32;
+    for (idx, &c) in chars.iter().enumerate() {
+        if let Some(open) = str_open {
+            if open == '"' {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    str_open = None;
+                }
+                out.push(c);
+                continue;
+            }
+            // 智能引号字符串：遇匹配闭引号或 ASCII 引号收束，闭引号统一改写为 "
+            let closes = matches!(
+                (open, c),
+                ('“', '”') | ('“', '"') | ('‘', '’') | ('‘', '\'')
+            );
+            if closes {
+                str_open = None;
+                out.push('"');
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                str_open = Some('"');
+                out.push('"');
+            }
+            '“' | '”' => {
+                str_open = Some('“');
+                out.push('"');
+            }
+            '\'' => {
+                str_open = Some('\'');
+                out.push('\'');
+            }
+            '‘' | '’' => {
+                str_open = Some('‘');
+                out.push('\'');
+            }
+            '：' => out.push(':'),
+            '，' | ',' => {
+                // 尾逗号：结构位置上后面（跳过空白）紧跟 ] 或 } 则删除
+                let next = chars[idx + 1..].iter().find(|x| !x.is_whitespace());
+                if !matches!(next, Some(']') | Some('}')) {
+                    out.push(',');
+                }
+            }
+            '{' | '[' => {
+                depth += 1;
+                out.push(c);
+            }
+            '}' | ']' => {
+                depth -= 1;
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    // 修不出平衡结构（字符串未闭合 / 括号失衡）：交还上层按截断等路径处理
+    if str_open.is_some() || depth != 0 {
+        return None;
+    }
+    if out == reply {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// 扫描文本中所有平衡的 {...} JSON 对象，返回（解析值, 起始字节, 结束字节）。
 /// 只保留含字符串字段 "tool" 的对象——部分模型不按数组协议输出，而是每行一个
 /// 裸对象、甚至自创 <xxx_function_call> 之类的标记前缀
@@ -1210,7 +1656,7 @@ fn find_tool_objects(reply: &str) -> Vec<(serde_json::Value, usize, usize)> {
             break; // 剩余部分不平衡，放弃
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply[i..=j]) {
-            if v.get("tool").and_then(|t| t.as_str()).is_some() {
+            if normalize_tool_call(&v).is_some() {
                 out.push((v, i, j + 1));
                 i = j + 1;
                 continue;
@@ -1222,19 +1668,27 @@ fn find_tool_objects(reply: &str) -> Vec<(serde_json::Value, usize, usize)> {
 }
 
 /// 解析回复中的工具调用：标准 JSON 数组协议优先；
-/// 兼容模型散落的单个 {"tool":...} 对象（可带 <xxx_function_call> 自创标记）
+/// 兼容模型散落的单个 {"tool":...} 对象（可带 <xxx_function_call> 自创标记）；
+/// 标准解析失败时用 jsonish_repair 兜底重试（智能引号/全角标点/尾逗号）；
+/// 全部结果经 normalize_tool_call 归一化为 {"tool","params"}
 fn parse_tool_calls(reply: &str) -> Option<Vec<serde_json::Value>> {
-    if let Some(calls) = crate::autopilot::parse_json_array(reply) {
-        if !calls.is_empty() && looks_like_tool_calls(&calls) {
-            return Some(calls);
+    for text in std::iter::once(reply).chain(jsonish_repair(reply).iter().map(|s| s.as_str())) {
+        if let Some(calls) = crate::autopilot::parse_json_array(text) {
+            let norm = normalize_calls(&calls);
+            if !norm.is_empty() {
+                return Some(norm);
+            }
+        }
+        let objs = find_tool_objects(text);
+        if !objs.is_empty() {
+            let vals: Vec<serde_json::Value> = objs.into_iter().map(|(v, _, _)| v).collect();
+            let norm = normalize_calls(&vals);
+            if !norm.is_empty() {
+                return Some(norm);
+            }
         }
     }
-    let objs = find_tool_objects(reply);
-    if objs.is_empty() {
-        None
-    } else {
-        Some(objs.into_iter().map(|(v, _, _)| v).collect())
-    }
+    None
 }
 
 #[cfg(test)]
@@ -1323,6 +1777,79 @@ mod tests {
         let calls = parse_tool_calls(reply).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["params"]["command"], "dir");
+    }
+
+    /// OpenAI 风格 name/arguments（arguments 为内嵌 JSON 字符串）——部分模型文本模式跑偏常见形态
+    #[test]
+    fn test_parse_openai_function_style() {
+        let reply = r#"我来执行：{"name": "shell", "arguments": "{\"command\": \"echo hi\"}"}"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "shell");
+        assert_eq!(calls[0]["params"]["command"], "echo hi");
+    }
+
+    /// 嵌套 function 对象风格
+    #[test]
+    fn test_parse_nested_function_style() {
+        let reply = r#"{"function": {"name": "shell", "arguments": {"command": "dir"}}}"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls[0]["tool"], "shell");
+        assert_eq!(calls[0]["params"]["command"], "dir");
+    }
+
+    /// 裸 {"name":...}（无 arguments/params/function 字段）不得误判为工具调用（散文数据对象）
+    #[test]
+    fn test_reject_bare_name_object() {
+        assert!(parse_tool_calls(r#"用户是 {"name": "John", "age": 30}，请记住"#).is_none());
+    }
+
+    /// 智能引号 + 全角冒号：jsonish_repair 兜底（标准解析失败后重试）
+    #[test]
+    fn test_parse_smart_quotes_and_fullwidth() {
+        let reply = "[{“tool”：“shell”, “params”：{“command”：“echo smart-ok”}}]";
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls[0]["tool"], "shell");
+        assert_eq!(calls[0]["params"]["command"], "echo smart-ok");
+    }
+
+    /// 尾逗号（对象内部）：find_tool_objects 的 serde 解析失败 → repair 兜底
+    #[test]
+    fn test_parse_trailing_comma() {
+        let reply = r#"[{"tool":"shell","params":{"command":"echo a",}}]"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls[0]["params"]["command"], "echo a");
+    }
+
+    /// params 写成字符串：尝试按 JSON 解析为对象
+    #[test]
+    fn test_parse_params_as_string() {
+        let reply = r#"[{"tool":"shell","params":"{\"command\":\"echo x\"}"}]"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls[0]["params"]["command"], "echo x");
+    }
+
+    /// 工具名带空白：归一化去空白
+    #[test]
+    fn test_parse_tool_name_whitespace() {
+        let reply = r#"[{"tool":" shell ","params":{"command":"echo ws"}}]"#;
+        let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls[0]["tool"], "shell");
+    }
+
+    /// 修复不动字符串内部的全角字符（命令/内容语义不被破坏）
+    #[test]
+    fn test_repair_keeps_string_content() {
+        let reply = "{“tool”：“shell”，“params”：{“command”：“echo a：b”}}";
+        let repaired = jsonish_repair(reply).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v.pointer("/params/command").and_then(|x| x.as_str()), Some("echo a：b"));
+    }
+
+    /// 修不出平衡结构（字符串未闭合）返回 None，交还上层按截断处理
+    #[test]
+    fn test_repair_rejects_unbalanced() {
+        assert!(jsonish_repair("{“tool”: \"shell\"").is_none());
     }
 
     /// 不含 tool 字段的 JSON 不应被误判为工具调用

@@ -1,3 +1,4 @@
+// yxpil · BIT
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -8,6 +9,14 @@ use tauri::Manager;
 
 use crate::ai::AiConfig;
 use crate::audit::AuditEntry;
+
+/// 工具质量评估模块（挂在 state 下声明，避免 main.rs 被外部同步回退时丢 mod 声明）
+#[path = "toolstats.rs"]
+pub mod toolstats;
+
+/// 设备指纹与设备凭证（账号凭证 + 信道签名材料）
+#[path = "device.rs"]
+pub mod device;
 use crate::goal::{Goal, Todo};
 use crate::memory::{Memory, Skill};
 use crate::registry::ToolDef;
@@ -79,20 +88,46 @@ pub struct Ctx {
     pub autopilot_running: AtomicBool,
     /// 会话中断标志（session_id → flag），chat_interrupt 置位后执行循环在检查点停止
     pub interrupts: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 同会话回合互斥：同一会话同时只允许一个对话回合在跑，防止并发回合交错写会话历史
+    pub turn_locks: Mutex<HashMap<String, ()>>,
     /// 原生工具调用探测缓存（session_id → 该会话端点是否支持 tools 参数）。
     /// 只存内存、不持久化：每个会话首次请求时探测一次，模型/接口更新后新会话自动重新探测
     pub native_probe: Mutex<HashMap<String, bool>>,
     /// 提示词缓存命中率统计（session_id → 累计用量）。内存态，重启清零
     pub cache_stats: Mutex<HashMap<String, CacheStats>>,
-    /// 待审批工具调用（request_id → 应答通道）
-    pub approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    /// 待审批工具调用（request_id → 应答通道 + 元信息，供审批列表接口展示）
+    pub approvals: Mutex<HashMap<String, PendingApproval>>,
     /// 审批请求自增 id
     pub approval_seq: AtomicU64,
     pub server_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// 云中继客户端循环句柄（随远程服务启停）
+    pub relay_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// 远程端口被占用自动切换时的原端口（内存态；正常绑定即清空，前端启动时查询展示提示）
+    pub port_switch: Mutex<Option<u16>>,
+    /// 目标自动推进计数（goal_id → 已自动续跑轮数，防空转；目标完成后残留条目无害）
+    pub auto_drive_counts: Mutex<HashMap<String, u32>>,
+    /// 远程对话限速：客户端标识（IP）→ 最近请求时刻滑动窗口。内存态，重启清零
+    pub chat_rate: Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>,
+    /// 每 IP 并发在途对话请求计数（IP → 计数）。防单 IP 洪泛占满对话通道；请求结束即递减
+    pub active_per_ip: Mutex<HashMap<String, u32>>,
+    /// bitsign 验签的 nonce 重放缓存（信道防护：同一签名 nonce 只允许用一次）
+    pub nonce_seen: Mutex<crate::security::NonceCache>,
+    /// 工具质量统计：tool_id → 成功率等（内存态 + tool_stats.json 落盘）
+    pub tool_stats: Mutex<toolstats::Store>,
+    /// 进程启动时刻（诊断报告的运行时长）
+    pub started: std::time::Instant,
 }
 
 pub const AUDIT_MAX: usize = 2000;
 pub const CHAT_MAX: usize = 200;
+
+/// 一条待审批的工具调用：应答通道 + 展示用元信息（工具名 / 参数 / 发起时刻）
+pub struct PendingApproval {
+    pub tx: tokio::sync::oneshot::Sender<bool>,
+    pub tool: String,
+    pub params: serde_json::Value,
+    pub created: std::time::Instant,
+}
 
 impl Ctx {
     pub fn load(app: tauri::AppHandle) -> Arc<Ctx> {
@@ -150,6 +185,9 @@ impl Ctx {
         // 解释器列表：启动时直接用缓存（探测在后台进行，不阻塞窗口显示），
         // 后台 refresh_runtimes() 完成后更新状态并通知前端
         let runtimes: Vec<Runtime> = cached;
+        // data_dir 要 move 进 Ctx，工具统计先读出来
+        let tool_stats: toolstats::Store =
+            read_json(&data_dir.join("tool_stats.json")).unwrap_or_default();
 
         Arc::new(Ctx {
             app,
@@ -168,12 +206,24 @@ impl Ctx {
             mcp: Mutex::new(mcp),
             mcp_sessions: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
+            turn_locks: Mutex::new(HashMap::new()),
             native_probe: Mutex::new(HashMap::new()),
             cache_stats: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             approval_seq: AtomicU64::new(1),
             autopilot_running: AtomicBool::new(false),
             server_task: Mutex::new(None),
+            relay_task: Mutex::new(None),
+            port_switch: Mutex::new(None),
+            auto_drive_counts: Mutex::new(HashMap::new()),
+            chat_rate: Mutex::new(HashMap::new()),
+            active_per_ip: Mutex::new(HashMap::new()),
+            nonce_seen: Mutex::new(crate::security::NonceCache::new(
+                std::time::Duration::from_secs(crate::security::BITSIGN_TS_WINDOW as u64),
+                8192,
+            )),
+            tool_stats: Mutex::new(tool_stats),
+            started: std::time::Instant::now(),
         })
     }
 

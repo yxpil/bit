@@ -1,3 +1,4 @@
+// yxpil · BIT
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -193,7 +194,8 @@ pub async fn initialize(
 
 /// 发现单个端口：TCP 连通则尝试 MCP 握手，识别成功返回 Discovered
 pub async fn probe_port(host: &str, port: u16) -> Option<Discovered> {
-    let addr = format!("{host}:{port}");
+    // IPv6 字面量加方括号（TcpStream::connect 与 URL 均要求 [::1]:8600 形态）
+    let addr = crate::config::join_host_port(host, port);
     // 先快速 TCP 探测，未开放直接跳过
     if tokio::time::timeout(
         std::time::Duration::from_millis(600),

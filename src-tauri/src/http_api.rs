@@ -1,5 +1,6 @@
+// yxpil · BIT
 use crate::state::Ctx;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -9,6 +10,7 @@ use axum::Router;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tauri::Emitter;
 
 /// 启动/重启远程访问 HTTP 服务
 pub async fn restart_server(ctx: &Arc<Ctx>) -> Result<String, String> {
@@ -18,25 +20,99 @@ pub async fn restart_server(ctx: &Arc<Ctx>) -> Result<String, String> {
         task.abort();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
+    // 旧中继循环必须一并终止：否则每次重启都泄漏一个 poller，
+    // 多个 poller 轮流抢走隧道请求，泄漏循环一旦卡死请求就无人应答
+    if let Some(t) = ctx.relay_task.lock().unwrap().take() {
+        t.abort();
+    }
 
     let cfg = ctx.config.lock().unwrap().clone();
     if !cfg.remote_enabled {
+        // 远程关闭：中继循环一并停止
+        if let Some(t) = ctx.relay_task.lock().unwrap().take() {
+            t.abort();
+        }
         return Ok("disabled".into());
     }
 
     let addr = cfg.listen_addr();
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| format!("绑定 {addr} 失败: {e}"))?;
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => {
+            // 绑定到配置端口：清空切换提示
+            *ctx.port_switch.lock().unwrap() = None;
+            l
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // 端口被占用：自动向后尝试 port+1..=+50，最后兜底临时端口；
+            // 切换结果写入配置并通知前端告知用户
+            let host = cfg.host.clone();
+            let wanted_port = cfg.port;
+            let mut found = None;
+            for p in wanted_port + 1..=wanted_port + 50 {
+                if let Ok(l) = tokio::net::TcpListener::bind(crate::config::join_host_port(&host, p)).await {
+                    found = Some((l, p));
+                    break;
+                }
+            }
+            let (listener, new_port) = match found {
+                Some(x) => x,
+                // 兜底：内核分配临时端口（保证服务能起来）
+                None => {
+                    let l = tokio::net::TcpListener::bind(crate::config::join_host_port(&host, 0))
+                        .await
+                        .map_err(|e| format!("绑定 {addr} 失败（{wanted_port}..{} 均被占用）: {e}", wanted_port + 50))?;
+                    let p = l.local_addr().map_err(|e| e.to_string())?.port();
+                    (l, p)
+                }
+            };
+            let new_addr = crate::config::join_host_port(&host, new_port);
+            // 更新配置并落盘（单处真源：托盘/远程页/连通性测试都读配置）
+            {
+                let mut c = ctx.config.lock().unwrap();
+                c.port = new_port;
+                c.revision += 1;
+            }
+            ctx.save_config();
+            *ctx.port_switch.lock().unwrap() = Some(wanted_port);
+            crate::audit::record(ctx, "local-user", "remote.port_switch", "config", json!({ "from": wanted_port, "to": new_port }), true);
+            let _ = ctx.app.emit("remote-port-switched", json!({ "from": wanted_port, "to": new_port, "addr": new_addr }));
+            let _ = crate::tray::refresh(&ctx.app);
+            eprintln!("[BIT] port {wanted_port} in use, switched to {new_port}");
+            listener
+        }
+        Err(e) => return Err(format!("绑定 {addr} 失败: {e}")),
+    };
 
+    // local_addr 在 listener 被 move 进服务任务前取出
+    let bound_port = listener
+        .local_addr()
+        .map_err(|e| format!("获取监听端口失败: {e}"))?
+        .port();
     let router = build_router(ctx.clone());
     let task = tauri::async_runtime::spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
+        // with_connect_info：让 handler 能取到客户端 IP（对话限速按 IP 分桶）
+        if let Err(e) = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
             eprintln!("[BIT] http server stopped: {e}");
         }
     });
     *ctx.server_task.lock().unwrap() = Some(task);
-    Ok(addr)
+    // 设备凭证注册（幂等，先于服务与中继启动）：bitsign-v2 验签材料依赖它。首次启动
+    // 采集硬件指纹 + 公网 IP（公开 API 竞速 5s）+ 时间戳派生并落盘；失败不阻断服务
+    if let Err(e) = crate::state::device::ensure_device_key(&ctx).await {
+        eprintln!("[BIT] device register failed (channel verify degraded): {e}");
+    }
+    // 云中继客户端：与 HTTP 服务同生命周期；内部动态读配置，未配置中继时不产生外联
+    {
+        let relay_ctx = ctx.clone();
+        let relay_loop = tauri::async_runtime::spawn(async move { crate::relay::run_loop(relay_ctx).await });
+        *ctx.relay_task.lock().unwrap() = Some(relay_loop);
+    }
+    Ok(crate::config::join_host_port(&cfg.host, bound_port))
 }
 
 pub fn build_router(ctx: Arc<Ctx>) -> Router {
@@ -46,7 +122,12 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/tools/{id}", axum::routing::delete(remove_tool))
         .route("/api/tools/{id}/invoke", post(invoke_tool))
         .route("/api/chat", post(remote_chat))
+        .route("/api/approvals", get(list_approvals))
+        .route("/api/approvals/{id}", post(answer_approval))
+        .route("/api/context/metrics", get(context_metrics_route))
         .route("/api/audit", get(list_audit))
+        // 连接二维码 payload（手机端 / E2E 测试用，与 Tauri get_remote_qr 同源）
+        .route("/api/qr", get(qr_route))
         // 自动更新：检测 / 状态 / 手动下载（启动后台任务已自动下，此处供远程管理用）
         .route("/api/update/check", get(update_check))
         .route("/api/update/status", get(update_status))
@@ -55,13 +136,25 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/debug/state", get(debug_state))
         .route("/api/debug/sessions", get(debug_sessions))
         .route("/api/debug/sessions/{id}", get(debug_session_detail))
+        .route("/api/debug/goals", get(debug_goals))
         .route("/api/debug/mcp", get(debug_mcp))
+        .route("/api/debug/interrupt", post(debug_interrupt))
+        .route("/api/debug/config", post(debug_config))
         .route("/mcp", post(mcp_endpoint).delete(mcp_delete))
         // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
         .route("/v1/models", get(openai_models))
         .route("/v1/chat/completions", post(openai_chat_completions))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
         .with_state(ctx)
+}
+
+/// GET /api/qr：连接二维码 payload（与 Tauri get_remote_qr 同一数据源，含 128 位识别码
+/// 与三种连接方式），手机端脚本化获取 / E2E 断言用
+async fn qr_route(State(ctx): State<Arc<Ctx>>) -> Response {
+    match crate::commands::qr_payload(&ctx).await {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -366,6 +459,30 @@ async fn mcp_delete(State(ctx): State<Arc<Ctx>>, headers: HeaderMap) -> Response
     }
 }
 
+/// 来源 IP 网段归并（与 relay-worker / fake_relay 的 ipPrefix 完全同口径）：
+/// v4 取前 3 段（/24），v6 取前 4 组（/48），回环原样，空 → "unknown"。
+/// 口径必须与 Worker 端许可盖章逐字符一致——BIT 端比对"真实来源 IP 的网段"与
+/// Worker 盖章的许可网段（x-bit-permit-pfx），实现差异会造成误杀正常请求
+fn ip_prefix(ip: &str) -> String {
+    if ip.is_empty() {
+        return "unknown".to_string();
+    }
+    if ip == "::1" || ip == "127.0.0.1" {
+        return ip.to_string();
+    }
+    if ip.contains(':') {
+        // 与 JS ip.split(":").slice(0, 4).join(":") 同语义（含 "::" 在前 4 组时的边缘形态）
+        let parts: Vec<&str> = ip.split(':').collect();
+        return parts.iter().take(4).copied().collect::<Vec<_>>().join(":");
+    }
+    let o: Vec<&str> = ip.split('.').collect();
+    if o.len() == 4 {
+        o[..3].join(".")
+    } else {
+        ip.to_string()
+    }
+}
+
 /// 鉴权校验（纯函数，便于单测）：
 /// - /api/health 免鉴权
 /// - 第一重：Bearer Client Key 或 ?key= 查询参数；Client Key 未配置一律拒绝（防止空 key 绕过）
@@ -448,6 +565,111 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
             .into_response();
     }
 
+    // 信道防护（bitsign-v2）：x-bit-via 头由本机中继循环回环时添加（直连请求没有），
+    // 命中即视为"经云中继进入"→ 强制验签。第三方 App 无法算出合法签名，借道中继直接 403；
+    // LAN 直连 / 本机访问不受影响（第三方 OpenAI 客户端兼容保留）。
+    // 验签通过后返回经中继进入时附带的真实手机端 IP（x-bit-client-ip，本机 poller 注入）
+    let via_relay = req.headers().get("x-bit-via").and_then(|v| v.to_str().ok()) == Some("relay");
+    let mut relay_client_ip: Option<String> = None;
+    // 敏感端点中继隔离：/api/qr（响应含 client_key/识别码/局域网地址）与 /api/debug/*
+    // （可远程改配置——关防护/关审核/换上游）绝不允许经云中继触达。放在验签之前：
+    // channel_guard 关闭时同样生效（与站点门槛同理：客户端开关绕不过），
+    // 与 Worker 站点层路径拒绝互为纵深（私有中继也拦得住）
+    if via_relay && (path == "/api/qr" || path.starts_with("/api/debug")) {
+        crate::audit::record(&ctx, &actor_of(&provided), "http.channel_sensitive", &path, json!({}), false);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "sensitive endpoint not available over relay channel" })),
+        )
+            .into_response();
+    }
+    // 中继通道功能收窄（chat-only）：经中继只允许"远程下发对话 + 看回复"这一条最小闭环
+    // ——聊天端点与健康探测；其余路径（工具/文件/审批/更新/MCP/审计/调试…）一律 403。
+    // 最小攻击面：即使请求签名与许可全部合法，能做的也只有对话本身，
+    // 中继面上不存在"其它功能"可被利用。放在鉴权之后：无凭据仍返回 401，
+    // 有凭据打非聊天路径才吃到这里的 403
+    const RELAY_ALLOW: [&str; 4] = ["/api/chat", "/v1/chat/completions", "/v1/models", "/api/health"];
+    if via_relay && !RELAY_ALLOW.contains(&path.as_str()) {
+        crate::audit::record(&ctx, &actor_of(&provided), "http.relay_path_denied", &path, json!({}), false);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "relay tunnel is chat-only (command & reply)" })),
+        )
+            .into_response();
+    }
+    // 来源一致性闸门（端到端 IP 比对，确保真实性才放行）：比对"本次请求的真实来源 IP"
+    // （x-bit-client-ip ← Worker cf-connecting-ip）与"许可签发时绑定的网段"（x-bit-permit-pfx，
+    // ← Worker 许可记录盖章，非现算）。官方中继在许可校验通过后必盖章：缺章或与真实
+    // 来源不同段 = 中继实现被替换或被破坏，拒绝放行。两个头都只有本机 poller 从中继
+    // 信封注入（PASS_HEADERS 白名单外），手机端无法伪造
+    if via_relay {
+        let cip = req.headers().get("x-bit-client-ip").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let cpfx = req.headers().get("x-bit-permit-pfx").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if cip.is_empty() || cpfx.is_empty() || cpfx != ip_prefix(cip) {
+            crate::audit::record(&ctx, &actor_of(&provided), "http.relay_ip_mismatch", &path, json!({ "ip": cip, "pfx": cpfx }), false);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "source ip inconsistent with permit" })),
+            )
+                .into_response();
+        }
+    }
+    if via_relay && cfg.channel_guard {
+        let rid = req.headers().get("x-bit-rid").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let ts = req.headers().get("x-bit-ts").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let nonce = req.headers().get("x-bit-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let sign = req.headers().get("x-bit-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let now = chrono::Utc::now().timestamp();
+        let check = crate::security::BitsignCheck { ts, nonce: nonce.to_string(), sign: sign.to_string() };
+        // 验签材料：设备凭证（bitsign-v2）——未注册时用空材料（理论上不会发生：启动即注册）
+        let material = crate::state::device::sig_material(cfg.device_key.as_deref().unwrap_or(""));
+        // 验签 path = 本机请求路径（不含 query，与手机端签名口径一致）
+        match crate::security::bitsign_verify(&cfg.client_key, &material, rid, req.method().as_str(), req.uri().path(), &check, now) {
+            Ok(()) => {
+                relay_client_ip = req
+                    .headers()
+                    .get("x-bit-client-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<std::net::IpAddr>().ok())
+                    .map(|ip| ip.to_string());
+                // nonce 防重放：同一识别码下每个 nonce 只允许用一次（缓存窗口=签名时间窗）
+                let key = format!("{rid}|{nonce}");
+                if !ctx.nonce_seen.lock().unwrap().fresh(&key) {
+                    crate::audit::record(&ctx, &actor_of(&provided), "http.channel_replay", &path, json!({ "rid": rid }), false);
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "channel nonce replayed" })),
+                    )
+                        .into_response();
+                }
+            }
+            Err(reason) => {
+                crate::audit::record(&ctx, &actor_of(&provided), "http.channel_denied", &path, json!({ "rid": rid, "reason": reason }), false);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": format!("channel signature invalid: {reason}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // IP 黑名单：命中直接 403（防滥用第一道闸；黑名单在 debug_config / 设置页维护）。
+    // 经验签的中继请求按真实手机端 IP（envelope.ip ← Worker cf-connecting-ip）计；
+    // 直连 / 未验签请求按 socket 地址——伪造头无法绕过黑名单（需先过 bitsign）
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>() {
+        let ip = relay_client_ip.clone().unwrap_or_else(|| addr.ip().to_string());
+        let blocked = cfg.ip_blocklist.as_ref().map(|l| l.iter().any(|b| *b == ip)).unwrap_or(false);
+        if blocked {
+            crate::audit::record(&ctx, &actor_of(&provided), "http.ip_blocked", &path, json!({ "ip": ip }), false);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "client ip blocked" })),
+            )
+                .into_response();
+        }
+    }
+
     let actor = actor_of(&provided);
     let method = req.method().to_string();
     crate::audit::record(
@@ -458,7 +680,31 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
         json!({ "method": method }),
         true,
     );
-    next.run(req).await
+    let resp = next.run(req).await;
+    // 中继响应只放行文本类（JSON / text / SSE）：二进制内容（图片/文件/任意流）不经云中继
+    // 返回——信道只传文字，防被当作二进制外传管道（请求侧由 Worker 415 拦截，此为响应侧兜底）
+    if via_relay {
+        let binary = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| {
+                let ct = ct.to_ascii_lowercase();
+                !(ct.starts_with("application/json")
+                    || ct.starts_with("text/")
+                    || ct.is_empty())
+            })
+            .unwrap_or(false);
+        if binary {
+            crate::audit::record(&ctx, &actor, "http.channel_binary_blocked", &path, json!({}), false);
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                Json(json!({ "error": "relay channel is text-only" })),
+            )
+                .into_response();
+        }
+    }
+    resp
 }
 
 fn actor_of(key: &str) -> String {
@@ -468,6 +714,22 @@ fn actor_of(key: &str) -> String {
     } else {
         format!("agent:{prefix}")
     }
+}
+
+/// 对话限速 / 并发计数用的客户端 IP：经验签的中继请求取真实手机端 IP（x-bit-client-ip，
+/// 由本机 poller 注入，来源 = Worker cf-connecting-ip；签名验证在 auth 中间件已完成），
+/// 直连请求按 socket 地址。channel_guard 关闭时中继请求未经验签，退回 socket 地址防伪造
+fn chat_client_ip(ctx: &Arc<Ctx>, headers: &HeaderMap, addr: &std::net::IpAddr) -> String {
+    let via = headers.get("x-bit-via").and_then(|v| v.to_str().ok()) == Some("relay");
+    let guard = ctx.config.lock().unwrap().channel_guard;
+    if via && guard {
+        if let Some(v) = headers.get("x-bit-client-ip").and_then(|v| v.to_str().ok()) {
+            if let Ok(ip) = v.parse::<std::net::IpAddr>() {
+                return ip.to_string();
+            }
+        }
+    }
+    addr.to_string()
 }
 
 async fn list_tools(State(ctx): State<Arc<Ctx>>) -> Json<serde_json::Value> {
@@ -546,6 +808,63 @@ async fn remove_tool(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Res
     }
 }
 
+/// GET /api/approvals：列出待审批的工具调用（远程客户端轮询用；本地 UI 走 tool-approval 事件）
+async fn list_approvals(State(ctx): State<Arc<Ctx>>) -> Response {
+    let map = ctx.approvals.lock().unwrap();
+    let mut items: Vec<_> = map
+        .iter()
+        .map(|(id, p)| {
+            json!({
+                "id": id,
+                "tool": p.tool,
+                "params": p.params,
+                "age_secs": p.created.elapsed().as_secs(),
+            })
+        })
+        .collect();
+    drop(map);
+    // ap-N 自增 id 按数值排序（字典序会把 ap-10 排在 ap-2 前）
+    items.sort_by_key(|x| {
+        x["id"]
+            .as_str()
+            .unwrap_or_default()
+            .strip_prefix("ap-")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    Json(json!({ "approvals": items })).into_response()
+}
+
+/// POST /api/approvals/{id}：应答审批请求（body: {"allow": bool}）。本地 UI 与远程客户端共用同一张审批表
+async fn answer_approval(
+    State(ctx): State<Arc<Ctx>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let allow = match body.get("allow").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing boolean field `allow`" })),
+            )
+                .into_response()
+        }
+    };
+    let sender = ctx.approvals.lock().unwrap().remove(&id).map(|p| p.tx);
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(allow);
+            Json(json!({ "id": id, "allow": allow })).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Approval request not found or already answered" })),
+        )
+            .into_response(),
+    }
+}
+
 async fn invoke_tool(
     State(ctx): State<Arc<Ctx>>,
     headers: HeaderMap,
@@ -559,6 +878,28 @@ async fn invoke_tool(
         .unwrap_or_else(|| "agent:unknown".into());
 
     let params = body.get("params").cloned().unwrap_or(json!({}));
+    // 审批模式真实生效：ask/auto 下非安全工具须先经审批（本地弹卡片 / 远程轮询应答），
+    // 否则远程客户端可绕过审批直接调用 shell 等危险工具。allow_all 一律放行
+    let tool_name = {
+        let tools = ctx.tools.lock().unwrap();
+        tools
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| id.clone())
+    };
+    let mode = ctx.config.lock().unwrap().tool_approval.clone();
+    if !crate::agent::auto_pass(&mode, &tool_name) {
+        if let Err(e) =
+            crate::agent::request_approval(&ctx, &tool_name, &params, None, &actor).await
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": e })),
+            )
+                .into_response();
+        }
+    }
     match crate::registry::invoke(&ctx, &id, params, &actor, None).await {
         Ok(result) => Json(json!({ "result": result })).into_response(),
         Err(e) => (
@@ -611,6 +952,7 @@ async fn debug_state(State(ctx): State<Arc<Ctx>>) -> Response {
     let total_messages: usize = sessions.sessions.iter().map(|s| s.messages.len()).sum();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
         "data_dir": ctx.data_dir.display().to_string(),
         "remote": { "port": cfg.port, "access_password_enabled": cfg.password_enabled },
         "provider": active,
@@ -677,6 +1019,13 @@ async fn debug_session_detail(State(ctx): State<Arc<Ctx>>, Path(id): Path<String
     }
 }
 
+/// GET /api/debug/goals：目标与待办快照（供 E2E / 调试桥断言目标状态）
+async fn debug_goals(State(ctx): State<Arc<Ctx>>) -> Response {
+    let goals = ctx.goals.lock().unwrap().clone();
+    let todos = ctx.todos.lock().unwrap().clone();
+    Json(json!({ "goals": goals, "todos": todos })).into_response()
+}
+
 /// GET /api/debug/mcp：MCP 服务器连接状态 + 每台服务器导入的工具名
 async fn debug_mcp(State(ctx): State<Arc<Ctx>>) -> Response {
     let mcp = ctx.mcp.lock().unwrap().clone();
@@ -710,27 +1059,326 @@ async fn debug_mcp(State(ctx): State<Arc<Ctx>>) -> Response {
     Json(json!({ "servers": servers })).into_response()
 }
 
+/// POST /api/debug/interrupt：置位会话中断标志（远程触发「停止对话」，语义同 Tauri 命令
+/// chat_interrupt）。仅当该会话有正在执行的回合（映射中存在标志）时生效，
+/// 执行循环在下一检查点停止并返回「对话已中断」
+async fn debug_interrupt(State(ctx): State<Arc<Ctx>>, Json(body): Json<serde_json::Value>) -> Response {
+    let sid = body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if sid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "lose session_id" })),
+        )
+            .into_response();
+    }
+    let hit = {
+        let map = ctx.interrupts.lock().unwrap();
+        match map.get(&sid) {
+            Some(flag) => {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    };
+    crate::audit::record(&ctx, "remote", "chat.interrupt", &sid, json!({ "was_running": hit }), true);
+    Json(json!({ "id": sid, "interrupted": hit })).into_response()
+}
+
+/// POST /api/debug/config：运行时调整幻觉防护阈值 / 对话限速 / 审批模式（E2E 熔断用例 / 调试桥），仅接受列出的键，同步落盘
+async fn debug_config(State(ctx): State<Arc<Ctx>>, Json(body): Json<serde_json::Value>) -> Response {
+    let (w, t) = {
+        let mut cfg = ctx.config.lock().unwrap();
+        if let Some(v) = body.get("word_repeat_max").and_then(|x| x.as_u64()) {
+            cfg.word_repeat_max = (v.min(10000)) as u32;
+        }
+        if let Some(v) = body.get("tool_loop_max").and_then(|x| x.as_u64()) {
+            cfg.tool_loop_max = (v.min(10000)) as u32;
+        }
+        if let Some(v) = body.get("chat_rpm_max").and_then(|x| x.as_u64()) {
+            cfg.chat_rpm_max = (v.min(100000)) as u32;
+        }
+        if let Some(v) = body.get("relay_kbps_per_user").and_then(|x| x.as_u64()) {
+            // 中继每用户响应带宽（KB/s，0=不限）：中继循环按请求动态读取，改完即生效
+            cfg.relay_kbps_per_user = (v.min(1000000)) as u32;
+        }
+        if let Some(v) = body.get("relay_max_text_chars").and_then(|x| x.as_u64()) {
+            // 中继文本长度上限（字符数，0=不限）：验签后按请求动态读取，改完即生效
+            cfg.relay_max_text_chars = (v.min(10_000_000)) as u32;
+        }
+        if let Some(v) = body.get("tool_approval").and_then(|x| x.as_str()) {
+            // 非法值直接拒绝，避免把配置改成永远无法审批的死状态
+            if ["ask", "auto", "allow_all"].contains(&v) {
+                cfg.tool_approval = v.to_string();
+            }
+        }
+        if let Some(v) = body.get("cloud_relay_url").and_then(|x| x.as_str()) {
+            // 云中继入口（空串=清除）：中继循环每轮动态读取，改完即生效
+            cfg.cloud_relay_url = if v.trim().is_empty() { None } else { Some(v.to_string()) };
+        }
+        if let Some(v) = body.get("stun_servers") {
+            // 自定 STUN 列表：数组或逗号/分号分隔字符串（空=清除，恢复内置默认列表）
+            let list: Vec<String> = match v {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
+                serde_json::Value::String(s) => s.split([',', ';', '，', '；']).map(String::from).collect(),
+                _ => Vec::new(),
+            };
+            let list: Vec<String> = list
+                .iter()
+                .flat_map(|s| s.split([',', ';', '，', '；']))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cfg.stun_servers = if list.is_empty() { None } else { Some(list) };
+        }
+        // 敏感词审核开关
+        if let Some(v) = body.get("moderation_enabled").and_then(|x| x.as_bool()) {
+            cfg.moderation_enabled = v;
+        }
+        // 自定敏感词表：数组或逗号分隔字符串（空=清除，恢复内置默认词库）
+        if let Some(v) = body.get("blocked_words") {
+            let list: Vec<String> = match v {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
+                serde_json::Value::String(s) => s.split([',', ';', '，', '；']).map(String::from).collect(),
+                _ => Vec::new(),
+            };
+            let list: Vec<String> = list
+                .iter()
+                .flat_map(|s| s.split([',', ';', '，', '；']))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cfg.blocked_words = if list.is_empty() { None } else { Some(list) };
+        }
+        // 每 IP 并发在途上限（0=不限）
+        if let Some(v) = body.get("max_active_per_ip").and_then(|x| x.as_u64()) {
+            cfg.max_active_per_ip = (v.min(1000)) as u32;
+        }
+        // IP 黑名单：数组或逗号分隔字符串（空=清空黑名单）
+        if let Some(v) = body.get("ip_blocklist") {
+            let list: Vec<String> = match v {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
+                serde_json::Value::String(s) => s.split([',', ';', '，', '；']).map(String::from).collect(),
+                _ => Vec::new(),
+            };
+            let list: Vec<String> = list
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cfg.ip_blocklist = if list.is_empty() { None } else { Some(list) };
+        }
+        // 信道防护开关：经中继请求是否强制 bitsign 验签
+        if let Some(v) = body.get("channel_guard").and_then(|x| x.as_bool()) {
+            cfg.channel_guard = v;
+        }
+        (cfg.word_repeat_max, cfg.tool_loop_max)
+    };
+    // 可选：清空限速窗口（E2E 用例隔离，避免上一用例的计数影响下一个）
+    if body.get("chat_rate_reset").and_then(|x| x.as_bool()) == Some(true) {
+        ctx.chat_rate.lock().unwrap().clear();
+    }
+    ctx.save_config();
+    Json(json!({ "word_repeat_max": w, "tool_loop_max": t })).into_response()
+}
+
+/// 远程对话限速：60 秒滑动窗口按客户端 IP 计数（/api/chat 与 /v1/chat/completions 各自独立桶）。
+/// 返回 Some(建议等待秒数) 表示超限；chat_rpm_max=0 时不限速。
+fn chat_rate_check(ctx: &Arc<Ctx>, client: &str, kind: &str) -> Option<u64> {
+    let max = ctx.config.lock().unwrap().chat_rpm_max;
+    if max == 0 {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let key = format!("{kind}|{client}");
+    let mut map = ctx.chat_rate.lock().unwrap();
+    let q = map.entry(key).or_default();
+    while let Some(front) = q.front() {
+        if now.duration_since(*front).as_secs() >= 60 {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+    if q.len() >= max as usize {
+        let wait = 60 - now.duration_since(*q.front().unwrap()).as_secs();
+        return Some(wait.max(1));
+    }
+    q.push_back(now);
+    None
+}
+
+/// 限速 429 响应：英文提示 + Retry-After（外部客户端 / 旧模型可读）
+fn rate_limited_response(wait: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("Retry-After", wait.to_string().as_str())],
+        Json(json!({ "error": "rate limited: too many chat requests, slow down and retry later" })),
+    )
+        .into_response()
+}
+
+/// 每 IP 并发在途请求守卫：acquire 成功后计数 +1，Drop 时递减（含 panic/提前返回路径）。
+/// 超上限返回 None → 调用方回 429。流式响应场景守卫在 handler 返回时释放（非流结束），
+/// 是保守近似——占位计时短于真实流时长，不影响防护语义
+struct ActiveGuard {
+    ctx: Arc<Ctx>,
+    ip: String,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        let mut m = self.ctx.active_per_ip.lock().unwrap();
+        if let Some(c) = m.get_mut(&self.ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
+fn active_acquire(ctx: &Arc<Ctx>, ip: &str, max: u32) -> Option<ActiveGuard> {
+    {
+        let mut m = ctx.active_per_ip.lock().unwrap();
+        let c = m.entry(ip.to_string()).or_insert(0);
+        if max != 0 && *c >= max {
+            return None;
+        }
+        *c += 1;
+    }
+    Some(ActiveGuard { ctx: ctx.clone(), ip: ip.to_string() })
+}
+
+/// 并发超限 429 响应
+fn too_active_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("Retry-After", "5")],
+        Json(json!({ "error": "too many concurrent requests from this ip, wait and retry" })),
+    )
+        .into_response()
+}
+
+/// 敏感词审核（输入方向）：启用时命中即拒绝。返回英文 403（不透露命中词，防词库探测）
+fn moderation_input_check(ctx: &Arc<Ctx>, text: &str, actor: &str, path: &str) -> Option<Response> {
+    let cfg = ctx.config.lock().unwrap().clone();
+    if !cfg.moderation_enabled {
+        return None;
+    }
+    let words: Vec<String> = cfg
+        .blocked_words
+        .clone()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.clone())
+        .unwrap_or_else(|| crate::security::DEFAULT_BLOCKED_WORDS.iter().map(|s| s.to_string()).collect());
+    if let Some(hit) = crate::security::moderation_scan(text, &words) {
+        crate::audit::record(ctx, actor, "chat.moderation_input", path, json!({ "hit": hit.word, "len": text.len() }), false);
+        return Some((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": { "message": "moderation blocked: content violates usage policy", "type": "content_policy_violation" } })),
+        )
+            .into_response());
+    }
+    None
+}
+
+/// 敏感词审核（输出方向）：回复命中时替换为固定拒绝语并审计（不中断会话）
+fn moderation_output_check(ctx: &Arc<Ctx>, reply: &str, actor: &str, path: &str) -> String {
+    let cfg = ctx.config.lock().unwrap().clone();
+    if !cfg.moderation_enabled {
+        return reply.to_string();
+    }
+    let words: Vec<String> = cfg
+        .blocked_words
+        .clone()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.clone())
+        .unwrap_or_else(|| crate::security::DEFAULT_BLOCKED_WORDS.iter().map(|s| s.to_string()).collect());
+    if let Some(hit) = crate::security::moderation_scan(reply, &words) {
+        crate::audit::record(ctx, actor, "chat.moderation_output", path, json!({ "hit": hit.word, "len": reply.len() }), false);
+        return "The response was withheld by moderation (content policy).".to_string();
+    }
+    reply.to_string()
+}
+
+/// GET /api/context/metrics：当前会话上下文用量 + 模型最大上下文（手机端 / E2E 用）
+async fn context_metrics_route(State(ctx): State<Arc<Ctx>>) -> Response {
+    let session_id = ctx.sessions.lock().unwrap().active.clone();
+    let convo = match crate::agent::build_context(&ctx, &session_id) {
+        Ok((c, _)) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let est = super::commands::estimate_context_tokens(&ctx, &session_id, &convo);
+    Json(json!({
+        "session_id": session_id,
+        "est_tokens": est,
+        "max_context": super::commands::active_max_context(&ctx),
+    }))
+    .into_response()
+}
+
 /// 远程对话：Agent 通过 HTTP 使用 BIT 的 AI 能力（含自写插件）
 async fn remote_chat(
     State(ctx): State<Arc<Ctx>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // 对话请求限速：按客户端 IP 滑动窗口（chat_rpm_max，0=不限）。
+    // 经验签中继请求按真实手机端 IP 计（见 chat_client_ip）
+    let client_ip = chat_client_ip(&ctx, &headers, &addr.ip());
+    if let Some(wait) = chat_rate_check(&ctx, &client_ip, "api") {
+        return rate_limited_response(wait);
+    }
     let actor = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|v| actor_of(v.strip_prefix("Bearer ").unwrap_or("")))
         .unwrap_or_else(|| "agent:unknown".into());
+    // 每 IP 并发在途上限（max_active_per_ip，0=不限）：防单 IP 洪泛占满对话通道
+    let max_active = ctx.config.lock().unwrap().max_active_per_ip;
+    let _active = match active_acquire(&ctx, &client_ip, max_active) {
+        Some(g) => g,
+        None => return too_active_response(),
+    };
 
     let message = body.get("message").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    // 中继文本长度上限（relay_max_text_chars，0=不限）：只对经中继进入的请求生效，
+    // LAN 直连不受限。防止把中继当大文本传输通道（正常对话通常 < 10K 字符）
+    if headers.get("x-bit-via").and_then(|v| v.to_str().ok()) == Some("relay") {
+        let cap = ctx.config.lock().unwrap().relay_max_text_chars as usize;
+        if cap > 0 && message.chars().count() > cap {
+            crate::audit::record(&ctx, &actor, "http.relay_text_too_long", "/api/chat", json!({ "chars": message.chars().count(), "cap": cap }), false);
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({ "error": format!("relay text limit: message exceeds {cap} chars") })),
+            )
+                .into_response();
+        }
+    }
     // 可选图片：data URL（data:image/png;base64,...）数组，仅支持视觉的模型能看到
     let images: Vec<String> = body
         .get("images")
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    // 远程可指定会话；未指定则写入当前激活会话
-    let session_id = body.get("session_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    // 远程必须指定会话：每台设备用独立会话（QR sidPolicy=device，手机端自建 remote-<随机>）。
+    // 绝不容许空 session_id 落入桌面激活会话——否则多设备/多人共用一条会话必然串线
+    let session_id = body.get("session_id").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
     if message.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -738,13 +1386,22 @@ async fn remote_chat(
         )
             .into_response();
     }
-
-    // 远程指定的会话不存在时自动创建（外部客户端可直接开启新会话）
-    if !session_id.is_empty() {
-        ctx.sessions.lock().unwrap().get_or_create_mut(&session_id);
+    if session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "缺少 session_id 字段：远程对话必须指定会话（每台设备自建独立会话，避免与桌面或其它设备串线）" })),
+        )
+            .into_response();
+    }
+    // 敏感词审核（输入）：启用时命中即 403（含经中继与 LAN 直连的全部远程入口）
+    if let Some(resp) = moderation_input_check(&ctx, &message, &actor, "/api/chat") {
+        return resp;
     }
 
-    match crate::agent::chat_turn(&ctx, &session_id, &message, images).await {
+    // 远程指定的会话不存在时自动创建（外部客户端可直接开启新会话）
+    ctx.sessions.lock().unwrap().get_or_create_mut(&session_id);
+
+    match crate::agent::chat_turn_auto(&ctx, &session_id, &message, images).await {
         Ok(messages) => {
             let last = messages
                 .iter()
@@ -752,6 +1409,8 @@ async fn remote_chat(
                 .find(|m| m.role == "assistant")
                 .map(|m| m.content.clone())
                 .unwrap_or_default();
+            // 敏感词审核（输出）：回复命中时以外发替换语返回（会话记录不动）
+            let last = moderation_output_check(&ctx, &last, &actor, "/api/chat");
             crate::audit::record(&ctx, &actor, "chat.remote", "ai", json!({ "reply_len": last.len() }), true);
             Json(json!({ "reply": last, "messages": messages })).into_response()
         }
@@ -784,6 +1443,19 @@ struct OaiMessage {
     /// OpenAI 格式：字符串 或 多模态数组 [{type:"text",...},{type:"image_url",...}]
     #[serde(default)]
     content: serde_json::Value,
+}
+
+/// OpenAI content 的文本字符数统计：字符串直计；多模态数组只累加 type:"text" 部分
+/// （image_url 是 base64 数据，不占文本预算——长度上限防的是文本搬运）
+fn oai_text_len(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::String(s) => s.chars().count(),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|p| p.get("text").and_then(|t| t.as_str()).map(|s| s.chars().count()).unwrap_or(0))
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// OpenAI messages → (BIT ChatMessage 列表, 图片列表)
@@ -850,9 +1522,22 @@ async fn openai_models(State(ctx): State<Arc<Ctx>>) -> Response {
 /// 直接透传给激活的 AI Provider，不进入 Agent 工具循环（客户端发来的是完整对话历史）
 async fn openai_chat_completions(
     State(ctx): State<Arc<Ctx>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<OaiRequest>,
 ) -> Response {
+    // 对话请求限速：按客户端 IP 滑动窗口（与 /api/chat 同一上限、独立计数桶）。
+    // 经验签中继请求按真实手机端 IP 计（见 chat_client_ip）
+    let client_ip = chat_client_ip(&ctx, &headers, &addr.ip());
+    if let Some(wait) = chat_rate_check(&ctx, &client_ip, "v1") {
+        return rate_limited_response(wait);
+    }
+    // 每 IP 并发在途上限（与 /api/chat 同一上限、独立计数同桶按 IP）
+    let max_active = ctx.config.lock().unwrap().max_active_per_ip;
+    let _active = match active_acquire(&ctx, &client_ip, max_active) {
+        Some(g) => g,
+        None => return too_active_response(),
+    };
     let actor = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -866,6 +1551,28 @@ async fn openai_chat_completions(
             Json(json!({ "error": { "message": "messages 不能为空", "type": "invalid_request_error" } })),
         )
             .into_response();
+    }
+    // 中继文本长度上限（relay_max_text_chars，0=不限）：OpenAI 客户端整包发送历史，
+    // 上限按全部消息文本总字符数计（只算文本，图片不占预算）。仅限中继面，
+    // LAN 直连不受限——防把中继当大文本传输通道
+    if headers.get("x-bit-via").and_then(|v| v.to_str().ok()) == Some("relay") {
+        let cap = ctx.config.lock().unwrap().relay_max_text_chars as usize;
+        let chars: usize = req.messages.iter().map(|m| oai_text_len(&m.content)).sum();
+        if cap > 0 && chars > cap {
+            crate::audit::record(&ctx, &actor, "http.relay_text_too_long", "/v1/chat/completions", json!({ "chars": chars, "cap": cap }), false);
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({ "error": { "message": format!("relay text limit: total message text exceeds {cap} chars"), "type": "invalid_request_error" } })),
+            )
+                .into_response();
+        }
+    }
+    // 敏感词审核（输入）：扫全部消息文本（OpenAI 客户端把历史整包发来，逐条都要过闸）
+    {
+        let joined: String = messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+        if let Some(resp) = moderation_input_check(&ctx, &joined, &actor, "/v1/chat/completions") {
+            return resp;
+        }
     }
 
     let model = {
@@ -944,6 +1651,8 @@ async fn openai_chat_completions(
         // 非流式：整体返回 OpenAI completion 格式
         match crate::ai::chat_with_images(&ctx, &messages, &images).await {
             Ok((reply, usage)) => {
+                // 敏感词审核（输出）：仅非流式可整体拦（流式 token 已外发，靠输入闸兜底）
+                let reply = moderation_output_check(&ctx, &reply, &actor, "/v1/chat/completions");
                 crate::audit::record(&ctx, &actor, "chat.openai", "/v1/chat/completions", json!({ "stream": false, "ok": true, "reply_len": reply.len() }), true);
                 Json(json!({
                     "id": id, "object": "chat.completion", "created": created, "model": model,
@@ -1002,6 +1711,20 @@ mod tests {
         // /api/health 免鉴权：无任何凭据也放行
         let cfg = cfg_with_key("sk-bit-test", Some("12345678"));
         assert!(check_auth(&cfg, "/api/health", "", "", "").is_ok());
+    }
+
+    #[test]
+    fn test_ip_prefix_matches_worker_semantics() {
+        // 口径与 relay-worker/fake_relay 的 ipPrefix 逐字符一致（来源一致性闸门的比对基准，
+        // 实现差异会误杀正常请求）：v4 /24、v6 /48、回环原样、空 unknown、畸形原样
+        assert_eq!(ip_prefix("203.0.113.7"), "203.0.113"); // v4 → 前 3 段
+        assert_eq!(ip_prefix("203.0.113.200"), "203.0.113"); // 同段不同主机 → 同段
+        assert_eq!(ip_prefix("127.0.0.1"), "127.0.0.1"); // v4 回环原样
+        assert_eq!(ip_prefix("::1"), "::1"); // v6 回环原样
+        assert_eq!(ip_prefix("2408:8207:18cc:a9e0::1"), "2408:8207:18cc:a9e0"); // v6 → 前 4 组
+        assert_eq!(ip_prefix("2001:db8:85a3:1:2:3:4:5"), "2001:db8:85a3:1");
+        assert_eq!(ip_prefix(""), "unknown"); // 空
+        assert_eq!(ip_prefix("not-an-ip"), "not-an-ip"); // 畸形原样（不误杀非标来源）
     }
 
     #[test]
@@ -1149,32 +1872,24 @@ mod tests {
     async fn test_list_models_http_error_propagates() {
         // 上游 401：错误信息应透传而不是静默返回空列表
         let base = spawn_401_server().await;
-        let err = super::super::commands::list_provider_models(
-            "openai".into(),
-            base,
-            "bad-key".into(),
-        )
-        .await
-        .unwrap_err();
+        let err = super::super::commands::fetch_provider_models("openai", &base, "bad-key")
+            .await
+            .unwrap_err();
         assert!(err.contains("401"), "应透传 HTTP 状态码: {err}");
     }
 
     #[tokio::test]
     async fn test_list_models_connection_refused() {
         // 连接不存在的端口：应返回 Err 而非 panic/空列表
-        let err = super::super::commands::list_provider_models(
-            "openai".into(),
-            "http://127.0.0.1:9/v1".into(),
-            String::new(),
-        )
-        .await
-        .unwrap_err();
+        let err = super::super::commands::fetch_provider_models("openai", "http://127.0.0.1:9/v1", "")
+            .await
+            .unwrap_err();
         assert!(!err.is_empty());
     }
 
     #[tokio::test]
     async fn test_list_models_empty_base_url() {
-        let err = super::super::commands::list_provider_models("openai".into(), "  ".into(), String::new())
+        let err = super::super::commands::fetch_provider_models("openai", "  ", "")
             .await
             .unwrap_err();
         assert!(err.contains("Base URL"));
@@ -1184,13 +1899,9 @@ mod tests {
     async fn test_list_models_trailing_slash_normalized() {
         // 边缘：base_url 带尾斜杠不应产生 //models 双斜杠（对 401 服务请求即可验证 URL 拼接正常）
         let base = spawn_401_server().await;
-        let err = super::super::commands::list_provider_models(
-            "openai".into(),
-            format!("{base}/"),
-            "bad-key".into(),
-        )
-        .await
-        .unwrap_err();
+        let err = super::super::commands::fetch_provider_models("openai", &format!("{base}/"), "bad-key")
+            .await
+            .unwrap_err();
         assert!(err.contains("401"), "尾斜杠应被归一化: {err}");
     }
 

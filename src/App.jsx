@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { api } from "./api.js";
 import { useTheme } from "./useTheme.js";
@@ -70,6 +71,22 @@ export default function App() {
     getVersion().then(setAppVersion).catch(() => {});
   }, []);
 
+  // 远程服务端口被占用自动切换：事件实时推送；启动时事件可能早于 JS 监听丢失，
+  // 故挂载时再查一次 get_remote_status 兜底（switched_from 有值即展示提示条）
+  const [portSwitched, setPortSwitched] = useState(null); // { from, to }
+  useEffect(() => {
+    invoke("get_remote_status")
+      .then((s) => {
+        if (s?.switched_from) setPortSwitched({ from: s.switched_from, to: s.addr });
+      })
+      .catch(() => {});
+    const un = listen("remote-port-switched", (e) => {
+      const p = e.payload || {};
+      if (p.from && p.to) setPortSwitched({ from: p.from, to: p.addr || `:${p.to}` });
+    });
+    return () => un.then((f) => f()).catch(() => {});
+  }, []);
+
   // 全局捕获右键：屏蔽 WebView 默认菜单；输入框保留原生气泡（复制/粘贴仍可用）
   useEffect(() => {
     const onCtx = (e) => {
@@ -84,13 +101,35 @@ export default function App() {
     return () => window.removeEventListener("contextmenu", onCtx, true);
   }, []);
 
+  // 隐藏彩蛋菜单：键入 ↑↓↑↓←→←→BABA（或经典魂斗罗序列 ↑↑↓↓←→←→BA）打开 yxpil.com
+  useEffect(() => {
+    const seqUser = [
+      "ArrowUp", "ArrowDown", "ArrowUp", "ArrowDown",
+      "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight", "b", "a", "b", "a",
+    ];
+    const seqKonami = [
+      "ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown",
+      "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight", "b", "a",
+    ];
+    const buf = [];
+    const matches = (seq) =>
+      seq.length <= buf.length && buf.slice(-seq.length).every((k, i) => k === seq[i]);
+    const onKey = (e) => {
+      buf.push(e.key.length === 1 ? e.key.toLowerCase() : e.key);
+      if (buf.length > seqUser.length) buf.shift();
+      if (matches(seqUser) || matches(seqKonami)) {
+        buf.length = 0;
+        invoke("open_external", { url: "https://yxpil.com" }).catch(() => {});
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const refresh = () => api.overview().then(setStats).catch(() => {});
   useEffect(() => {
     refresh();
   }, [tab]);
-
-  const current = PAGES[tab] || PAGES[PRIMARY];
-  const Page = current.page;
 
   // 图标导航项：圆形小圆片（悬停显示名称），把宽度留给内容区
   const NavItem = ({ k }) => {
@@ -139,6 +178,23 @@ export default function App() {
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-neutral-100 text-neutral-900 dark:bg-black dark:text-neutral-100">
       <TitleBar />
+
+      {/* 端口切换提示条：远程端口被占用已自动切换（可关闭，纯色不透明） */}
+      {portSwitched && (
+        <div className="flex shrink-0 items-center justify-center gap-3 bg-neutral-900 px-4 py-1.5 text-xs text-white">
+          <span>
+            {t("remote.portSwitched")}
+            <span className="font-mono font-semibold">{portSwitched.to}</span>
+          </span>
+          <button
+            onClick={() => setPortSwitched(null)}
+            title={t("common.close")}
+            className="rounded px-1 text-neutral-400 transition-colors hover:text-white"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         {/* 图标侧栏：无分隔线，与窗口背景融为一体 */}

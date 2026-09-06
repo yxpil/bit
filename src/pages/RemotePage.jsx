@@ -3,9 +3,21 @@ import { api } from "../api.js";
 import { useLang } from "../i18n.js";
 import { IconGlobe, IconCheck, IconRefresh } from "../components/Icons.jsx";
 
+// STUN SocketAddr 形态："[v6]:p" / "v4:p"；只取 IP 部分（实际端口由 BIT 监听口决定）
+const ipOnly = (s) => {
+  const x = String(s || "");
+  if (x.startsWith("[")) return x.substring(1, x.indexOf("]"));
+  return /:\d+$/.test(x) ? x.substring(0, x.lastIndexOf(":")) : x;
+};
+
 // 远程访问：端口/Client Key/访问密码管理，测试通过才可保存
 export default function RemotePage({ onStats }) {
   const { t } = useLang();
+  const natLabel = {
+    none: t("remote.qrNatNone"),
+    cone: t("remote.qrNatCone"),
+    symmetric: t("remote.qrNatSymmetric"),
+  };
   const [cfg, setCfg] = useState(null);
   const [host, setHost] = useState("");
   const [port, setPort] = useState("");
@@ -20,6 +32,53 @@ export default function RemotePage({ onStats }) {
   const [pwdMsg, setPwdMsg] = useState("");
   const [cli, setCli] = useState(null); // {path, hint} | {error}
   const [cliBusy, setCliBusy] = useState(false);
+  // 扫码连接二维码：payload 含全部连接信息（地址候选/端口/密钥/密码/会话/云中继）
+  const [qr, setQr] = useState(null);
+  const [qrBusy, setQrBusy] = useState(false);
+  const [qrErr, setQrErr] = useState("");
+  const [cloudInput, setCloudInput] = useState("https://osbt.space");
+  const [cloudSaved, setCloudSaved] = useState(false);
+  const [stunInput, setStunInput] = useState("");
+  const [stunSaved, setStunSaved] = useState(false);
+
+  const loadQr = async () => {
+    setQrBusy(true);
+    setQrErr("");
+    try {
+      setQr(await api.getRemoteQr());
+    } catch (e) {
+      setQr(null);
+      setQrErr(String(e));
+    } finally {
+      setQrBusy(false);
+    }
+  };
+
+  const saveCloud = async () => {
+    setQrErr("");
+    try {
+      await api.saveCloudRelay(cloudInput);
+      setCloudSaved(true);
+      setTimeout(() => setCloudSaved(false), 1500);
+      await loadQr(); // 云中继进入二维码 payload
+    } catch (e) {
+      setQrErr(String(e));
+    }
+  };
+
+  // 自定 STUN 列表：逗号分隔，留空恢复内置免费列表；保存后重探 NAT 进二维码
+  const saveStun = async () => {
+    setQrErr("");
+    try {
+      const list = stunInput.split(/[,;，；]/).map((s) => s.trim()).filter(Boolean);
+      await api.saveStunServers(list);
+      setStunSaved(true);
+      setTimeout(() => setStunSaved(false), 1500);
+      await loadQr();
+    } catch (e) {
+      setQrErr(String(e));
+    }
+  };
 
   const installCli = async () => {
     setCliBusy(true);
@@ -41,11 +100,21 @@ export default function RemotePage({ onStats }) {
       setEnabled(c.remote_enabled);
       setPwd(c.access_password || "");
       setPwdEnabled(c.password_enabled !== false);
+      setCloudInput(c.cloud_relay_url || "");
+      setStunInput((c.stun_servers || []).join(", "));
     });
+    loadQr();
   }, []);
 
   const changed =
     cfg && (host.trim() !== cfg.host || Number(port) !== cfg.port || enabled !== cfg.remote_enabled);
+
+  // IPv6 地址的 URL 形态：加方括号（http://[::1]:8600），IPv4/域名原样
+  const base = (() => {
+    const h = String(cfg?.host || "");
+    const hp = h.includes(":") ? `[${h.replace(/^\[|\]$/g, "")}]:${cfg?.port}` : `${h}:${cfg?.port}`;
+    return `http://${hp}`;
+  })();
 
   const test = async () => {
     setTestState(null);
@@ -70,6 +139,9 @@ export default function RemotePage({ onStats }) {
       setTestState("pass");
       const c = await api.getRemoteConfig();
       setCfg(c);
+      // 输入框重新同步：后端可能因端口被占用已自动切换端口
+      setHost(c.host);
+      setPort(String(c.port));
       onStats?.();
       return r;
     } catch (e) {
@@ -269,7 +341,7 @@ export default function RemotePage({ onStats }) {
         {testState === "pass" && (
           <p className="flex items-center gap-2 rounded-full bg-neutral-100 px-4 py-2 text-xs text-neutral-800 dark:bg-neutral-800 dark:text-neutral-200">
             <IconCheck size={14} />
-            {t("remote.testPass")}http://{cfg.host}:{cfg.port}
+            {t("remote.testPass")}{base}
           </p>
         )}
         {testState?.error && (
@@ -288,6 +360,133 @@ export default function RemotePage({ onStats }) {
         </div>
       </div>
 
+      {/* 扫码连接：二维码固定黑码白底（扫码可靠性优先于主题），深浅主题下均放在白色圆角面板内 */}
+      <div className="card flex flex-col gap-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="font-medium">{t("remote.qrTitle")}</p>
+            <p className="mt-0.5 text-xs text-neutral-500">{t("remote.qrDesc")}</p>
+          </div>
+          <button onClick={loadQr} disabled={qrBusy} className="pill pill-outline pill-hover shrink-0">
+            <IconRefresh size={14} />
+            {qrBusy ? "…" : t("remote.qrRefresh")}
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-4 sm:flex-row">
+          <div className="mx-auto shrink-0 rounded-2xl border border-neutral-200 bg-white p-3 dark:border-neutral-700 sm:mx-0">
+            {qr?.svg ? (
+              <div className="h-44 w-44 [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: qr.svg }} />
+            ) : (
+              <div className="flex h-44 w-44 items-center justify-center px-3 text-center text-xs text-neutral-400">
+                {qrErr ? t("remote.qrProbeFail") : t("remote.qrGenerate")}
+              </div>
+            )}
+          </div>
+
+          <div className="min-w-0 flex-1 space-y-2.5 text-xs">
+            {qr?.payload && (
+              <>
+                <p className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={`chip ${
+                      ["cone", "none"].includes(qr.payload.nat)
+                        ? "border-emerald-500/50 text-emerald-600 dark:text-emerald-400"
+                        : ""
+                    }`}
+                  >
+                    {natLabel[qr.payload.nat] || t("remote.qrNatUnknown")}
+                  </span>
+                  {qr.payload.rid && (
+                    <span className="chip font-mono" title={t("remote.qrRidTip")}>
+                      {t("remote.qrRid")}: {String(qr.payload.rid).slice(0, 8)}…
+                    </span>
+                  )}
+                </p>
+                <div className="min-w-0 space-y-2">
+                  {/* 方式一：局域网直连 */}
+                  <div className="min-w-0">
+                    <p className="mb-1 font-medium text-neutral-600 dark:text-neutral-300">
+                      {t("remote.qrMethodLan")}
+                    </p>
+                    <div className="space-y-0.5 font-mono text-[11px] text-neutral-500">
+                      {(() => {
+                        const urls = qr.payload.methods?.lan?.length
+                          ? qr.payload.methods.lan
+                          : (qr.payload.addrs?.lan || []).map((a) => `http://${a}:${qr.payload.port}`);
+                        return urls.length ? urls.map((u) => <p key={`lan-${u}`} className="truncate">{u}</p>)
+                          : <p className="text-neutral-400">{t("remote.qrNone")}</p>;
+                      })()}
+                    </div>
+                  </div>
+                  {/* 方式二：IPv6 直连（NAT1 / 锥形 NAT 且有全球 v6） */}
+                  <div className="min-w-0">
+                    <p className="mb-1 font-medium text-neutral-600 dark:text-neutral-300">
+                      {t("remote.qrMethodDirect6")}
+                    </p>
+                    <div className="space-y-0.5 font-mono text-[11px] text-neutral-500">
+                      {(() => {
+                        const urls = qr.payload.methods?.direct6 || [];
+                        return urls.length ? urls.map((u) => <p key={`d6-${u}`} className="truncate">{u}</p>)
+                          : <p className="text-neutral-400">{t("remote.qrNone")}</p>;
+                      })()}
+                    </div>
+                  </div>
+                  {/* 方式三：云中继（对称 NAT / 直连失败兜底；只转发不留存） */}
+                  <div className="min-w-0">
+                    <p className="mb-1 font-medium text-neutral-600 dark:text-neutral-300">
+                      {t("remote.qrMethodRelay")}
+                    </p>
+                    <div className="space-y-0.5 font-mono text-[11px] text-neutral-500">
+                      {qr.payload.methods?.relay && <p className="truncate">{qr.payload.methods.relay}</p>}
+                      {qr.payload.cloud && qr.payload.cloud !== qr.payload.methods?.relay && (
+                        <p className="truncate text-neutral-400">{qr.payload.cloud}</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
+            <div>
+              <div className="flex gap-2">
+                <input
+                  className="field flex-1 font-mono"
+                  placeholder={t("remote.qrCloudPlaceholder")}
+                  value={cloudInput}
+                  onChange={(e) => setCloudInput(e.target.value)}
+                />
+                <button onClick={saveCloud} className="pill pill-hover shrink-0">
+                  {cloudSaved ? <IconCheck size={14} /> : t("common.save")}
+                </button>
+              </div>
+              <p className="mt-1 px-2 text-[11px] text-neutral-400">{t("remote.qrCloudLabel")}</p>
+            </div>
+
+            <div>
+              <div className="flex gap-2">
+                <input
+                  className="field flex-1 font-mono"
+                  placeholder={t("remote.stunPlaceholder")}
+                  value={stunInput}
+                  onChange={(e) => setStunInput(e.target.value)}
+                />
+                <button onClick={saveStun} className="pill pill-hover shrink-0">
+                  {stunSaved ? <IconCheck size={14} /> : t("common.save")}
+                </button>
+              </div>
+              <p className="mt-1 px-2 text-[11px] text-neutral-400">{t("remote.stunLabel")}</p>
+            </div>
+
+            {qrErr && <p className="px-2 text-[11px] text-red-600">{qrErr}</p>}
+
+            <p className="rounded-xl bg-neutral-100 px-3 py-2 text-[11px] leading-relaxed text-neutral-500 dark:bg-neutral-800/60 dark:text-neutral-400">
+              {t("remote.qrPrivacy")}
+            </p>
+          </div>
+        </div>
+      </div>
+
       <div className="card">
         <p className="mb-3 font-medium">{t("remote.openaiTitle")}</p>
         <p className="mb-3 text-xs text-neutral-500">
@@ -297,18 +496,18 @@ export default function RemotePage({ onStats }) {
           {t("remote.mcpNote")}
         </p>
         <div className="mb-2 flex gap-2">
-          <input className="field flex-1 font-mono" readOnly value={`http://${cfg.host}:${cfg.port}/v1`} />
-          <button onClick={() => copy(`http://${cfg.host}:${cfg.port}/v1`, "baseurl")} className="pill pill-outline pill-hover shrink-0">
+          <input className="field flex-1 font-mono" readOnly value={`${base}/v1`} />
+          <button onClick={() => copy(`${base}/v1`, "baseurl")} className="pill pill-outline pill-hover shrink-0">
             {copied === "baseurl" ? <IconCheck size={14} /> : <IconGlobe size={14} />}
             {copied === "baseurl" ? t("common.copied") : t("common.copy")}
           </button>
         </div>
         <pre className="overflow-x-auto rounded-2xl bg-neutral-900 p-4 font-mono text-xs leading-relaxed text-neutral-100">{`# ${t("remote.curlListModels")}
-curl http://${cfg.host}:${cfg.port}/v1/models \\
+curl ${base}/v1/models \\
   -H "Authorization: Bearer ${cfg.client_key}"
 
 # ${t("remote.curlChat")}
-curl -X POST http://${cfg.host}:${cfg.port}/v1/chat/completions \\
+curl -X POST ${base}/v1/chat/completions \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "Content-Type: application/json" \\
   -d '{"model":"bit","messages":[{"role":"user","content":"${t("remote.curlChatContent")}"}]}'`}</pre>
@@ -317,23 +516,23 @@ curl -X POST http://${cfg.host}:${cfg.port}/v1/chat/completions \\
       <div className="card">
         <p className="mb-3 font-medium">{t("remote.agentTitle")}</p>
         <pre className="overflow-x-auto rounded-2xl bg-neutral-900 p-4 font-mono text-xs leading-relaxed text-neutral-100">{`# ${t("remote.curlHealth")}
-curl http://${cfg.host}:${cfg.port}/api/health
+curl ${base}/api/health
 
 # ${t("remote.curlRegister")}
-curl -X POST http://${cfg.host}:${cfg.port}/api/tools \\
+curl -X POST ${base}/api/tools \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "X-Access-Password: ${pwd}" \\
   -H "Content-Type: application/json" \\
   -d '{"name":"my_tool","description":"...","url":"http://agent:9000/callback"}'
 
 # ${t("remote.curlInvoke")}
-curl -X POST http://${cfg.host}:${cfg.port}/api/tools/<id>/invoke \\
+curl -X POST ${base}/api/tools/<id>/invoke \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "X-Access-Password: ${pwd}" \\
   -d '{"params":{}}'
 
 # ${t("remote.curlAIChat")}
-curl -X POST http://${cfg.host}:${cfg.port}/api/chat \\
+curl -X POST ${base}/api/chat \\
   -H "Authorization: Bearer ${cfg.client_key}" \\
   -H "X-Access-Password: ${pwd}" \\
   -d '{"message":"${t("remote.curlAIChatContent")}"}'`}</pre>

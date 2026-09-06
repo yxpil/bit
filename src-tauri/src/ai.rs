@@ -1,3 +1,4 @@
+// yxpil · BIT
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -46,6 +47,10 @@ pub struct AiConfig {
     /// 温度：None=默认（不发送参数），范围 0-2
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// 各模型最大上下文缓存（token 数，键 "{base_url}|{model_id}"）：
+    /// 由模型列表接口尽力获取，openai 兼容端适配多种常见字段，gemini 用 inputTokenLimit，claude 用家族默认
+    #[serde(default)]
+    pub model_context: std::collections::BTreeMap<String, u64>,
 }
 
 impl AiConfig {
@@ -192,6 +197,62 @@ pub async fn chat_with_images(
 
 /// 流式被调用方中止的哨兵错误（中断会话时立即断开 SSE 读取，不回退非流式）
 pub const STREAM_STOP: &str = "__BIT_STREAM_STOP__";
+
+/// Marker prefix embedded in errors classified as transient network failures
+/// (stream cut, connect refused, timeout...). Classification is prefix-based so
+/// the human-readable part can be any language. UI layers strip it via user_err().
+pub const NET_TRANSIENT: &str = "[net-transient]";
+
+/// Stream aborted before its completion marker ([DONE] / message_stop):
+/// partial content must never be treated as a complete reply.
+/// Classified as transient (agent layer auto-retries the round).
+pub const STREAM_CUT: &str =
+    "[net-transient] stream ended before completion marker (network flap or proxy closed)";
+
+/// Strip the machine-readable marker prefix for user-facing display.
+pub fn user_err(e: &str) -> String {
+    match e.strip_prefix(NET_TRANSIENT) {
+        Some(rest) => rest.trim_start().to_string(),
+        None => e.to_string(),
+    }
+}
+
+/// True when the error is a transient network failure worth auto-retrying the
+/// round: stream cut before completion marker, connect refused/timeout, body
+/// read interrupted. Business errors (4xx/5xx status, upstream error body,
+/// parse failure, empty reply) are never transient.
+pub fn is_transient_net_error(e: &str) -> bool {
+    let e = e.trim();
+    // interrupt sentinel / empty error produced by the interrupt select arm
+    if e.is_empty() || e == STREAM_STOP {
+        return false;
+    }
+    // explicitly marked transient at the source
+    if e.starts_with(NET_TRANSIENT) {
+        return true;
+    }
+    // business errors are never transient
+    if e.starts_with("HTTP ")
+        || e.contains("上游返回错误")
+        || e.contains("响应解析失败")
+        || e.contains("流式无内容")
+        || e.contains("响应中缺少")
+        || e.contains("不支持")
+    {
+        return false;
+    }
+    // reqwest transport-layer failures (Display is English regardless of wrapper)
+    e.contains("error sending request")
+        || e.contains("error decoding response body")
+        || e.contains("timed out")
+        || e.contains("connection reset")
+        || e.contains("connection refused")
+        || e.contains("broken pipe")
+        || e.contains("incomplete message")
+        // legacy Chinese wrappers around reqwest errors: "请求失败: {e}" / "流读取失败: {e}"
+        || e.contains("请求失败")
+        || e.contains("流读取失败")
+}
 
 /// 流式 token 种类：Text = 正文增量，Think = 思考过程增量（reasoning/thinking）
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -427,12 +488,22 @@ async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
     let mut stopped = false;
     let mut saw_done = false;
     let mut finish = String::new();
+    // 部分端点以 200 + {"error":{...}} 数据行报错（HTTP 层看不出异常）：捕获后显式报错
+    let mut upstream_err = String::new();
     read_sse(resp, |data| {
         if data == "[DONE]" {
             saw_done = true;
             return true;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+            if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+                upstream_err = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| err.to_string());
+                return true;
+            }
             if v.get("usage").is_some() {
                 usage = usage_from_openai(&v);
             }
@@ -476,12 +547,15 @@ async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
     if stopped {
         return Err(STREAM_STOP.into());
     }
+    if !upstream_err.is_empty() {
+        return Err(format!("上游返回错误: {upstream_err}"));
+    }
     if full.is_empty() {
         return Err("流式无内容".into());
     }
     // 上游未发 [DONE] = 连接异常中断（网络波动/代理断开）：半截内容不能当完整回复
     if !saw_done {
-        return Err("连接中断：流式响应未正常结束（网络波动或代理断开），请重试".into());
+        return Err(STREAM_CUT.into());
     }
     // 达到输出上限：在正文尾部显式标注，避免“话说一半”看起来像 bug
     let full = if finish_truncated(&finish) {
@@ -520,6 +594,7 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
     let mut full = String::new();
     let mut usage = TokenUsage::default();
     let mut stopped = false;
+    let mut saw_stop = false; // 是否收到 message_stop（未收到 = 连接异常中断）
     // input/cache 用量在 message_start，output 用量在 message_delta
     read_sse(resp, |data| {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
@@ -564,6 +639,7 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
                     }
                 }
             } else if t == "message_stop" {
+                saw_stop = true;
                 return true;
             }
         }
@@ -575,6 +651,10 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
     }
     if full.is_empty() {
         return Err("流式无内容".into());
+    }
+    // 未收到 message_stop = 连接异常中断（网络波动/代理断开）：半截内容不能当完整回复
+    if !saw_stop {
+        return Err(STREAM_CUT.into());
     }
     Ok((full, usage))
 }
@@ -1082,6 +1162,16 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         Your underlying model may be hosted by a remote API provider, but never present yourself as a cloud service — \
         if asked about your nature, answer honestly: a local agent running on this device, with a model served remotely.\n\
         \n\
+        ## Conduct (non-negotiable)\n\
+        - Every tool call has REAL consequences on this machine. shell runs real commands (files installed or deleted, processes killed, network accessed); \
+        write_file and edit really create/overwrite/patch files; add_tool and run_script execute code you wrote on this machine; \
+        delete_tool permanently removes a tool; truncate_history and compact_history irreversibly rewrite this conversation's history; \
+        plan/goal/todo become visible tasks the system will auto-drive; send_file hands a real file to the user; sub_agent spends real tokens in another session. \
+        Weigh the consequence before calling, then commit to it.\n\
+        - Be faithful to the user. Report what actually happened — include failures and errors verbatim; never fabricate tool output and never claim success without tool evidence.\n\
+        - You are yourself a tool serving the user. If a task is within your ability, DO it: no excuses, no needless refusal, no \"I cannot\" while a listed tool can do it, and never silently skip or fake part of a task.\n\
+        - Act instead of overthinking: prefer one decisive tool call over long deliberation. When an action is ambiguous or a required decision/input is missing, stop and ask the user instead of guessing.\n\
+        \n\
         {manual}\n\
         \n\
         ## Factory built-in tools (the numbers map to the Registered tools list below)\n\
@@ -1119,6 +1209,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         ## Local interpreters (only ids listed here are usable)\n{}\n\
         ## Current goals\n{}\n\
         ## Current todos\n{}\n\
+        ## Auto-drive protocol\n- When a goal of this session is incomplete, the system automatically sends you a message starting with \"继续（自动推进）\" containing the next pending todo. Execute it immediately (with tools when needed) instead of asking for permission.\n- Mark the goal achieved via goal_update once everything is done; keep todo statuses up to date (todo_update/todo_write) so progress is visible.\n- If you truly need a user decision or missing input to continue, start your reply with [WAIT] and explain what you need — this pauses the auto-drive.\n\
         ## Registered tools\n{}\n\
         ## Memories\n{}\n\
         ## Skills\n{}\n\
@@ -1356,7 +1447,16 @@ async fn read_json_native(resp: reqwest::Response) -> Result<serde_json::Value, 
         }
         return Err(NativeErr::Other(format!("HTTP {status}: {short}")));
     }
-    serde_json::from_str(&text).map_err(|e| NativeErr::Other(format!("响应解析失败: {e}")))
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| NativeErr::Other(format!("响应解析失败: {e}")))?;
+    // 200 状态码但响应体是错误对象（网关转发常见）：显式报错而非当成空回复
+    if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("上游返回错误");
+        return Err(NativeErr::Other(format!("上游返回错误: {msg}")));
+    }
+    Ok(v)
 }
 
 /// 非 2xx 响应分类（流式与一次性共用）：错误体含 tool/function/schema → Unsupported
@@ -1655,22 +1755,40 @@ async fn native_round_openai_stream(
     let mut content = String::new();
     let mut thinking = String::new();
     let mut stopped = false;
-    // index → (id, name, arguments 字符串增量拼接)
+    // slot → (id, name, arguments 字符串增量拼接)
     let mut tcs: std::collections::BTreeMap<usize, (String, String, String)> =
         std::collections::BTreeMap::new();
+    // 部分 OpenAI 兼容网关/代理的流式 tool_calls 不带 index 字段：若一律默认槽 0，
+    // 多个调用的 name/arguments 会交错拼成垃圾（工具执行必然失败）。
+    // 缺 index 时按 id 分槽（新 id 开新槽），纯参数增量续写最近使用的槽
+    let mut tc_next: usize = 0;
+    let mut tc_by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut tc_last: Option<usize> = None;
     let mut finish = String::new();
     let mut usage = TokenUsage::default();
     let mut got_any = false;
     let mut bad_data = 0usize; // 非 JSON 的 data 行数（垃圾响应容错判断用）
+    let mut upstream_err = String::new();
+    let mut saw_done = false; // 是否收到 [DONE]（未收到 = 连接异常中断，半截内容不能当完整回复）
     read_sse(resp, |data| {
         got_any = true;
         if data == "[DONE]" {
+            saw_done = true;
             return true;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
             bad_data += 1;
             return false;
         };
+        // 部分端点以 200 + {"error":{...}} 数据行报错（HTTP 层看不出异常）：显式透出
+        if let Some(err) = v.get("error").filter(|e| e.is_object()) {
+            upstream_err = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| err.to_string());
+            return true;
+        }
         if v.get("usage").is_some_and(|u| u.is_object()) {
             usage = usage_from_openai(&v);
         }
@@ -1708,8 +1826,33 @@ async fn native_round_openai_stream(
                     usable = true;
                 }
                 for tc in arr {
-                    let i = tc.get("index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                    let e = tcs.entry(i).or_default();
+                    let slot = match tc.get("index").and_then(|x| x.as_u64()) {
+                        Some(i) => {
+                            let i = i as usize;
+                            if let Some(id) =
+                                tc.get("id").and_then(|x| x.as_str()).filter(|s| !s.is_empty())
+                            {
+                                tc_by_id.insert(id.to_string(), i);
+                            }
+                            i
+                        }
+                        None => {
+                            let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                            if !id.is_empty() {
+                                *tc_by_id
+                                    .entry(id.to_string())
+                                    .or_insert_with(|| { let s = tc_next; tc_next += 1; s })
+                            } else {
+                                // 无 index 无 id：参数增量续写最近的槽；还没有任何槽时新开
+                                match tc_last {
+                                    Some(i) => i,
+                                    None => { let s = tc_next; tc_next += 1; tc_last = Some(s); s }
+                                }
+                            }
+                        }
+                    };
+                    tc_last = Some(slot);
+                    let e = tcs.entry(slot).or_default();
                     if let Some(id) = tc.get("id").and_then(|x| x.as_str()) {
                         if !id.is_empty() {
                             e.0 = id.to_string();
@@ -1743,6 +1886,9 @@ async fn native_round_openai_stream(
     if stopped {
         return Err(NativeErr::Other(STREAM_STOP.into()));
     }
+    if !upstream_err.is_empty() {
+        return Err(NativeErr::Other(format!("上游返回错误: {upstream_err}")));
+    }
     // 端点忽略 stream 参数返回整段 JSON：SSE 解析无任何事件 → 交由入口退回一次性请求
     if !got_any {
         return Err(NativeErr::Other("端点未返回 SSE 流".into()));
@@ -1751,6 +1897,11 @@ async fn native_round_openai_stream(
     // 交由入口退回一次性请求，由一次性路径报出明确的解析失败
     if content.is_empty() && thinking.is_empty() && tcs.is_empty() && bad_data > 0 {
         return Err(NativeErr::Other("流式响应体不可解析".into()));
+    }
+    // 收到过内容但没收到 [DONE] = 连接异常中断（网络波动/代理断开）：
+    // 半截回复不能当完整答案静默结束回合（此前会直接返回半截内容）
+    if !saw_done {
+        return Err(NativeErr::Other(STREAM_CUT.into()));
     }
 
     let calls: Vec<NativeToolCall> = tcs
@@ -2748,6 +2899,34 @@ mod fuzzy_tests {
         for f in ["stop", "end_turn", "STOP", "tool_calls", "max_tokens_exceeded_ok", ""] {
             assert!(!finish_truncated(f), "{f} 不应判定为截断");
         }
+    }
+
+    #[test]
+    fn transient_net_error_classification() {
+        use super::{is_transient_net_error as t, STREAM_CUT, STREAM_STOP};
+        // transient: stream cut / transport failures
+        assert!(t(STREAM_CUT));
+        assert!(t("请求失败: error sending request for url (http://x)"));
+        assert!(t("流读取失败: connection reset by peer"));
+        assert!(t("error decoding response body"));
+        assert!(t("connection refused"));
+        assert!(t("operation timed out"));
+        // not transient: interrupt / business errors
+        assert!(!t(""));
+        assert!(!t(STREAM_STOP));
+        assert!(!t("HTTP 401: invalid api key"));
+        assert!(!t("上游返回错误: quota exceeded"));
+        assert!(!t("响应解析失败: expected value"));
+        assert!(!t("流式无内容"));
+        assert!(!t("HTTP 400: tools parameter not supported by this endpoint"));
+    }
+
+    #[test]
+    fn user_err_strips_marker() {
+        use super::{user_err, STREAM_CUT, NET_TRANSIENT};
+        assert_eq!(user_err(STREAM_CUT), "stream ended before completion marker (network flap or proxy closed)");
+        assert_eq!(user_err("plain error"), "plain error");
+        assert!(!user_err(STREAM_CUT).starts_with(NET_TRANSIENT));
     }
 }
 

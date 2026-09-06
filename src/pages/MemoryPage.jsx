@@ -238,7 +238,7 @@ export default function MemoryPage({ onStats }) {
         </div>
       )}
 
-      <div className="my-1 border-t border-neutral-100" />
+      <div className="my-1 border-t border-neutral-100 dark:border-neutral-800" />
 
       <form onSubmit={add} className="card flex gap-2">
         <input

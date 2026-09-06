@@ -100,12 +100,15 @@ export default function ToolsPage({ onStats }) {
   const [mcpUrl, setMcpUrl] = useState("");
   const [mcpBusy, setMcpBusy] = useState(false);
   const [mcpMsg, setMcpMsg] = useState("");
+  // 工具质量统计：tool_id → { recent_rate, recent_n, fail, last_err, avg_ms }
+  const [stats, setStats] = useState({});
 
   const reload = async () => {
-    const [t, r, m] = await Promise.all([api.listTools(), api.listRuntimes(), api.mcpList()]);
+    const [t, r, m, s] = await Promise.all([api.listTools(), api.listRuntimes(), api.mcpList(), api.getToolStats().catch(() => [])]);
     setTools(t.tools || []);
     setRuntimes(r.runtimes || []);
     setMcpServers(m.servers || []);
+    setStats(Object.fromEntries((Array.isArray(s) ? s : []).map((x) => [x.id, x])));
     if (!runtime && r.runtimes?.length) setRuntime(r.runtimes[0].id);
   };
   useEffect(() => {
@@ -593,6 +596,31 @@ export default function ToolsPage({ onStats }) {
                     <span className="font-semibold">{tool.name}</span>
                     <span className={`chip ${k.cls}`}>{k.text}</span>
                     <span className="chip">{tool.created_by}</span>
+                    {/* 质量徽章：近期成功率（≥80% 绿 / 50-80% 灰 / <50% 黄），悬停看最近失败原因 */}
+                    {stats[tool.id]?.recent_n > 0 &&
+                      (() => {
+                        const st = stats[tool.id];
+                        const pct = Math.round((st.recent_rate || 0) * 100);
+                        const cls =
+                          pct >= 80
+                            ? "text-emerald-600 dark:text-emerald-400"
+                            : pct >= 50
+                              ? "text-neutral-500 dark:text-neutral-400"
+                              : "text-amber-600 dark:text-amber-400";
+                        return (
+                          <span
+                            className={`chip ${cls}`}
+                            title={
+                              (st.last_err
+                                ? `${t("tools.lastErr")}: ${st.last_err} · `
+                                : "") +
+                              `${t("tools.avgMs")}: ${st.avg_ms}ms · ${t("tools.failCount")}: ${st.fail}`
+                            }
+                          >
+                            {t("tools.successRate")} {pct}% ({st.recent_n})
+                          </span>
+                        );
+                      })()}
                   </div>
                   <p className="mt-0.5 truncate text-xs text-neutral-500 dark:text-neutral-400">
                     {tool.description || t("tools.noDesc")}

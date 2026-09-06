@@ -1,3 +1,4 @@
+// yxpil · BIT
 // 简约 TUI：`bit tui` 进入终端模式——无前端窗口、不监听 HTTP 端口、不抢单实例，
 // 与桌面端共用同一套数据目录与 Agent 链路（对话 / 工具 / 会话 / 记忆全部可用）。
 // 行协议 REPL：stdin 逐行读取，stdout 逐行输出，便于交互也便于 E2E 管道测试。
@@ -191,7 +192,7 @@ async fn handle(ctx: &Arc<Ctx>, line: &str) -> Result<Flow, String> {
         .find(|s| s.id == sid)
         .map(|s| s.messages.len())
         .unwrap_or(0);
-    let messages = crate::agent::chat_turn(ctx, "", line, Vec::new()).await?;
+    let messages = crate::agent::chat_turn_auto(ctx, "", line, Vec::new()).await?;
     let sess = ctx.sessions.lock().unwrap();
     if let Some(s) = sess.sessions.iter().find(|s| s.id == sid) {
         for m in s.messages.iter().skip(before) {

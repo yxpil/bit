@@ -1,3 +1,4 @@
+// yxpil · BIT
 use serde_json::json;
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
@@ -31,6 +32,8 @@ pub fn create(app: &tauri::AppHandle, ctx: &Arc<Ctx>) -> tauri::Result<()> {
             "quit" => {
                 if let Some(ctx) = app.try_state::<Arc<Ctx>>() {
                     crate::audit::record(&ctx, "local-app", "app.quit", "BIT", json!({ "via": "tray" }), true);
+                    // 正常退出：先通知守护进程不要接力拉起，再静默换装/退出
+                    crate::guardian::expect_exit(&ctx);
                     // 已下载更新：退出前静默换装，下次启动即新版本（关闭时自动更新）
                     let _ = crate::update::apply_update(&ctx, false);
                 }

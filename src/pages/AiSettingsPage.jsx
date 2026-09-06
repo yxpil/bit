@@ -40,6 +40,11 @@ export default function AiSettingsPage({ onStats, stats }) {
   // 模型采样参数：temperature null=默认；reasoning_effort ""=默认 / low / medium / high
   const [params, setParams] = useState({ temperature: null, reasoning_effort: "" });
   const [paramsSaved, setParamsSaved] = useState(false);
+  // 幻觉防护阈值：word_repeat_max=单回复词重复上限 / tool_loop_max=单回合工具轮上限（0=关闭）
+  const [limits, setLimits] = useState({ word_repeat_max: 20, tool_loop_max: 20 });
+  const [limitsSaved, setLimitsSaved] = useState(false);
+  // 开机自动启动：null=加载中；开启后登录系统即在后台驻留（托盘）
+  const [autostart, setAutostart] = useState(null);
   // 从提供方 API 拉取的模型列表（点击模型名直接填充）
   const [remoteModels, setRemoteModels] = useState(null);
   const [fetchingModels, setFetchingModels] = useState(false);
@@ -50,7 +55,28 @@ export default function AiSettingsPage({ onStats, stats }) {
   useEffect(() => {
     load();
     api.getAiParams().then((r) => setParams({ temperature: r?.temperature ?? null, reasoning_effort: r?.reasoning_effort || "" })).catch(() => {});
+    api.getGuardLimits().then((r) => setLimits({ word_repeat_max: r?.word_repeat_max ?? 20, tool_loop_max: r?.tool_loop_max ?? 20 })).catch(() => {});
+    api.getAutostart().then((r) => setAutostart(!!r?.enabled)).catch(() => setAutostart(false));
+    api.getElevation().then((r) => setElevation({ active: !!r?.active, enabled: !!r?.enabled })).catch(() => setElevation({ active: false, enabled: false }));
   }, []);
+
+  // 开机自启开关：先落系统登录项，失败回滚显示原状态
+  const toggleAutostart = (enabled) => {
+    const prev = autostart;
+    setAutostart(enabled);
+    api.setAutostart(enabled).catch(() => setAutostart(prev));
+  };
+
+  // 高权限开关：成功即触发系统授权弹窗并以目标权限重启（当前进程随后自动退出）；
+  // 失败（用户取消授权等）回滚开关并显示原因
+  const toggleElevation = (enabled) => {
+    setElevation((e) => ({ ...(e || { active: false, enabled: false }), enabled }));
+    setElevErr("");
+    api.setElevation(enabled).catch((err) => {
+      api.getElevation().then((r) => setElevation({ active: !!r?.active, enabled: !!r?.enabled })).catch(() => {});
+      setElevErr(String(err).replace(/^.*Error[:：]\s*/, ""));
+    });
+  };
 
   // 变更即保存（温度滑块拖动用 300ms 防抖，避免频繁落盘）
   const debounceRef = useRef(null);
@@ -65,6 +91,19 @@ export default function AiSettingsPage({ onStats, stats }) {
     };
     if (debounce) debounceRef.current = setTimeout(doSave, 300);
     else doSave();
+  };
+
+  // 幻觉防护阈值变更即保存（300ms 防抖，0=关闭对应检测）
+  const limitsRef = useRef(null);
+  const saveLimits = (next) => {
+    setLimits(next);
+    if (limitsRef.current) clearTimeout(limitsRef.current);
+    limitsRef.current = setTimeout(() => {
+      api.setGuardLimits(next.word_repeat_max, next.tool_loop_max).then(() => {
+        setLimitsSaved(true);
+        setTimeout(() => setLimitsSaved(false), 1500);
+      }).catch(() => {});
+    }, 300);
   };
 
   const editing = form.id !== null;
@@ -335,6 +374,85 @@ export default function AiSettingsPage({ onStats, stats }) {
         </div>
       </div>
 
+      {/* 幻觉防护：词重复 / 工具死循环熔断阈值（0=关闭），深浅主题沿用 field/card 变量 */}
+      <div className="card flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">{t("ai.guardTitle")}</p>
+            <p className="mt-0.5 text-xs text-neutral-500">{t("ai.guardDesc")}</p>
+          </div>
+          {limitsSaved && (
+            <span className="flex items-center gap-1 text-xs text-neutral-500">
+              <IconCheck size={14} />
+              {t("common.saved")}
+            </span>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.guardWord")}</label>
+            <input
+              className="field tabular-nums"
+              type="number"
+              min="0"
+              max="10000"
+              value={limits.word_repeat_max}
+              onChange={(e) =>
+                saveLimits({ ...limits, word_repeat_max: Math.max(0, Math.min(10000, parseInt(e.target.value, 10) || 0)) })
+              }
+            />
+            <p className="mt-1 px-2 text-[11px] text-neutral-400">{t("ai.guardWordHint")}</p>
+          </div>
+          <div>
+            <label className="mb-1 block px-2 text-xs text-neutral-500">{t("ai.guardTool")}</label>
+            <input
+              className="field tabular-nums"
+              type="number"
+              min="0"
+              max="10000"
+              value={limits.tool_loop_max}
+              onChange={(e) =>
+                saveLimits({ ...limits, tool_loop_max: Math.max(0, Math.min(10000, parseInt(e.target.value, 10) || 0)) })
+              }
+            />
+            <p className="mt-1 px-2 text-[11px] text-neutral-400">{t("ai.guardToolHint")}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* 开机自动启动：登录系统后后台驻留（托盘），写入系统登录项 */}
+      <div className="card flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{t("ai.autostartTitle")}</p>
+          <p className="mt-0.5 text-xs text-neutral-500">{t("ai.autostartDesc")}</p>
+        </div>
+        <PillSwitch
+          checked={!!autostart}
+          disabled={autostart === null}
+          onChange={toggleAutostart}
+        />
+      </div>
+
+      {/* 高权限模式：以管理员/root 身份重启（触发系统授权弹窗），提权后 AI 的 shell 等工具拥有管理员权限 */}
+      <div className="card flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{t("ai.elevTitle")}</p>
+          <p className="mt-0.5 text-xs text-neutral-500">{t("ai.elevDesc")}</p>
+          {elevErr && <p className="mt-1 text-xs text-red-500 dark:text-red-400">{elevErr}</p>}
+          {elevation?.active && !elevErr && (
+            <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">{t("ai.elevActive")}</p>
+          )}
+          {!elevation?.active && elevation?.enabled && !elevErr && (
+            <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">{t("ai.elevInactive")}</p>
+          )}
+        </div>
+        <PillSwitch
+          checked={!!elevation?.active}
+          disabled={!elevation}
+          onChange={toggleElevation}
+        />
+      </div>
+
       {/* 新增 / 编辑表单 */}
       <form onSubmit={submit} className="card flex flex-col gap-4">
         <div className="flex items-center justify-between">
@@ -447,18 +565,24 @@ export default function AiSettingsPage({ onStats, stats }) {
           )}
           {Array.isArray(remoteModels) && remoteModels.length > 0 && (
             <div className="mt-2 max-h-40 overflow-y-auto rounded-xl border border-neutral-200/80 dark:border-neutral-800">
-              {remoteModels.map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setForm((f) => ({ ...f, model: m }))}
-                  className={`block w-full px-3 py-1.5 text-left font-mono text-[11px] transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
-                    form.model === m ? "text-neutral-900 dark:text-white" : "text-neutral-500"
-                  }`}
-                >
-                  {m}
-                </button>
-              ))}
+              {remoteModels.map((m) => {
+                const id = typeof m === "string" ? m : m.id;
+                const len = typeof m === "object" && m ? m.context_length : null;
+                const lenLabel = len ? ` · ${len >= 1024 ? `${Math.round(len / 1024)}K` : len} ctx` : "";
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => setForm((f) => ({ ...f, model: id }))}
+                    className={`block w-full px-3 py-1.5 text-left font-mono text-[11px] transition-colors hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
+                      form.model === id ? "text-neutral-900 dark:text-white" : "text-neutral-500"
+                    }`}
+                  >
+                    {id}
+                    {lenLabel && <span className="float-right text-neutral-400">{lenLabel}</span>}
+                  </button>
+                );
+              })}
             </div>
           )}
           {Array.isArray(remoteModels) && remoteModels.length === 0 && (

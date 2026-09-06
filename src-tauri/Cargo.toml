@@ -1,6 +1,6 @@
 [package]
 name = "bit"
-version = "0.5.13"
+version = "0.5.14"
 description = "BIT - Agent Tool Hub with audit and remote access"
 edition = "2021"
 
@@ -12,6 +12,10 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
 # 单实例保护：二次启动时唤起已有实例的主窗口而不是再开一个进程
 tauri-plugin-single-instance = "2"
+# 开机自动启动：写系统登录项（macOS LaunchAgent / Windows 注册表 Run / Linux autostart 目录）
+tauri-plugin-autostart = "2"
+# 守护进程：接力拉起前校验主程序二进制 sha256（防病毒换装借壳复活）
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -31,3 +35,8 @@ zip = "2"
 quick-xml = "0.42"
 # 页眉仪表盘：本进程内存占用查询
 sysinfo = "0.33"
+# 幻觉防护：中文分词（jieba 搜索粒度）检测回复中某个词异常重复
+jieba-rs = "0.7"
+# 远程二维码：网卡地址枚举（LAN IPv4 / 全球 IPv6）+ 离线二维码 SVG 生成
+if-addrs = "0.13"
+qrcode = { version = "0.14", features = ["svg"] }

@@ -1,3 +1,4 @@
+// yxpil · BIT
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ fn resolve_session_id(ctx: &Arc<Ctx>, session_id: &str) -> String {
     }
 }
 
-fn estimate_context_tokens(ctx: &Arc<Ctx>, session_id: &str, convo: &[crate::ai::ChatMessage]) -> usize {
+pub fn estimate_context_tokens(ctx: &Arc<Ctx>, session_id: &str, convo: &[crate::ai::ChatMessage]) -> usize {
     let target = resolve_session_id(ctx, session_id);
     let native_mode = ctx.native_probe.lock().unwrap().get(&target).copied() != Some(false);
     let convo_chars: usize = convo
@@ -290,6 +291,7 @@ pub fn get_remote_config(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
         "client_key": cfg.client_key,
         "access_password": cfg.access_password.clone().unwrap_or_default(),
         "password_enabled": cfg.password_enabled,
+        "cloud_relay_url": cfg.cloud_relay_url.clone().unwrap_or_default(),
         "revision": cfg.revision,
     })
 }
@@ -305,10 +307,8 @@ pub async fn save_remote_config(
     {
         let mut cfg = ctx.config.lock().unwrap();
         cfg.remote_enabled = remote_enabled;
-        let host = host.trim().to_string();
-        if host.is_empty() {
-            return Err("监听地址不能为空".into());
-        }
+        // 归一化主机输入：剥 IPv6 方括号 + 拒绝非 IP/域名形态（绑定时由 join_host_port 加回括号）
+        let host = crate::config::normalize_host(&host)?;
         if port < 1024 {
             return Err("端口需不小于 1024".into());
         }
@@ -324,6 +324,220 @@ pub async fn save_remote_config(
     // 远程地址变化，同步托盘菜单显示
     crate::tray::refresh(&ctx.app);
     Ok(json!({ "addr": addr }))
+}
+
+/// 远程服务运行状态：供前端启动时查询端口是否被占用自动切换（事件可能早于 JS 监听而丢失）
+#[tauri::command]
+pub fn get_remote_status(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let cfg = ctx.config.lock().unwrap();
+    let switched_from = *ctx.port_switch.lock().unwrap();
+    Ok(json!({
+        "enabled": cfg.remote_enabled,
+        "addr": cfg.listen_addr(),
+        "switched_from": switched_from,
+    }))
+}
+
+/// 幻觉防护阈值（设置页读写）：word_repeat_max=单回复词重复上限 / tool_loop_max=单回合工具轮上限，0=关闭
+#[tauri::command]
+pub fn get_guard_limits(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let cfg = ctx.config.lock().unwrap();
+    json!({ "word_repeat_max": cfg.word_repeat_max, "tool_loop_max": cfg.tool_loop_max })
+}
+
+#[tauri::command]
+pub fn set_guard_limits(
+    state: State<'_, Arc<Ctx>>,
+    word_repeat_max: u32,
+    tool_loop_max: u32,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.word_repeat_max = word_repeat_max.min(10000);
+        cfg.tool_loop_max = tool_loop_max.min(10000);
+    }
+    ctx.save_config();
+    crate::audit::record(
+        &ctx,
+        "local-user",
+        "guard.limits",
+        "set",
+        json!({ "word_repeat_max": word_repeat_max, "tool_loop_max": tool_loop_max }),
+        true,
+    );
+    Ok(json!({ "ok": true }))
+}
+
+/// 云中继地址（手机远程 App 用）：对称 NAT 无法直连时改连该地址
+#[tauri::command]
+pub fn save_cloud_relay(state: State<'_, Arc<Ctx>>, url: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let url = url.trim().trim_end_matches('/').to_string();
+    if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("云中继地址需以 http:// 或 https:// 开头".into());
+    }
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.cloud_relay_url = if url.is_empty() { None } else { Some(url) };
+        cfg.revision += 1;
+    }
+    ctx.save_config();
+    crate::audit::record(&ctx, "local-user", "remote.cloud_relay", "set", json!({}), true);
+    Ok(json!({ "ok": true }))
+}
+
+/// 网络探测：LAN/公网候选地址 + NAT 粗判（远程二维码数据源）
+#[tauri::command]
+pub async fn get_lan_info(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let stun = ctx.config.lock().unwrap().stun_servers.clone();
+    Ok(crate::netinfo::lan_probe(stun.as_deref()).await)
+}
+
+/// 自定 STUN 服务器列表（host:port，逗号/分号分隔或数组）：整体替换内置免费列表，
+/// 空列表 = 恢复默认。NAT 探测即时生效（下次打开二维码/探测即用新列表）
+#[tauri::command]
+pub fn save_stun_servers(state: State<'_, Arc<Ctx>>, servers: Vec<String>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    // 展平：数组元素本身也允许逗号/分号分隔（前端单输入框直接整串传进来）
+    let mut list: Vec<String> = Vec::new();
+    for item in &servers {
+        for part in item.split([',', ';', '，', '；']) {
+            let p = part.trim().trim_end_matches('/').to_string();
+            if !p.is_empty() && !list.contains(&p) {
+                list.push(p);
+            }
+        }
+    }
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.stun_servers = if list.is_empty() { None } else { Some(list) };
+        cfg.revision += 1;
+    }
+    ctx.save_config();
+    crate::audit::record(&ctx, "local-user", "remote.stun_servers", "set", json!({}), true);
+    Ok(json!({ "ok": true }))
+}
+
+/// 二维码 payload（Tauri get_remote_qr 与 HTTP /api/qr 共用）。v2：新增 128 位识别码 rid
+/// 与三种连接方式 methods（局域网直连 / IPv6 直连 / 云中继），手机端按 NAT 类型智能择路：
+/// 局域网 → 直连；NAT1（锥形）且有全球 IPv6 → IPv6 直连；对称 NAT（NAT3/4）→ 云中继。
+/// rid 懒生成：首次查看二维码时生成 128 位随机数并持久化，作为中继路由 + 访问凭据。
+pub async fn qr_payload(ctx: &Arc<Ctx>) -> Result<serde_json::Value, String> {
+    // 128 位识别码：只生成一次（避免每次探测漂移导致中继路由失效）
+    let rid = {
+        let mut c = ctx.config.lock().unwrap();
+        if c.relay_id.is_empty() {
+            let id = crate::relay::gen_relay_id();
+            c.relay_id = id.clone();
+            c.revision += 1;
+            c.save(&ctx.data_dir);
+            crate::audit::record(ctx, "local-app", "remote.relay_id", "generate", json!({}), true);
+            id
+        } else {
+            c.relay_id.clone()
+        }
+    };
+    let cfg = ctx.config.lock().unwrap().clone();
+    let stun = cfg.stun_servers.clone();
+    let probe = crate::netinfo::lan_probe(stun.as_deref()).await;
+    let nat = probe.get("nat").cloned().unwrap_or(json!("unknown"));
+    let port = cfg.port;
+    let lan: Vec<String> = probe
+        .get("lan")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let lan6: Vec<String> = probe
+        .get("lan6")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let pub6 = probe.get("pub6").and_then(|v| v.as_str()).map(String::from);
+    // IPv6 直连候选：本机全球 v6（网卡或 STUN 映射）。对称 NAT 下对方依旧无法主动连入，
+    // 但 v6 出站映射通常独立于目标（EIM），保留候选由手机端实测决定
+    let mut direct6: Vec<String> = lan6.iter().map(|a| format!("http://[{a}]:{port}")).collect();
+    if let Some(p6) = &pub6 {
+        let ip = p6.rsplit_once(':').map(|(a, _)| a.trim_matches(|c| c == '[' || c == ']')).unwrap_or(p6);
+        let url = format!("http://[{ip}]:{port}");
+        if !direct6.contains(&url) {
+            direct6.push(url);
+        }
+    }
+    let lan_urls: Vec<String> = lan.iter().map(|a| format!("http://{a}:{port}")).collect();
+    // 云中继：用户显式配置优先，缺省用 osbt.space 官方中继（只转发不留存）
+    let relay_base = cfg
+        .cloud_relay_url
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| crate::relay::DEFAULT_RELAY_BASE.to_string());
+    let mut payload = json!({
+        "v": 2,
+        "app": "bit",
+        "port": port,
+        "key": cfg.client_key,
+        "nat": nat.clone(),
+        // 128 位识别码：客户端生成，云中继按它路由（手机端把请求发到 {relay}/relay/{rid}/…）
+        "rid": rid,
+        // 会话策略：device —— 每台设备扫码后自建独立会话（remote-<随机>）调 /api/chat，
+        // 多台设备/多人互不串线；/api/chat 对空 session_id 直接拒绝，绝不落入桌面激活会话
+        "sidPolicy": "device",
+        // 内容留存声明：对话只存设备本地，中继 / 云服务器不留存（手机端据此展示隐私说明）
+        "retention": "device-only",
+        // 三种连接方式（按优先级排列尝试）
+        "methods": {
+            "lan": lan_urls,
+            "direct6": direct6,
+            "relay": format!("{relay_base}/relay/{rid}"),
+        },
+        // 原始候选（v1 兼容：旧手机端按 lan → lan6 → pub6 → pub4 依次尝试）
+        "addrs": {
+            "lan": probe.get("lan").cloned().unwrap_or(json!([])),
+            "lan6": probe.get("lan6").cloned().unwrap_or(json!([])),
+            "pub4": probe.get("pub4").cloned().unwrap_or(json!(null)),
+            "pub4_alt": probe.get("pub4_alt").cloned().unwrap_or(json!(null)),
+            "pub6": probe.get("pub6").cloned().unwrap_or(json!(null)),
+        },
+    });
+    if cfg.password_enabled {
+        if let Some(p) = &cfg.access_password {
+            payload["pwd"] = json!(p);
+        }
+    }
+    if let Some(u) = cfg.cloud_relay_url.clone().filter(|s| !s.is_empty()) {
+        payload["cloud"] = json!(u);
+    }
+    // 信道签名算法标识：手机端据此实现配套的请求签名（bitsign-v2，材料含设备凭证）
+    payload["alg"] = json!(crate::security::BITSIGN_ALG);
+    // 加密块（BIT-Crypt v1）：把整个 payload JSON 加密成 BIT1: 密文——二维码图只编密文，
+    // 普通扫码器/截图外泄读不出 client_key / rid 等连接凭据，只有本 App（内置主密钥）能解
+    let plain = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    payload["enc"] = json!(crate::security::bitcrypt_encrypt(&plain));
+    Ok(payload)
+}
+
+/// 远程连接二维码：payload 携带全部连接信息（地址候选 / 端口 / 密钥 / 密码 / 会话绑定 /
+/// 128 位识别码 / 三种连接方式），手机 App 扫码后按 局域网 → IPv6 直连（NAT1）→ 云中继依次尝试。
+/// 返回 payload JSON 与离线渲染的 SVG（黑码白底，深浅主题下均可识别）。
+#[tauri::command]
+pub async fn get_remote_qr(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let payload = qr_payload(&ctx).await?;
+    // 二维码图只编加密块（BIT1: 密文）：截图/扫码器读不出明文凭据，
+    // 本 App 扫码后用内置主密钥解出 payload JSON（手机端解密实现在 security.rs 注释）
+    let enc = payload["enc"].as_str().ok_or("enc missing")?.to_string();
+    let svg = qrcode::QrCode::new(enc.as_bytes())
+        .map_err(|e| e.to_string())?
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build();
+    Ok(json!({ "payload": payload, "svg": svg }))
 }
 
 #[tauri::command]
@@ -578,6 +792,17 @@ pub fn set_provider_active(
         }
     }
     ctx.save_ai_config();
+    // 激活项变更：后台刷新模型上下文缓存（尽量获取最大上下文，失败静默）
+    if active {
+        let rf = ctx.clone();
+        let rid = id.clone();
+        tauri::async_runtime::spawn(async move {
+            let p = rf.ai_config.lock().unwrap().providers.iter().find(|p| p.id == rid).cloned();
+            if let Some(p) = p {
+                refresh_model_context(&rf, &p.protocol, &p.base_url, &p.api_key).await;
+            }
+        });
+    }
     crate::audit::record(&ctx, "local-user", "ai.provider.active", &id, json!({ "active": active }), true);
     Ok(json!({ "active": active }))
 }
@@ -643,7 +868,7 @@ pub async fn chat_stream(
     let ctx = ctx(state);
     let ev = if event_name.trim().is_empty() { "chat-stream".to_string() } else { event_name };
     let messages =
-        crate::agent::chat_turn_stream(&ctx, &session_id, &message, &ev, images.unwrap_or_default()).await?;
+        crate::agent::chat_turn_stream_auto(&ctx, &session_id, &message, &ev, images.unwrap_or_default()).await?;
     notify_done(&app, &ctx, &session_id, &messages);
     Ok(json!({ "messages": messages }))
 }
@@ -671,7 +896,7 @@ pub async fn chat_interrupt(state: State<'_, Arc<Ctx>>, session_id: String) -> R
 #[tauri::command]
 pub async fn tool_approve(state: State<'_, Arc<Ctx>>, id: String, allow: bool) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    let sender = ctx.approvals.lock().unwrap().remove(&id);
+    let sender = ctx.approvals.lock().unwrap().remove(&id).map(|p| p.tx);
     match sender {
         Some(tx) => {
             let _ = tx.send(allow);
@@ -704,6 +929,45 @@ pub async fn get_tool_approval(state: State<'_, Arc<Ctx>>) -> Result<serde_json:
     let ctx = ctx(state);
     let mode = ctx.config.lock().unwrap().tool_approval.clone();
     Ok(json!({ "mode": mode }))
+}
+
+/// 读取开机自启真实状态（系统登录项为准；插件不可用时回退配置值）
+#[tauri::command]
+pub fn get_autostart(app: tauri::AppHandle, state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let configured = ctx(state).config.lock().unwrap().autostart;
+    use tauri_plugin_autostart::ManagerExt;
+    let enabled = app.autolaunch().is_enabled().unwrap_or(configured);
+    json!({ "enabled": enabled })
+}
+
+/// 设置开机自启：写/删系统登录项（macOS LaunchAgent / Windows 注册表 Run / Linux autostart），
+/// 同步落盘配置保证下次启动的一致性
+#[tauri::command]
+pub fn set_autostart(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<Ctx>>,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let c = ctx(state);
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled { manager.enable() } else { manager.disable() };
+    match result {
+        Ok(()) => {
+            {
+                let mut cfg = c.config.lock().unwrap();
+                cfg.autostart = enabled;
+                cfg.revision += 1;
+                cfg.save(&c.data_dir);
+            }
+            crate::audit::record(&c, "local-app", "settings.autostart", &enabled.to_string(), json!({ "enabled": enabled }), true);
+            Ok(json!({ "enabled": enabled }))
+        }
+        Err(e) => {
+            crate::audit::record(&c, "local-app", "settings.autostart", &enabled.to_string(), json!({ "error": e.to_string() }), false);
+            Err(format!("Failed to update launch-at-login entry: {e}"))
+        }
+    }
 }
 
 /// 读取模型采样参数（温度 / 思考强度）
@@ -743,21 +1007,50 @@ pub fn set_ai_params(
     Ok(json!({ "ok": true }))
 }
 
-/// 从提供方 API 拉取可用模型列表：
+/// Claude 协议的模型列表不携带上下文信息，用已知家族默认值兜底（token 数）
+fn claude_context_for(id: &str) -> Option<u64> {
+    if id.starts_with("claude") {
+        Some(200_000)
+    } else {
+        None
+    }
+}
+
+/// 从单个模型对象尽力提取上下文长度（各家字段不统一，逐个常见字段尝试）
+fn context_len_from(model: &serde_json::Value) -> Option<u64> {
+    const FIELDS: [&str; 5] =
+        ["context_length", "max_model_len", "context_window", "max_context_length", "max_input_tokens"];
+    for f in FIELDS {
+        if let Some(v) = model.get(f).and_then(|v| v.as_u64()) {
+            return Some(v);
+        }
+    }
+    // OpenRouter 嵌套形态：top_provider.context_length
+    model
+        .get("top_provider")
+        .and_then(|p| p.get("context_length"))
+        .and_then(|v| v.as_u64())
+}
+
+/// 模型上下文缓存键：base 归一化（去首尾空白与尾斜杠）+ 模型 id
+fn ctx_key(base: &str, id: &str) -> String {
+    format!("{}|{id}", base.trim().trim_end_matches('/'))
+}
+
+/// 从提供方 API 拉取可用模型列表（含尽力获取的上下文长度）：
 /// - openai 兼容：GET {base}/models（Bearer Key）
-/// - gemini：GET {base}/v1beta/models?key=（返回 name 去 "models/" 前缀）
-/// - claude：GET {base}/v1/models（x-api-key + anthropic-version）
-#[tauri::command]
-pub async fn list_provider_models(
-    protocol: String,
-    base_url: String,
-    api_key: String,
-) -> Result<Vec<String>, String> {
+/// - gemini：GET {base}/v1beta/models?key=（inputTokenLimit；name 去 "models/" 前缀）
+/// - claude：GET {base}/v1/models（x-api-key + anthropic-version；无上下文字段用家族默认）
+pub async fn fetch_provider_models(
+    protocol: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<(String, Option<u64>)>, String> {
     let base = base_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
         return Err("Base URL 不能为空".into());
     }
-    let url = match protocol.as_str() {
+    let url = match protocol {
         "gemini" => format!("{base}/v1beta/models?pageSize=200&key={api_key}"),
         "claude" => format!("{base}/v1/models?limit=1000"),
         _ => format!("{base}/models"),
@@ -767,11 +1060,11 @@ pub async fn list_provider_models(
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.get(&url);
-    match protocol.as_str() {
+    match protocol {
         "gemini" => {} // Key 已在查询参数中
         "claude" => {
             req = req
-                .header("x-api-key", &api_key)
+                .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01");
         }
         _ => {
@@ -793,16 +1086,29 @@ pub async fn list_provider_models(
             .unwrap_or("");
         return Err(format!("HTTP {status}: {msg}"));
     }
-    let mut models: Vec<String> = match protocol.as_str() {
+    let mut models: Vec<(String, Option<u64>)> = match protocol {
         "gemini" => body
             .get("models")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|m| {
-                        m.get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.trim_start_matches("models/").to_string())
+                        let id = m.get("name")?.as_str()?.trim_start_matches("models/").to_string();
+                        let len = m.get("inputTokenLimit").and_then(|v| v.as_u64());
+                        Some((id, len))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "claude" => body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        let id = m.get("id")?.as_str()?.to_string();
+                        let len = claude_context_for(&id);
+                        Some((id, len))
                     })
                     .collect()
             })
@@ -813,14 +1119,65 @@ pub async fn list_provider_models(
             .map(|arr| {
                 arr.iter()
                     .filter_map(|m| {
-                        m.get("id").and_then(|n| n.as_str()).map(String::from)
+                        let id = m.get("id")?.as_str()?.to_string();
+                        Some((id, context_len_from(m)))
                     })
                     .collect()
             })
             .unwrap_or_default(),
     };
-    models.sort();
+    models.sort_by(|a, b| a.0.cmp(&b.0));
+    models.dedup_by(|a, b| a.0 == b.0);
     Ok(models)
+}
+
+/// 把拉取到的上下文长度并入 ai_config.model_context 持久缓存并落盘
+fn persist_model_context(ctx: &Arc<Ctx>, base_url: &str, models: &[(String, Option<u64>)]) {
+    {
+        let mut cfg = ctx.ai_config.lock().unwrap();
+        for (id, len) in models {
+            if let Some(n) = len {
+                cfg.model_context.insert(ctx_key(base_url, id), *n);
+            }
+        }
+    }
+    ctx.save_ai_config();
+}
+
+/// 启动/配置变更时后台刷新激活提供方的模型上下文缓存（失败静默）
+pub async fn refresh_model_context(ctx: &Arc<Ctx>, protocol: &str, base_url: &str, api_key: &str) {
+    if let Ok(models) = fetch_provider_models(protocol, base_url, api_key).await {
+        persist_model_context(ctx, base_url, &models);
+    }
+}
+
+/// 激活模型的最大上下文（token）：优先模型列表获取的缓存，claude 协议用家族默认兜底
+pub fn active_max_context(ctx: &Arc<Ctx>) -> Option<u64> {
+    let ai = ctx.ai_config.lock().unwrap();
+    let p = ai.active()?.clone();
+    let base = p.base_url.trim().trim_end_matches('/');
+    ai.model_context
+        .get(&ctx_key(base, &p.model))
+        .copied()
+        .or_else(|| claude_context_for(&p.model))
+}
+
+/// 从提供方 API 拉取可用模型列表（顺带把上下文长度写入持久缓存）：
+/// 返回 [{id, context_length}]，context_length 为 null 表示该端点未提供
+#[tauri::command]
+pub async fn list_provider_models(
+    state: State<'_, Arc<Ctx>>,
+    protocol: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let ctx = ctx(state);
+    let models = fetch_provider_models(&protocol, &base_url, &api_key).await?;
+    persist_model_context(&ctx, &base_url, &models);
+    Ok(models
+        .into_iter()
+        .map(|(id, len)| json!({ "id": id, "context_length": len }))
+        .collect())
 }
 
 /// AI 接收信息预览：当前会话实际发给模型的 system prompt / 消息 / 工具清单
@@ -858,6 +1215,7 @@ pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> 
         "messages": messages,
         "tools": tools_list,
         "est_tokens": est_tokens,
+        "max_context": active_max_context(&ctx),
         "approval_mode": ctx.config.lock().unwrap().tool_approval.clone(),
     }))
 }
@@ -868,7 +1226,10 @@ pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> 
 pub async fn context_metrics(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     let (convo, _) = crate::agent::build_context(&ctx, &session_id)?;
-    Ok(json!({ "est_tokens": estimate_context_tokens(&ctx, &session_id, &convo) }))
+    Ok(json!({
+        "est_tokens": estimate_context_tokens(&ctx, &session_id, &convo),
+        "max_context": active_max_context(&ctx),
+    }))
 }
 
 /// 解析上传的文件（Excel→Markdown 表格 / Word(.docx)→纯文本 / CSV→原文）。
@@ -891,7 +1252,7 @@ pub async fn fetch_webpage(url: String) -> Result<serde_json::Value, String> {
 /// 端口冲突检测：true=可用，false=已被占用（保存远程配置前调用）
 #[tauri::command]
 pub async fn check_port(host: String, port: u16) -> Result<serde_json::Value, String> {
-    let addr = format!("{}:{}", host.trim(), port);
+    let addr = crate::config::join_host_port(host.trim(), port);
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => {
             drop(l);
@@ -1463,6 +1824,28 @@ pub(crate) fn normalize_user_path(raw: &str) -> String {
     s
 }
 
+/// canonicalize 后转成可传给系统调用的展示路径：Windows 的 std::fs::canonicalize 返回
+/// `\\?\` verbatim 前缀（且可能混入正斜杠），explorer `/select,` 解析不了会静默退回
+/// 打开默认文件夹（文档）——必须剥前缀、统一反斜杠；`\\?\UNC\` 还原为 `\\`。
+/// 非 Windows 平台原样返回字符串。
+pub(crate) fn clean_display_path(p: &std::path::Path) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let s = p.to_string_lossy().replace('/', "\\");
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        p.to_string_lossy().to_string()
+    }
+}
+
 fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -1491,11 +1874,13 @@ fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
         // cmd 元字符且无空格时 std 不加引号，cmd.exe 会把它们当命令分隔符执行（注入）
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // 剥 \\?\ verbatim 前缀 + 统一反斜杠：explorer 解析不了 verbatim 路径会退回打开默认文件夹
+        let disp = clean_display_path(p);
         if reveal {
             // /select, 与路径必须是单个参数且路径自带引号：std 会给含空格的参数整体加引号，
             // explorer 解析 "/select,C:\a b\c.txt" 会定位到错误位置——必须 raw_arg 预引号
             return std::process::Command::new("explorer")
-                .raw_arg(format!("/select,\"{}\"", p.display()))
+                .raw_arg(format!("/select,\"{disp}\""))
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
                 .map(|_| ())
@@ -1503,7 +1888,7 @@ fn open_target(p: &std::path::Path, reveal: bool) -> Result<(), String> {
         }
         // explorer 对文件按默认关联程序打开、对目录打开文件夹（exit code 不可靠，只 spawn 不判状态）
         return std::process::Command::new("explorer")
-            .arg(p)
+            .raw_arg(format!("\"{disp}\""))
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map(|_| ())
@@ -1557,6 +1942,261 @@ pub fn open_external(url: String) -> Result<(), String> {
     };
     cmd.spawn().map_err(|e| format!("打开浏览器失败: {e}"))?;
     Ok(())
+}
+
+/// ── 高权限模式（管理员 / root）──
+
+/// 当前进程是否已提权：Windows 探测 `net session`（仅管理员可成功，无新依赖）；
+/// unix 看 `id -u` 是否为 0
+pub(crate) fn is_elevated() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("net")
+            .arg("session")
+            .creation_flags(0x0800_0000)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>() == Ok(0))
+            .unwrap_or(false)
+    }
+}
+
+/// 以目标权限重启自身。elevate=true 触发系统授权弹窗（Windows UAC / macOS 管理员授权 /
+/// Linux polkit），用户取消则返回 Err；elevate=false 尝试降权拉起（Windows 经 explorer.exe
+/// 中完整性级别中转）。数据目录经 `--data-dir` 参数透传——授权弹窗产生的子进程不继承
+/// 进程环境变量，仅靠 BIT_DATA_DIR 会在提权后丢失。
+fn relaunch_with_elevation(exe: &std::path::Path, data_dir: &str, elevate: bool) -> Result<(), String> {
+    let exe_str = clean_display_path(exe);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if elevate {
+            // PowerShell 单引号转义（'' ）；-ArgumentList 透传 --data-dir
+            let esc = exe_str.replace('\'', "''");
+            let dir = data_dir.replace('\'', "''");
+            let out = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!("Start-Process -FilePath '{esc}' -ArgumentList '--data-dir','{dir}' -Verb RunAs"),
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("提权启动失败: {e}"))?;
+            if !out.status.success() {
+                return Err("未获得管理员授权（用户取消或被策略拒绝）".into());
+            }
+            return Ok(());
+        }
+        // 降权：explorer.exe 运行在中完整性级别，由它拉起的子进程不再是管理员。
+        // explorer 不透传参数；BIT_DATA_DIR 覆盖仅用于测试环境，正常数据目录为标准位置不受影响
+        std::process::Command::new("explorer")
+            .raw_arg(format!("\"{exe_str}\""))
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("降权启动失败: {e}"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let sh_e = exe_str.replace('\'', "'\\''");
+        let sh_d = data_dir.replace('\'', "'\\''");
+        if elevate {
+            // with administrator privileges 触发系统管理员授权弹窗；osascript 阻塞到用户决定，
+            // 取消时返回非零。nohup + & 后台拉起，授权对话框关闭即返回
+            let script = format!(
+                "do shell script \"BIT_DATA_DIR='{d}' nohup '{e}' >/dev/null 2>&1 &\" with administrator privileges",
+                d = sh_d,
+                e = sh_e
+            );
+            let out = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .output()
+                .map_err(|e| format!("提权启动失败: {e}"))?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                return Err(format!("未获得管理员授权: {}", err.trim()));
+            }
+            return Ok(());
+        }
+        // 降权：su 到控制台登录用户（root 执行 su 无需密码）
+        let user = std::process::Command::new("stat")
+            .args(["-f", "%Su", "/dev/console"])
+            .output()
+            .map_err(|e| format!("降权启动失败: {e}"))?;
+        let user = String::from_utf8_lossy(&user.stdout).trim().to_string();
+        if user.is_empty() || user == "root" {
+            return Err("无法确定控制台用户，降权失败".into());
+        }
+        std::process::Command::new("su")
+            .args(["-l", &user, "-c", &format!("BIT_DATA_DIR='{d}' nohup '{e}' >/dev/null 2>&1 &", d = sh_d, e = sh_e)])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("降权启动失败: {e}"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if elevate {
+            // pkexec 触发 polkit 授权弹窗；取消时返回非零。环境被清空 → 数据目录走参数
+            let mut cmd = std::process::Command::new("pkexec");
+            cmd.arg(&exe_str);
+            if !data_dir.is_empty() {
+                cmd.args(["--data-dir", data_dir]);
+            }
+            let out = cmd.output().map_err(|e| format!("提权启动失败: {e}"))?;
+            if !out.status.success() {
+                return Err("未获得管理员授权（用户取消或被策略拒绝）".into());
+            }
+            return Ok(());
+        }
+        // 降权：pkexec 提权场景拿 PKEXEC_UID，sudo 场景拿 SUDO_USER，回退 root 同名不可行则报错
+        let uid = std::env::var("PKEXEC_UID").ok().or_else(|| std::env::var("SUDO_UID").ok());
+        let user = match uid {
+            Some(uid) => {
+                let out = std::process::Command::new("getent")
+                    .args(["passwd", &uid])
+                    .output()
+                    .map_err(|e| format!("降权启动失败: {e}"))?;
+                let line = String::from_utf8_lossy(&out.stdout);
+                line.split(':').next().unwrap_or("").trim().to_string()
+            }
+            None => String::new(),
+        };
+        if user.is_empty() {
+            return Err("无法确定原用户，降权失败".into());
+        }
+        let mut cmd = std::process::Command::new("runuser");
+        cmd.args(["-u", &user, "--", &exe_str]);
+        if !data_dir.is_empty() {
+            cmd.args(["--data-dir", data_dir]);
+        }
+        cmd.spawn().map(|_| ()).map_err(|e| format!("降权启动失败: {e}"))
+    }
+}
+
+/// 工具质量评估快照：每工具近期成功率 / 累计成败 / 平均耗时 / 最近失败原因（失败次数降序）
+#[tauri::command]
+pub fn get_tool_stats(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    crate::state::toolstats::snapshot(&ctx(state))
+}
+
+/// 诊断报告：版本 / 平台 / 提权 / 守护 / 运行时长 / 数据文件清单 / 最近崩溃 / 低成功率工具，
+/// 一键自检排障所需的最小信息集
+#[tauri::command]
+pub fn get_diagnostics(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let c = ctx(state);
+    let cfg = c.config.lock().unwrap().clone();
+    let (sessions_n, messages_n, tools_n, tools_on) = {
+        let sessions = c.sessions.lock().unwrap();
+        let tools = c.tools.lock().unwrap();
+        (
+            sessions.sessions.len(),
+            sessions.sessions.iter().map(|s| s.messages.len()).sum::<usize>(),
+            tools.len(),
+            tools.iter().filter(|t| t.enabled).count(),
+        )
+    };
+    // 数据文件清单：存在性与大小（排障时确认哪些数据在、哪些丢失）
+    let file = |name: &str| {
+        let p = c.data_dir.join(name);
+        json!({
+            "name": name,
+            "exists": p.exists(),
+            "bytes": std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+        })
+    };
+    let names = [
+        "config.json", "ai_config.json", "tools.json", "runtimes.json", "skills.json",
+        "memories.json", "sessions.json", "goals.json", "todos.json", "mcp_servers.json",
+        "audit.json", "tool_stats.json", "guardian.json", "guardian.log", "crash.log",
+    ];
+    let files: Vec<serde_json::Value> = names.iter().map(|n| file(n)).collect();
+    // 低成功率工具：有失败记录的取前 5（快照已按失败次数降序）
+    let stats = crate::state::toolstats::snapshot(&c);
+    let worst: Vec<serde_json::Value> = stats
+        .as_array()
+        .map(|a| a.iter().filter(|t| t["fail"].as_u64().unwrap_or(0) > 0).take(5).cloned().collect())
+        .unwrap_or_default();
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        "elevated": is_elevated(),
+        "uptime_secs": c.started.elapsed().as_secs(),
+        "remote": { "enabled": cfg.remote_enabled, "port": cfg.port },
+        "sessions": { "count": sessions_n, "messages": messages_n },
+        "tools": { "total": tools_n, "enabled": tools_on },
+        "data_dir": c.data_dir.display().to_string(),
+        "files": files,
+        "worst_tools": worst,
+        "guardian": crate::guardian::diagnose(&c.data_dir, &cfg.client_key),
+        "crashes": crate::crash::tail(&c.data_dir, 5),
+    })
+}
+
+/// 查询高权限状态：active=当前进程实际已提权；enabled=配置意图（两者可能不一致：
+/// 授权弹窗被取消时配置保持开启但进程未提权）
+#[tauri::command]
+pub fn get_elevation(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let c = ctx(state);
+    json!({
+        "active": is_elevated(),
+        "enabled": c.config.lock().unwrap().elevated,
+    })
+}
+
+/// 开启/关闭高权限模式：开启即触发系统授权弹窗并以管理员身份重启；关闭以普通权限重启。
+/// 成功后当前进程自动退出，新实例接管；失败（授权被取消等）保持当前进程运行并返回错误。
+#[tauri::command]
+pub async fn set_elevation(app: tauri::AppHandle, state: State<'_, Arc<Ctx>>, enabled: bool) -> Result<serde_json::Value, String> {
+    let c = ctx(state);
+    let active = is_elevated();
+    if enabled == active {
+        // 意图与现状一致：仅同步配置（修正在系统外手动提权/降权造成的漂移）
+        {
+            let mut cfg = c.config.lock().unwrap();
+            cfg.elevated = enabled;
+            cfg.revision += 1;
+            cfg.save(&c.data_dir);
+        }
+        return Ok(json!({ "active": active, "enabled": enabled }));
+    }
+    crate::audit::record(&c, "local-app", "settings.elevation", &enabled.to_string(), json!({ "enabled": enabled, "was_active": active }), true);
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位可执行文件: {e}"))?;
+    let data_dir = c.data_dir.to_string_lossy().to_string();
+    // 阻塞等待授权弹窗结果：放入阻塞线程池，避免卡住异步运行时
+    let h = tokio::task::spawn_blocking(move || relaunch_with_elevation(&exe, &data_dir, enabled));
+    let result = h.await.map_err(|e| format!("重启任务失败: {e}"))?;
+    match result {
+        Ok(()) => {
+            {
+                let mut cfg = c.config.lock().unwrap();
+                cfg.elevated = enabled;
+                cfg.revision += 1;
+                cfg.save(&c.data_dir);
+            }
+            // 正常重启交接：通知守护进程不要按意外死亡接力，新实例会重新布防
+            crate::guardian::expect_exit(&c);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            app.exit(0);
+            #[allow(unreachable_code)]
+            Ok(json!({ "active": enabled, "enabled": enabled }))
+        }
+        Err(e) => {
+            crate::audit::record(&c, "local-app", "settings.elevation", &enabled.to_string(), json!({ "error": e }), false);
+            // 授权被取消：守护进程可能已收到退出标记，立即重新布防补位
+            crate::guardian::arm(&c);
+            Err(e)
+        }
+    }
 }
 
 /// 安装 `bit` 命令到终端 PATH：macOS/Linux 优先 /usr/local/bin 符号链接（无权限回退 ~/.local/bin），
@@ -1723,6 +2363,8 @@ pub async fn update_apply(app: tauri::AppHandle, state: State<'_, Arc<Ctx>>) -> 
     let ctx = ctx(state);
     let msg = crate::update::apply_update(&ctx, true)?;
     let _ = app.emit("update-applied", serde_json::json!({ "msg": msg }));
+    // 更新换装属正常重启：先通知守护进程不要按旧哈希接力，避免误报篡改
+    crate::guardian::expect_exit(&ctx);
     // 给事件一点送达时间后重启进程（macOS/Linux 已换装；Windows 安装器静默跑）
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     app.restart();
@@ -1732,6 +2374,52 @@ pub async fn update_apply(app: tauri::AppHandle, state: State<'_, Arc<Ctx>>) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_crash_tail_roundtrip() {
+        // crash.log JSONL 追加 → tail 倒序读取；损坏行跳过
+        let dir = std::env::temp_dir().join(format!("bit-crash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("crash.log"),
+            concat!(
+                "{\"time\":\"t1\",\"thread\":\"main\",\"msg\":\"first\",\"loc\":\"a.rs:1:1\",\"backtrace\":\"bt\"}\n",
+                "corrupted line\n",
+                "{\"time\":\"t2\",\"thread\":\"worker\",\"msg\":\"second\",\"loc\":\"\",\"backtrace\":\"\"}\n"
+            ),
+        )
+        .unwrap();
+        let v = crate::crash::tail(&dir, 5);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0]["msg"], "second");
+        assert_eq!(v[1]["msg"], "first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_clean_display_path_passthrough() {
+        // 非 Windows：canonicalize 后原样转字符串（Windows 分支的转换由 test_clean_display_path_verbatim 覆盖）
+        let tmp = std::env::temp_dir().join(format!("bit-cdp-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let c = std::fs::canonicalize(&f).unwrap();
+        assert_eq!(super::clean_display_path(&c), c.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_clean_display_path_verbatim() {
+        // \\?\C:\a\b.txt → C:\a\b.txt（explorer /select 无法解析 verbatim 前缀）
+        assert_eq!(super::clean_display_path(std::path::Path::new(r"\\?\C:\a\b.txt")), r"C:\a\b.txt");
+        // \\?\UNC\srv\share\f.txt → \\srv\share\f.txt
+        assert_eq!(super::clean_display_path(std::path::Path::new(r"\\?\UNC\srv\share\f.txt")), r"\\srv\share\f.txt");
+        // 正斜杠统一为反斜杠
+        assert_eq!(super::clean_display_path(std::path::Path::new(r"\\?\C:/a/b.txt")), r"C:\a\b.txt");
+        // 普通路径原样保留
+        assert_eq!(super::clean_display_path(std::path::Path::new(r"C:\a\b.txt")), r"C:\a\b.txt");
+    }
+
     /// 外部集成测试：连接独立运行的 mock AI（e2e/mock-ai.cjs，默认 127.0.0.1:9901），
     /// 走真实 TCP 验证 OpenAI 兼容 /models 拉取逻辑。
     /// 仅在设置 BIT_FAKE_OPENAI_URL 环境变量时运行：
@@ -1742,11 +2430,12 @@ mod tests {
             eprintln!("跳过：未设置 BIT_FAKE_OPENAI_URL");
             return;
         };
-        let models = super::list_provider_models("openai".into(), base, String::new())
+        let models = super::fetch_provider_models("openai", &base, "")
             .await
             .unwrap();
+        let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
         assert!(
-            models.contains(&"mock-model-a".to_string()) && models.contains(&"mock-model-b".to_string()),
+            ids.contains(&"mock-model-a") && ids.contains(&"mock-model-b"),
             "应返回 mock 的模型列表: {models:?}"
         );
     }

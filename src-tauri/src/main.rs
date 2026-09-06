@@ -1,3 +1,4 @@
+// yxpil · BIT
 // release 构建隐藏 Windows 控制台窗口；debug 保留便于查看日志
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -7,15 +8,21 @@ mod audit;
 mod autopilot;
 mod commands;
 mod config;
+mod crash;
 mod extract;
 mod goal;
+mod guardian;
 mod http_api;
 mod mcp;
 mod memory;
+mod netinfo;
 mod registry;
+mod relay;
+mod repetition;
 mod runtime;
 mod script;
 mod script_runtime;
+mod security;
 mod session;
 mod state;
 mod tray;
@@ -34,6 +41,22 @@ fn main() {
     // stdout 已被管道占用（E2E / CI）时 attach_console 自动跳过，标准流保持原样。
     #[cfg(windows)]
     attach_console();
+
+    // 守护进程模式：本进程由主进程拉起用于看门狗守护，不进入 GUI / TUI（握手文件与日志路径由参数传入）
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() >= 4 && argv[1] == guardian::GUARDIAN_FLAG {
+        guardian::run_guardian(argv[2].clone().into(), argv[3].clone().into());
+        return;
+    }
+
+    // --data-dir <path>：显式指定数据目录（提权重启时授权弹窗产生的子进程拿不到原环境变量，
+    // 用参数透传保证数据目录一致；也便于脚本/测试）
+    if let Some(pos) = argv.iter().position(|a| a == "--data-dir") {
+        if let Some(dir) = argv.get(pos + 1) {
+            std::env::set_var("BIT_DATA_DIR", dir);
+        }
+    }
+
     let explicit_tui = std::env::args().any(|a| a == "tui");
     let bare_tty_tui = !explicit_tui
         && std::env::args().count() == 1
@@ -61,11 +84,17 @@ fn main() {
             .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
                 tray::show_main_window(app);
             }))
-            .plugin(tauri_plugin_notification::init());
+            .plugin(tauri_plugin_notification::init())
+            .plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                None,
+            ));
     }
     builder
         .setup(move |app| {
             let ctx = state::Ctx::load(app.handle().clone());
+            // 全局 panic 钩子：崩溃信息（含回溯）追加到数据目录 crash.log，诊断报告展示
+            crash::install(&ctx.data_dir);
             let (actor, target) = if tui_mode { ("local-cli", "tui") } else { ("local-app", "BIT") };
             audit::record(&ctx, actor, "app.start", target, serde_json::json!({}), true);
             app.manage(ctx.clone());
@@ -83,6 +112,11 @@ fn main() {
                 return Ok(());
             }
 
+            // 守护进程布防：接力日志转存审计（此前发生的被杀/拉起/篡改拒绝事件）→ 写握手文件 → 拉起守护进程
+            guardian::drain_log(&ctx);
+            guardian::arm(&ctx);
+            tauri::async_runtime::spawn(guardian::watchdog_task(ctx.clone()));
+
             // 解释器探测移到后台：不阻塞窗口显示（修复启动慢/白屏）
             let rt_ctx = ctx.clone();
             let rt_app = app.handle().clone();
@@ -96,11 +130,34 @@ fn main() {
             // 系统托盘（关闭窗口后程序驻留后台）
             tray::create(app.handle(), &ctx)?;
 
+            // 开机自启：以配置为准同步系统登录项（配置是唯一真源，修复登录项被系统/用户清理后的漂移）
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let autostart_wanted = ctx.config.lock().unwrap().autostart;
+                let manager = app.autolaunch();
+                let cur = manager.is_enabled().unwrap_or(false);
+                if cur != autostart_wanted {
+                    let r = if autostart_wanted { manager.enable() } else { manager.disable() };
+                    if let Err(e) = r {
+                        eprintln!("[BIT] autostart sync failed: {e}");
+                    }
+                }
+            }
+
             // 远程访问 HTTP 服务
             let http_ctx = ctx.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = http_api::restart_server(&http_ctx).await {
                     eprintln!("[BIT] http server error: {e}");
+                }
+            });
+
+            // 后台拉取激活提供方的模型列表：尽量获取各模型最大上下文（写入 model_context 缓存，失败静默）
+            let mf_ctx = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                let p = mf_ctx.ai_config.lock().unwrap().active().cloned();
+                if let Some(p) = p {
+                    commands::refresh_model_context(&mf_ctx, &p.protocol, &p.base_url, &p.api_key).await;
                 }
             });
 
@@ -151,8 +208,15 @@ fn main() {
             commands::clear_audit,
             commands::delete_audit_entry,
             commands::get_remote_config,
+            commands::get_remote_status,
             commands::save_remote_config,
             commands::regenerate_client_key,
+            commands::get_guard_limits,
+            commands::set_guard_limits,
+            commands::save_cloud_relay,
+            commands::save_stun_servers,
+            commands::get_lan_info,
+            commands::get_remote_qr,
             commands::save_access_password,
             commands::regenerate_access_password,
             commands::test_connectivity,
@@ -177,6 +241,12 @@ fn main() {
             commands::tool_approve,
             commands::set_tool_approval,
             commands::get_tool_approval,
+            commands::get_autostart,
+            commands::set_autostart,
+            commands::get_elevation,
+            commands::set_elevation,
+            commands::get_tool_stats,
+            commands::get_diagnostics,
             commands::get_ai_params,
             commands::set_ai_params,
             commands::list_provider_models,

@@ -29,6 +29,17 @@ export const api = {
     invoke("save_access_password", { password, passwordEnabled: password_enabled }),
   regenerateAccessPassword: () => invoke("regenerate_access_password"),
   testConnectivity: () => invoke("test_connectivity"),
+  // 幻觉防护阈值：单回复词重复上限 / 单回合工具轮上限（0=关闭）
+  getGuardLimits: () => invoke("get_guard_limits"),
+  setGuardLimits: (word_repeat_max, tool_loop_max) =>
+    invoke("set_guard_limits", { wordRepeatMax: word_repeat_max, toolLoopMax: tool_loop_max }),
+  // 远程二维码：网络探测（LAN/公网候选 + NAT 粗判）→ 返回 { payload, svg }
+  getRemoteQr: () => invoke("get_remote_qr"),
+  getLanInfo: () => invoke("get_lan_info"),
+  // 云中继地址（对称 NAT 时手机端改连），空串清除
+  saveCloudRelay: (url) => invoke("save_cloud_relay", { url }),
+  // 自定 STUN 列表（NAT 探测数据源），空数组恢复内置默认
+  saveStunServers: (servers) => invoke("save_stun_servers", { servers }),
   listProviders: () => invoke("list_providers"),
   addProvider: (name, protocol, base_url, api_key, model) =>
     invoke("add_provider", { name, protocol, baseUrl: base_url, apiKey: api_key, model }),
@@ -86,6 +97,12 @@ export const api = {
   toolApprove: (id, allow) => invoke("tool_approve", { id, allow }),
   setToolApproval: (mode) => invoke("set_tool_approval", { mode }),
   getToolApproval: () => invoke("get_tool_approval"),
+  getAutostart: () => invoke("get_autostart"),
+  setAutostart: (enabled) => invoke("set_autostart", { enabled }),
+  getElevation: () => invoke("get_elevation"),
+  setElevation: (enabled) => invoke("set_elevation", { enabled }),
+  getToolStats: () => invoke("get_tool_stats"),
+  getDiagnostics: () => invoke("get_diagnostics"),
   contextPreview: (session_id) => invoke("context_preview", { sessionId: session_id || "" }),
   contextMetrics: (session_id) => invoke("context_metrics", { sessionId: session_id || "" }),
   listSessions: () => invoke("list_sessions"),

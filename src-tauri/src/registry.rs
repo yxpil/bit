@@ -1,3 +1,4 @@
+// yxpil · BIT
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -366,6 +367,8 @@ pub async fn invoke(
         return Err(format!("Tool `{}` is paused; enable it on the Tools page first", tool.name));
     }
 
+    // 工具质量评估：计时并记录成功/失败/耗时/失败原因（所有调用路径统一收口）
+    let t0 = std::time::Instant::now();
     let result = match &tool.kind {
         ToolKind::Builtin { handler } => builtin_invoke(ctx, handler, &params, actor, session).await,
         ToolKind::Remote { url } => {
@@ -432,6 +435,13 @@ pub async fn invoke(
         }
     };
 
+    crate::state::toolstats::record(
+        ctx,
+        &tool.id,
+        result.is_ok(),
+        t0.elapsed().as_millis() as u64,
+        result.as_ref().err().map(|e| safe_trunc(e, 200)).as_deref(),
+    );
     crate::audit::record(
         ctx,
         actor,
@@ -545,10 +555,11 @@ async fn builtin_invoke(
             if meta.is_dir() {
                 return Err(format!("`{path}` is a directory; send_file only accepts a single file"));
             }
-            let card_path = std::fs::canonicalize(p)
-                .unwrap_or_else(|_| std::path::PathBuf::from(&path))
-                .to_string_lossy()
-                .to_string();
+            // 卡片存自包含的干净绝对路径：canonicalize 绝对化后剥掉 Windows `\\?\` verbatim
+            // 前缀（否则 explorer /select 解析失败退回打开"文档"文件夹）
+            let card_path = crate::commands::clean_display_path(
+                &std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(&path)),
+            );
             let name = p
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -759,8 +770,9 @@ async fn builtin_invoke(
                         };
                     }
                     _ = &mut watch => {
-                        // 同时清掉子会话自己的中断标记，避免下次对话误报「已中断」
-                        crate::agent::clear_interrupt(ctx, &sid);
+                        // 主会话中断：取消子任务（run future 被 drop 即终止）。
+                        // 子会话残留的中断条目无需在此清理：下一回合 register 时会复位，
+                        // 且 chat_turn 的摘除按 Arc 指针比对，外部无法拿到子回合的标志
                         break Err(format!("Parent session interrupted; subtask stopped (sub-session {sid} keeps the progress)"));
                     }
                 }

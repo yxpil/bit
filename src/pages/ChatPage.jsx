@@ -17,6 +17,9 @@ import {
   IconQueue,
   IconCopy,
   IconCheck,
+  IconTarget,
+  IconChevronDown,
+  IconChevronRight,
 } from "../components/Icons.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
 import FileCard from "../components/FileCard.jsx";
@@ -118,6 +121,30 @@ export default function ChatPage({ onStats, visible }) {
     return () => uns.forEach((u) => u.then((f) => f()));
   }, []);
 
+  // ── 计划栏：输入框上方展示目标与待办 ──
+  // 完成项绿色圆点+绿字，未完成白色圆点；小箭头折叠/展开（localStorage 记忆展开状态）
+  const [planGoals, setPlanGoals] = useState([]);
+  const [planTodos, setPlanTodos] = useState([]);
+  const [planOpen, setPlanOpen] = useState(() => localStorage.getItem("bit.planOpen") === "1");
+  const loadPlans = () => {
+    api.listGoals().then((r) => setPlanGoals(r.goals || [])).catch(() => {});
+    api.listTodos().then((r) => setPlanTodos(r.todos || [])).catch(() => {});
+  };
+  useEffect(() => {
+    loadPlans();
+    const timer = setInterval(loadPlans, 3000); // AI 执行 plan 工具后自动刷新
+    const unFocus = listen("tauri://focus", loadPlans);
+    return () => {
+      clearInterval(timer);
+      unFocus.then((f) => f());
+    };
+  }, []);
+  const togglePlanOpen = () =>
+    setPlanOpen((v) => {
+      localStorage.setItem("bit.planOpen", v ? "0" : "1");
+      return !v;
+    });
+
   // 后台会话变动（如子智能体新建会话 / 完成任务）：自动刷新侧栏与当前会话内容
   useEffect(() => {
     const un = listen("sessions-updated", (e) => {
@@ -135,16 +162,37 @@ export default function ChatPage({ onStats, visible }) {
   const live = liveMap[activeId] || null;
   const runningCount = Object.keys(busyMap).length;
 
+  // 计划栏派生：非放弃目标 + 归属待办；无目标待办的独立待办单独成组
+  const planVisibleGoals = planGoals.filter((g) => g.status !== "abandoned");
+  const planGoalIds = new Set(planVisibleGoals.map((g) => g.id));
+  const planVisibleTodos = planTodos.filter((td) => !td.goal_id || planGoalIds.has(td.goal_id));
+  const planLooseTodos = planVisibleTodos.filter((td) => !td.goal_id);
+  const planGroups = [
+    ...planVisibleGoals.map((g) => ({ goal: g, todos: planVisibleTodos.filter((td) => td.goal_id === g.id) })),
+    ...(planLooseTodos.length ? [{ goal: null, todos: planLooseTodos }] : []),
+  ];
+  const planTodoDone = planVisibleTodos.filter((td) => td.status === "completed").length;
+  const planAllDone =
+    planVisibleTodos.length > 0 &&
+    planTodoDone === planVisibleTodos.length &&
+    planVisibleGoals.every((g) => g.status === "achieved");
+  // 没有进行中的内容（无 active 目标且无未完成待办）时整个隐藏，已完成/已放弃的不占位置
+  const planHasActive =
+    planVisibleGoals.some((g) => g.status !== "achieved") ||
+    planVisibleTodos.some((td) => td.status !== "completed");
+
   // 上下文用量估算：优先使用后端按真实上下文构造得到的统一口径，
   // 前端仅在结果返回前用消息长度做兜底估算。
-  // 阈值默认 128K，用户可点击用量条上的数字自行设置（localStorage 持久化）
+  // 阈值优先取后端从模型 API 拉到的最大上下文（model_context 缓存），
+  // 拿不到时退回手动设置（默认 128K，localStorage 持久化）
   const [ctxLimitK, setCtxLimitK] = useState(() => {
     const v = parseInt(localStorage.getItem("bit.ctxLimitK"));
     return Number.isFinite(v) && v >= 4 && v <= 2000 ? v : 128;
   });
   const [limitEdit, setLimitEdit] = useState(false);
   const [limitInput, setLimitInput] = useState("");
-  const CONTEXT_LIMIT = ctxLimitK * 1024;
+  const ctxLimitKnown = Number.isFinite(contextMeta?.max_context) && contextMeta.max_context > 0;
+  const CONTEXT_LIMIT = ctxLimitKnown ? contextMeta.max_context : ctxLimitK * 1024;
   const [compressing, setCompressing] = useState(false);
   const estimateTokens = (text) => Math.ceil((text || "").length / 2);
   const localContextTokens = (() => {
@@ -201,7 +249,7 @@ export default function ChatPage({ onStats, visible }) {
         },
       }),
     );
-  }, [sessions.length, contextTokens, ctxLimitK, runningCount, usage?.hit_rate, usageKnown]);
+  }, [sessions.length, contextTokens, ctxLimitK, ctxLimitKnown, runningCount, usage?.hit_rate, usageKnown]);
 
   useEffect(() => {
     activeRef.current = activeId;
@@ -445,12 +493,13 @@ export default function ChatPage({ onStats, visible }) {
             }));
             break;
           case "tools":
-            // 本轮是工具调用：丢弃流式文本，沉淀为卡片（含可选的说明文字）
+            // 本轮是工具调用：丢弃流式文本，沉淀为卡片（含可选的说明文字）；
+            // 思考跨轮保留（落库的是整个回合的思考，实时面板保持一致，调工具不清空）
             setLiveMap((m) => ({
               ...m,
               [sid]: {
                 text: "",
-                think: "",
+                think: m[sid]?.think || "",
                 cards: [...(m[sid]?.cards || []), { visible: ev.visible || "", calls: ev.calls || [] }],
               },
             }));
@@ -458,6 +507,11 @@ export default function ChatPage({ onStats, visible }) {
           case "continue":
             // 后端检测到回复被截断，自动续发「继续」：用清洗后的片段替换原始流式文本
             setLiveMap((m) => ({ ...m, [sid]: { text: ev.visible || "", think: m[sid]?.think || "", cards: m[sid]?.cards || [] } }));
+            break;
+          case "net_retry":
+            // 网络瞬断自动重试：本轮半截内容重新生成（历史未落库），清空实时文本与思考避免重复；
+            // 已完成轮次的工具卡片保留
+            setLiveMap((m) => ({ ...m, [sid]: { text: "", think: "", cards: m[sid]?.cards || [] } }));
             break;
           case "usage":
             // 本轮 token 用量与缓存命中率（会话累计）
@@ -476,7 +530,11 @@ export default function ChatPage({ onStats, visible }) {
               endLive();
             } else {
               if (activeRef.current === sid) {
-                setMessages((msgs) => [...msgs, { role: "assistant", content: t("chat.callFailed") + ev.error }]);
+                setMessages((msgs) => [
+                  // 上游断流前已流出的部分回复先入列（后端已落库），避免已显示的内容消失
+                  ...(ev.partial ? [{ role: "assistant", content: ev.partial }] : []),
+                  { role: "assistant", content: t("chat.callFailed") + ev.error },
+                ]);
               }
               endLive();
             }
@@ -711,15 +769,31 @@ export default function ChatPage({ onStats, visible }) {
       {/* 对话主区：无标题行，主体完全留给消息 */}
       <div className="flex min-w-0 flex-1 flex-col gap-3">
         <div className="card flex-1 overflow-y-auto">
-          {visibleMessages.length === 0 && !busy && (
+          {messages.length === 0 && !busy && (
             <div className="flex h-full items-center justify-center px-6 text-center text-sm text-neutral-400">
               {t("chat.emptyHint")}
             </div>
           )}
           <div className="flex flex-col gap-3">
-            {visibleMessages.map((m, i) => (
-              <MessageBubble key={i} message={m} />
-            ))}
+            {messages.map((m, i) =>
+              m.role === "system" ? (
+                // 压缩分割线：会话中的 system 消息即压缩摘要（仅 compress_session 写入），
+                // 悬停可查看完整摘要；上方为压缩前历史，下方为压缩后新对话
+                <div
+                  key={i}
+                  title={m.content}
+                  className="my-2 flex items-center gap-3"
+                >
+                  <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
+                  <span className="shrink-0 text-[11px] text-neutral-400">
+                    {t("chat.compressedDivider")}
+                  </span>
+                  <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
+                </div>
+              ) : (
+                <MessageBubble key={i} message={m} />
+              )
+            )}
             {/* 流式实时区：已完成轮次的工具卡片 + 本轮增量文本 */}
             {live && (
               <div className="mr-auto flex max-w-[85%] flex-col gap-2">
@@ -728,18 +802,6 @@ export default function ChatPage({ onStats, visible }) {
                   const toolCalls = (c.calls || []).filter((x) => !(x.tool === "send_file" && x.ok));
                   return (
                     <div key={i} className="flex flex-col gap-2">
-                      {fileCalls.length > 0 && (
-                        <div className="flex flex-col gap-1.5">
-                          {fileCalls.map((call, j) => (
-                            <FileCard
-                              key={j}
-                              path={call.params?.path}
-                              bytes={call.result?.bytes}
-                              note={call.params?.note}
-                            />
-                          ))}
-                        </div>
-                      )}
                       {toolCalls.length > 0 && (
                         <div className="flex flex-col gap-1.5">
                           {toolCalls.map((call, j) => (
@@ -750,6 +812,19 @@ export default function ChatPage({ onStats, visible }) {
                       {c.visible && c.visible.trim() && (
                         <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">
                           <Markdown>{c.visible}</Markdown>
+                        </div>
+                      )}
+                      {/* 文件卡片放在说明文字之后：先说话后发文件 */}
+                      {fileCalls.length > 0 && (
+                        <div className="flex flex-col gap-1.5">
+                          {fileCalls.map((call, j) => (
+                            <FileCard
+                              key={j}
+                              path={call.params?.path}
+                              bytes={call.result?.bytes}
+                              note={call.params?.note}
+                            />
+                          ))}
                         </div>
                       )}
                     </div>
@@ -812,6 +887,8 @@ export default function ChatPage({ onStats, visible }) {
                     onBlur={saveLimit}
                     className="w-14 rounded-md bg-transparent px-1 text-center outline-none ring-1 ring-current/40"
                   />
+                ) : ctxLimitKnown ? (
+                  <span title={t("chat.ctxAutoTitle")}>{Math.round(CONTEXT_LIMIT / 1024)}K</span>
                 ) : (
                   <button
                     onClick={() => {
@@ -1016,6 +1093,94 @@ export default function ChatPage({ onStats, visible }) {
               >
                 <IconX size={14} />
               </button>
+            </div>
+          )}
+
+          {/* 计划栏：完成=绿色，未完成=白色；小箭头折叠/展开；无进行中内容时隐藏 */}
+          {planHasActive && (
+            <div className="card px-3 py-2">
+              <button onClick={togglePlanOpen} className="flex w-full items-center gap-2 text-left">
+                <IconTarget
+                  size={14}
+                  className={`shrink-0 ${planAllDone ? "text-emerald-500" : "text-neutral-400"}`}
+                />
+                <span
+                  className={`text-sm font-medium ${
+                    planAllDone ? "text-emerald-600 dark:text-emerald-400" : "text-neutral-900 dark:text-neutral-100"
+                  }`}
+                >
+                  {t("chat.plan")}
+                </span>
+                {planVisibleTodos.length > 0 && (
+                  <span
+                    className={`font-mono text-xs ${
+                      planAllDone ? "text-emerald-500/80" : "text-neutral-400"
+                    }`}
+                  >
+                    {planTodoDone}/{planVisibleTodos.length}
+                  </span>
+                )}
+                <span className="ml-auto text-neutral-400">
+                  {planOpen ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+                </span>
+              </button>
+              {planOpen && (
+                <div className="mt-2 space-y-2">
+                  {planGroups.map((grp, gi) => {
+                    const goalDone = grp.goal && grp.goal.status === "achieved";
+                    return (
+                      <div key={grp.goal ? grp.goal.id : `loose-${gi}`}>
+                        {grp.goal && (
+                          <div
+                            className={`flex items-center gap-2 text-[13px] ${
+                              goalDone
+                                ? "text-emerald-600 dark:text-emerald-400"
+                                : "text-neutral-900 dark:text-neutral-100"
+                            }`}
+                          >
+                            <span
+                              className={`h-2 w-2 shrink-0 rounded-full ${
+                                goalDone
+                                  ? "bg-emerald-500"
+                                  : "border border-neutral-400 bg-white dark:border-neutral-400"
+                              }`}
+                            />
+                            <span className="min-w-0 truncate font-medium" title={grp.goal.title}>
+                              {grp.goal.title}
+                            </span>
+                          </div>
+                        )}
+                        <div className={`space-y-1 ${grp.goal ? "mt-1 pl-4" : ""}`}>
+                          {grp.todos.map((td) => {
+                            const done = td.status === "completed";
+                            return (
+                              <div
+                                key={td.id}
+                                className={`flex items-center gap-2 text-xs ${
+                                  done
+                                    ? "text-emerald-600/80 dark:text-emerald-400/80"
+                                    : "text-neutral-600 dark:text-neutral-300"
+                                }`}
+                              >
+                                <span
+                                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                                    done
+                                      ? "bg-emerald-500"
+                                      : "border border-neutral-400 bg-white dark:border-neutral-400"
+                                  }`}
+                                />
+                                <span className="min-w-0 truncate" title={td.content}>
+                                  {td.content}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -1298,18 +1463,6 @@ function MessageBubble({ message }) {
 
   return (
     <div className="mr-auto flex max-w-[85%] flex-col gap-2">
-      {fileCalls.length > 0 && (
-        <div className="flex flex-col gap-1.5">
-          {fileCalls.map((c, i) => (
-            <FileCard
-              key={i}
-              path={c.params?.path}
-              bytes={c.result?.bytes}
-              note={c.params?.note}
-            />
-          ))}
-        </div>
-      )}
       {toolCalls.length > 0 && (
         <div className="flex flex-col gap-1.5">
           {toolCalls.map((c, i) => (
@@ -1324,6 +1477,19 @@ function MessageBubble({ message }) {
             <Markdown>{message.content}</Markdown>
           </div>
           <CopyBtn text={message.content || ""} />
+        </div>
+      )}
+      {/* 文件卡片放在文字之后：先说话后发文件，如同聊天里收到附件 */}
+      {fileCalls.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          {fileCalls.map((c, i) => (
+            <FileCard
+              key={i}
+              path={c.params?.path}
+              bytes={c.result?.bytes}
+              note={c.params?.note}
+            />
+          ))}
         </div>
       )}
     </div>

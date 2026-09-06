@@ -4,6 +4,14 @@ const http = require("http");
 
 const PORT = 9901;
 
+// 网络瞬断场景的请求计数（按标记）：首次断流、重试给完整答案
+const netFlapCount = {};
+
+// plan 工具创建的目标（title → goal_id）：跨请求记忆。
+// BIT 不把工具反馈持久化进下一轮历史，后续自动推进请求里拿不到 goal_id，
+// 只能在 plan 反馈经过时捕获，供自动推进轮的 todo_write / goal_update 使用。
+const goalIds = {};
+
 function contentText(m) {
   // 多模态：content 可能是 [{type:"text",text}, {type:"image_url",...}] 数组
   if (typeof m.content === "string") return m.content;
@@ -34,10 +42,10 @@ function pickLastUser(messages) {
 }
 
 function toolResultCount(messages) {
-  // 文本协议：user 消息以「工具调用结果」开头；原生 function calling：role="tool" 消息
+  // 文本协议：user 消息以「Tool result(s)」开头（BIT 反馈前缀）；原生 function calling：role="tool" 消息
   return messages.filter(
     (m) =>
-      (m.role === "user" && String(m.content || "").startsWith("工具调用结果")) ||
+      (m.role === "user" && String(m.content || "").startsWith("Tool result(s)")) ||
       m.role === "tool"
   ).length;
 }
@@ -46,7 +54,7 @@ function toolResultCount(messages) {
 function feedbackText(messages) {
   const lastTool = [...messages].reverse().find((m) => m.role === "tool");
   if (lastTool) return String(lastTool.content || "");
-  const last = [...messages].reverse().find((m) => m.role === "user" && String(m.content || "").startsWith("工具调用结果"));
+  const last = [...messages].reverse().find((m) => m.role === "user" && String(m.content || "").startsWith("Tool result(s)"));
   return last ? String(last.content) : "";
 }
 
@@ -77,15 +85,16 @@ function respondMsg(res, payload, sse, messages) {
 }
 
 const server = http.createServer((req, res) => {
-  // GET /v1/models：模拟 OpenAI 兼容模型列表（供 list_provider_models 集成测试）
+  // GET /v1/models：模拟 OpenAI 兼容模型列表（供 list_provider_models 集成测试；
+  // 附 context_length 供「最大上下文自动获取」断言）
   if (req.method === "GET" && req.url.startsWith("/v1/models")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(
       JSON.stringify({
         object: "list",
         data: [
-          { id: "mock-model-a", object: "model", owned_by: "mock" },
-          { id: "mock-model-b", object: "model", owned_by: "mock" },
+          { id: "mock-model-a", object: "model", owned_by: "mock", context_length: 8192 },
+          { id: "mock-model-b", object: "model", owned_by: "mock", context_length: 16384 },
         ],
       })
     );
@@ -119,6 +128,29 @@ const server = http.createServer((req, res) => {
     const all = messages.map((m) => contentText(m)).join("\n");
     const isFeedback = rounds > 0;
 
+    // 捕获 plan 工具结果中的 goal_id（title → id），供自动推进轮收尾使用。
+    // 逐消息配对（serde_json 键序不定，goal / goal_id 先后都可能），避免跨消息错配
+    for (const m of messages) {
+      const s = contentText(m);
+      if (!s.includes("goal_id")) continue;
+      const gid = (s.match(/"goal_id"\s*:\s*"([^"]+)"/) || [])[1];
+      const gtitle = (s.match(/"goal"\s*:\s*"([^"]+)"/) || [])[1];
+      if (gid && gtitle) goalIds[gtitle] = gid;
+    }
+
+    // E2E-TOOLLOOP（幻觉防护-工具死循环）：无视反馈内容，每轮都继续调用工具；
+    // BIT 在 tool_loop_max 轮后拒绝执行并附 [tool-loop-guard] 熔断标记，不再询问 mock
+    if (all.includes("E2E-TOOLLOOP")) {
+      const n = rounds + 1;
+      return respond(res, `继续第 ${n} 次调用：[{"tool":"shell","params":{"command":"echo e2e-loop-${n}"}}]`, sse);
+    }
+
+    // E2E-REPEAT（幻觉防护-词重复）：单条回复里同词出现 25 次（默认阈值 20）→
+    // BIT 应在回复尾部附 [repetition-guard] 熔断标记
+    if (last.includes("E2E-REPEAT")) {
+      return respond(res, "好的，以下是说明。" + "测试".repeat(25), sse);
+    }
+
     // ── 图片场景：多模态消息到达即确认看见（在工具轮判断之前，图片消息无工具反馈） ──
     const imgs = imageCount(messages);
     if (imgs > 0) return respond(res, `E2E-IMAGE-SEEN count=${imgs}`, sse);
@@ -126,7 +158,9 @@ const server = http.createServer((req, res) => {
     // ── 工具反馈轮：按场景与轮次决定继续调用还是给最终答案 ──
     if (isFeedback) {
       // 记忆/技能沉淀等后台请求：直接给个普通文本，避免触发更多工具
-      if (last.includes("沉淀") || last.includes("总结")) return respond(res, "已完成后台整理。", sse);
+      // （自动推进的收尾指令含「简要总结成果」，属于推进轮而非后台整理，需排除）
+      if ((last.includes("沉淀") || last.includes("总结")) && !last.startsWith("继续（自动推进）"))
+        return respond(res, "已完成后台整理。", sse);
 
       // E2E-CMD-FILES: 轮0 写文件 → 轮1 编辑文件 → 轮2 最终
       if (all.includes("E2E-CMD-FILES")) {
@@ -219,6 +253,22 @@ const server = http.createServer((req, res) => {
         return respond(res, "E2E-AI-NOTOOL-OK（已改用真实工具）", sse);
       }
 
+      // E2E-AUTODRIVE（目标自动推进）反馈轮：工具调用都在「轮次开始」发出（见下方用户轮分支），
+      // 这里只按推进阶段确认。确认语按阶段变化——自动推进的空转保护会把
+      // 「连续两轮完全相同的回复」判为停机，确认语必须逐轮不同。
+      // last 为推进指令原文（pickLastUser 跳过 role=tool），从中解析阶段：
+      if (all.includes("E2E-AUTODRIVE")) {
+        if (last.includes("所有待办均已完成")) return respond(res, "目标已标记 achieved。E2E-AUTODRIVE-DONE 全部完成", sse);
+        if (last.includes("「step two」")) return respond(res, "step two 完成，收尾。", sse);
+        if (last.includes("「step one」")) return respond(res, "step one 完成，继续第二步。", sse);
+        return respond(res, "目标已创建，共 2 步，等待推进。", sse);
+      }
+
+      // E2E-CMD-PLAN（T6）反馈轮：plan 建目标后自动推进收尾（待办完成 + 目标归档）也走这里确认
+      if (all.includes("E2E-CMD-PLAN")) {
+        return respond(res, "E2E-FINAL-OK 计划完成并自动归档", sse);
+      }
+
       // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）
       const stdouts = messages
         .filter((m) => m.role === "tool")
@@ -231,6 +281,45 @@ const server = http.createServer((req, res) => {
 
     // ── 用户轮：按场景标记返回工具调用（含 BIT 文本协议的各种变体） ──
 
+    // 目标自动推进首轮：plan 建 2 步目标（后续轮次由自动推进驱动，见反馈区 E2E-AUTODRIVE 分支）
+    // 守卫：自动推进的合成消息（「继续（自动推进）」开头）含目标标题里的标记，不得再命中首轮建目标
+    if (last.includes("E2E-AUTODRIVE") && !last.startsWith("继续（自动推进）")) {
+      return respond(
+        res,
+        '制定计划：[{"tool":"plan","params":{"goal":"E2E-AUTODRIVE 目标","steps":["step one","step two"]}}]',
+        sse
+      );
+    }
+
+    // 自动推进轮（系统合成「继续（自动推进）」消息）：按推进指令发出对应工具调用。
+    // goal_id 从 goalIds 取（plan 反馈经过时捕获）；按指令文案分阶段，
+    // 放在 T26 的「继续（」截断续发分支之前，避免被其拦截。
+    if (last.startsWith("继续（自动推进）")) {
+      // T6（E2E-CMD-PLAN）：一步完成待办并归档目标（多工具单轮）
+      if (last.includes("验证 plan 工具")) {
+        const gid = goalIds["E2E 待办"] || "";
+        return respond(
+          res,
+          `收尾：[{"tool":"todo_write","params":{"goal_id":"${gid}","items":[{"content":"验证 plan 工具","status":"completed"}]}},{"tool":"goal_update","params":{"id":"${gid}","status":"achieved"}}]`,
+          sse
+        );
+      }
+      const gid = goalIds["E2E-AUTODRIVE 目标"] || "";
+      if (last.includes("所有待办均已完成"))
+        return respond(res, `标记目标完成：[{"tool":"goal_update","params":{"id":"${gid}","status":"achieved"}}]`, sse);
+      if (last.includes("「step two」"))
+        return respond(
+          res,
+          `执行第二步：[{"tool":"todo_write","params":{"goal_id":"${gid}","items":[{"content":"step one","status":"completed"},{"content":"step two","status":"completed"}]}}]`,
+          sse
+        );
+      return respond(
+        res,
+        `执行第一步：[{"tool":"todo_write","params":{"goal_id":"${gid}","items":[{"content":"step one","status":"completed"},{"content":"step two","status":"pending"}]}}]`,
+        sse
+      );
+    }
+
     // 压测-上行完整性：回显收到的最后一条用户消息的统计（验证 BIT 完整转发大文本）
     if (last.includes("E2E-CMD-ECHO")) {
       try { require("fs").writeFileSync("/tmp/mock-echo-received.txt", last); } catch {}
@@ -238,9 +327,11 @@ const server = http.createServer((req, res) => {
       return respond(res, `E2E-ECHO-STATS ${payload}`, sse);
     }
 
-    // 压测-下行长文本：分块流式输出 50KB 确定性文本（可校验 head/tail 完整性）
+    // 压测-下行长文本：分块流式输出确定性文本（可校验 head/tail 完整性）。
+    // E2E-CMD-LONG 默认 50 块（≈50KB）；E2E-CMD-LONG-<n> 指定块数（1 块≈1KB，上限 5000）
     if (last.includes("E2E-CMD-LONG")) {
-      const total = 50;
+      const mm = last.match(/E2E-CMD-LONG-(\d+)/);
+      const total = mm ? Math.min(parseInt(mm[1], 10) || 50, 5000) : 50;
       const mk = (i) => `L${String(i).padStart(4, "0")}:` + "x".repeat(1000 - 6) + "\n";
       const full = Array.from({ length: total }, (_, i) => mk(i)).join("");
       if (sse) {
@@ -265,6 +356,37 @@ const server = http.createServer((req, res) => {
       res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "第二段内容，马上就要断了" } }] })}\n\n`);
       setTimeout(() => res.destroy(), 50);
       return;
+    }
+
+    // 网络瞬断自动重试：同标记首次请求流式发一块后断开（无 [DONE]，瞬态错误），
+    // BIT 应自动重走本轮；重试请求给完整答案。
+    // 计数按时间窗判定新回合（>15s 未命中视为新一轮 E2E 运行），mock 进程常驻不受影响
+    if (last.includes("E2E-NETFLAP")) {
+      const now = Date.now();
+      if (!netFlapCount.flap || now - (netFlapCount.flapAt || 0) > 15000) netFlapCount.flap = 0;
+      netFlapCount.flap += 1;
+      netFlapCount.flapAt = now;
+      if (netFlapCount.flap === 1) {
+        if (!sse) return respond(res, "E2E-NETFLAP-NEED-SSE", sse);
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "半截：" } }] })}\n\n`);
+        setTimeout(() => res.destroy(), 50);
+        return;
+      }
+      return respond(res, `E2E-NETFLAP-OK attempts=${netFlapCount.flap}`, sse);
+    }
+
+    // 上游硬错误（不重试）：200 + error body（错误对象形态），任何请求都报错
+    // 验证 BIT 识别为业务错误、不烧重试直接失败
+    if (last.includes("E2E-NET-HARD")) {
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ error: { message: "mock hard upstream failure" } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: { message: "mock hard upstream failure" } }));
     }
 
     // 压测-max_tokens 截断：finish_reason=length（验证 BIT 显式标注截断而不是默默断句）
@@ -430,8 +552,81 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ error: { message: "mock upstream exploded" } }));
     }
 
+    // 思考过程：先 reasoning_content 增量再正文（DeepSeek R1 风格），验证 BIT 聚合落库与 SSE 转发
+    if (last.includes("E2E-STREAM-THINK")) {
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        const usage = usageFor(messages);
+        for (const t of ["用户要求验证思考链路，", "E2E-THINK-MARK 思考完毕，开始作答。"]) {
+          res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { reasoning_content: t } }] })}\n\n`);
+        }
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "E2E-THINK-FINAL 正文已到达" } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {} }], usage })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      return respond(res, "E2E-THINK-FINAL 需要流式请求", sse);
+    }
+
     if (last.includes("E2E-CMD-SHELL"))
       return respond(res, '好的，我来执行命令。\n[{"tool":"shell","params":{"command":"echo e2e-shell-ok"}}]', sse);
+
+    // 自动续发轮：上一条回复被截断，BIT 自动补发「继续」→ 直接给最终答案
+    if (last.startsWith("继续（")) return respond(res, "E2E-CONTINUE-OK 内容已补全完成", sse);
+
+    // 截断场景：原生请求先拒（BIT 自动降级文本协议），文本轮输出半截工具 JSON
+    // （looks_truncated 命中 → BIT 自动续发「继续」→ 下一轮命中上方续发分支）
+    if (last.includes("E2E-CMD-CONTINUE")) {
+      if (parsed.tools) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "tools parameter not supported by this endpoint" } }));
+      }
+      return respond(res, '好的我先把文件写上：[{"tool":"write_file","params":{"path":"./.e2e-cont.txt","content":"partial', sse);
+    }
+
+    // 中断场景：慢工具（sleep 2）给 E2E 留出置位中断标志的窗口；未被打断时走通用反馈轮
+    if (last.includes("E2E-CMD-SLEEP"))
+      return respond(
+        res,
+        '先执行一个慢命令：\n[{"tool":"shell","params":{"command":"sleep 2 && echo e2e-slept"}}]',
+        sse
+      );
+
+    // 无 index 的流式 tool_calls（部分 OpenAI 兼容网关形态）：两个完整调用、不带 index 字段，
+    // 验证 BIT 按 id 分槽聚合（修复前全部并入槽 0 → name/args 交错成垃圾）
+    if (last.includes("E2E-NOINDEX")) {
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        const usage = usageFor(messages);
+        const mk = (id, args) =>
+          JSON.stringify({
+            id: "mock",
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: { tool_calls: [{ id, type: "function", function: { name: "shell", arguments: args } }] } }],
+          });
+        res.write(`data: ${mk("call-1", '{"command": "echo alpha-one"}')}\n\n`);
+        res.write(`data: ${mk("call-2", '{"command": "echo beta-two"}')}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [], usage })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      return respond(
+        res,
+        '执行：[{"tool":"shell","params":{"command":"echo alpha-one"}},{"tool":"shell","params":{"command":"echo beta-two"}}]',
+        sse
+      );
+    }
+
+    // 智能引号 + 全角冒号跑偏 JSON（模型笔误形态）：原生请求先拒降级文本协议，
+    // 验证 jsonish_repair 兜底后工具正常执行
+    if (last.includes("E2E-SMART-JSON")) {
+      if (parsed.tools) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "tools parameter not supported by this endpoint" } }));
+      }
+      return respond(res, "我来执行：\n[“tool”：“shell”, “params”：{“command”：“echo smart-ok”}]", sse);
+    }
 
     // AI 自我扩展：注册一个 node 脚本工具（读 stdin 的 params，输出 JSON）
     if (last.includes("E2E-CMD-ADDTOOL")) {

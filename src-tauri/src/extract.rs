@@ -1,3 +1,4 @@
+// yxpil · BIT
 //! 附件解析：Excel → Markdown 表格、Word(.docx) → 纯文本、网页 → 正文文字。
 //! 均在后端完成，前端只负责把文件读成 base64 或把 URL 传进来。
 
