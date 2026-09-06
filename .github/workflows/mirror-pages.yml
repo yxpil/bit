@@ -44,10 +44,22 @@ jobs:
           if [ -z "$TAG" ]; then TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name); fi
           echo "镜像 $TAG"
           VERSION="${TAG#v}"
+          # 最新 Release tag：并发发布时（如 v0.5.14 修复版与 v0.5.15 同时在跑）两条流水线的
+          # finalize 都会 dispatch 本 workflow，谁后部署谁覆盖站点根——根清单必须钉在最新版，
+          # 否则已装旧版的用户拿到的 latest.json 版本不增长，自动更新永远不触发
+          LATEST_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          LATEST_VERSION="${LATEST_TAG#v}"
           mkdir -p "site/$VERSION"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "site/$VERSION"
-          # latest.json 提到站点根：客户端自动更新检测优先请求 /bit/latest.json
-          if [ -f "site/$VERSION/latest.json" ]; then cp "site/$VERSION/latest.json" site/latest.json; fi
+          # latest.json 提到站点根：客户端自动更新检测优先请求 /bit/latest.json。
+          # 镜像的就是最新版 → 直接用本 tag 的；镜像的是旧版 → 根清单取最新 Release 的，
+          # 旧版目录照常镜像（版本历史入口），但根清单绝不随旧版本回退
+          if [ "$VERSION" = "$LATEST_VERSION" ]; then
+            [ -f "site/$VERSION/latest.json" ] && cp "site/$VERSION/latest.json" site/latest.json
+          else
+            gh release download "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" --dir site --pattern "latest.json" --clobber \
+              || echo "最新版 latest.json 下载失败，本次部署不含根清单（客户端回退 GitHub API 源）"
+          fi
 
           # 版本目录内的资产清单行：文件名 + 人类可读大小（黑白极简 pill 风格）
           ITEM_LIST=$(cd "site/$VERSION" && ls -1 | while read -r f; do
@@ -95,7 +107,7 @@ jobs:
           </html>
           PAGEEOF
 
-          # 站点首页：/bit/ —— 最新版本入口
+          # 站点首页：/bit/ —— 最新版本入口（并发发布时也钉最新版，不随本镜像 tag 回退）
           cat > site/index.html <<ROOTEOF
           <!doctype html>
           <html lang="zh-CN">
@@ -107,9 +119,9 @@ jobs:
           </head>
           <body>
           <h1>BIT</h1>
-          <p class=sub>最新版本 / Latest: v$VERSION</p>
+          <p class=sub>最新版本 / Latest: $LATEST_TAG</p>
           <ul>
-          <li><a href="$VERSION/"><span>v$VERSION 全部文件 / All files</span></a></li>
+          <li><a href="$LATEST_VERSION/"><span>v$LATEST_VERSION 全部文件 / All files</span></a></li>
           <li><a href="latest.json"><span>自动更新清单 / Update manifest (latest.json)</span></a></li>
           </ul>
           <p class=foot>BIT 永久免费 / BIT is free forever · <a href="https://osbt.space">osbt.space</a> · <a href="https://github.com/yxpil/bit">GitHub</a></p>
