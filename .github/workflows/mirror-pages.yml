@@ -100,6 +100,7 @@ jobs:
           <h1>BIT $VERSION</h1>
           <p class=sub>全部资产直链 · All release assets（GitHub Pages 镜像 / mirror）</p>
           <ul>
+          <li><a href="https://github.com/yxpil/bit-mobile"><span>安卓版</span><span class="size">bit-mobile</span></a></li>
           $ITEM_LIST
           </ul>
           <p class=foot>BIT 永久免费 / BIT is free forever · <a href="https://osbt.space">osbt.space</a> · <a href="https://github.com/yxpil/bit">GitHub</a> · <a href="./latest.json">latest.json</a></p>
