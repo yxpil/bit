@@ -374,7 +374,7 @@ export default function RemotePage({ onStats }) {
         </div>
 
         <div className="flex flex-col gap-4 sm:flex-row">
-          <div className="mx-auto shrink-0 rounded-2xl border border-neutral-200 bg-white p-3 dark:border-neutral-700 sm:mx-0">
+          <div className="mx-auto h-[200px] w-[200px] shrink-0 rounded-2xl border border-neutral-200 bg-white p-3 dark:border-neutral-700 sm:mx-0">
             {qr?.svg ? (
               <div className="h-44 w-44 aspect-square [&>svg]:block [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: qr.svg }} />
             ) : (

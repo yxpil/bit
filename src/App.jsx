@@ -115,6 +115,14 @@ export default function App() {
     const matches = (seq) =>
       seq.length <= buf.length && buf.slice(-seq.length).every((k, i) => k === seq[i]);
     const onKey = (e) => {
+      // Cmd+Q / Ctrl+Q：走正常退出链路（notify guardian + silent update）
+      // macOS Tauri RunEvent::ExitRequested 不触发 Cmd+Q（issue #9198），
+      // 必须前端拦截手动调 quit_app，否则 guardian 以为主进程意外死亡会拉起来
+      if ((e.metaKey || e.ctrlKey) && (e.key === "q" || e.key === "Q")) {
+        e.preventDefault();
+        api.quitApp();
+        return;
+      }
       buf.push(e.key.length === 1 ? e.key.toLowerCase() : e.key);
       if (buf.length > seqUser.length) buf.shift();
       if (matches(seqUser) || matches(seqKonami)) {
@@ -258,7 +266,7 @@ export default function App() {
             </p>
             {/* 安卓版扫码下载：二维码黑码白底（扫码可靠性优先于主题） */}
             <div className="mt-4 flex flex-col items-center gap-1.5">
-              <div className="rounded-xl border border-neutral-200 bg-white p-2 dark:border-neutral-700">
+              <div className="h-[128px] w-[128px] rounded-xl border border-neutral-200 bg-white p-2 dark:border-neutral-700">
                 {androidQr ? (
                   <div className="h-28 w-28 aspect-square [&>svg]:block [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: androidQr }} />
                 ) : (

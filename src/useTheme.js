@@ -42,7 +42,7 @@ function applyLook(look) {
     root.style.removeProperty("--look-bg-color-light");
     root.style.removeProperty("--look-bg-color-dark");
     root.style.removeProperty("--look-bg-opacity");
-    root.classList.remove("no-border", "no-shadow", "has-bg-image");
+    root.classList.remove("no-border", "no-shadow", "has-bg-image", "has-transparency");
     return;
   }
   // 背景色（light/dark 各自生效）
@@ -51,9 +51,12 @@ function applyLook(look) {
   if (look.bgColorDark) root.style.setProperty("--look-bg-color-dark", look.bgColorDark);
   else root.style.removeProperty("--look-bg-color-dark");
 
-  // 透明度 + 背景图
+  // 透明度：背景 + 卡片/pill/chip 也跟着半透明（不透明度 = 背景透明度 + 15%，保证内容可读）
   const op = look.bgOpacity != null ? look.bgOpacity : 100;
   root.style.setProperty("--look-bg-opacity", op + "%");
+  // 卡片/pill 的 alpha：背景越透明，卡片也相应透出，但始终比背景高 15% 保证可读性
+  const cardAlpha = Math.min(1, Math.max(0.3, (op + 15) / 100));
+  root.style.setProperty("--look-card-alpha", cardAlpha.toFixed(2));
   if (look.bgImage) {
     root.style.setProperty("--app-bg-image", `url("${look.bgImage}")`);
     root.classList.add("has-bg-image");
@@ -68,6 +71,8 @@ function applyLook(look) {
   // 边框 & 阴影开关
   root.classList.toggle("no-border", !look.borderOn);
   root.classList.toggle("no-shadow", !look.shadowOn);
+  // 透明度联动：背景 < 100% 时给卡片/按钮也加半透明
+  root.classList.toggle("has-transparency", op < 100);
 }
 
 const DEFAULT_LOOK = {

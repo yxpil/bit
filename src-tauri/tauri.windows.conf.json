@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "app": {
-    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "BIT",
@@ -10,12 +9,14 @@
         "minWidth": 920,
         "minHeight": 620,
         "center": true,
-        "decorations": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
+        "decorations": false,
         "transparent": true,
         "shadow": true,
-        "visible": true
+        "visible": true,
+        "windowEffects": {
+          "effects": ["mica", "acrylic", "blur"],
+          "radius": 12
+        }
       }
     ]
   }

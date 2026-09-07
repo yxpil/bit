@@ -1891,10 +1891,15 @@ pub fn remove_todo(state: State<'_, Arc<Ctx>>, id: String) -> Result<serde_json:
 }
 
 /// 真正退出应用（关闭窗口只是隐藏到托盘）
+/// 与托盘退出保持一致：通知守护进程不要接力拉起 + 关闭时静默更新
 #[tauri::command]
 pub fn quit_app(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     crate::audit::record(&ctx, "local-app", "app.quit", "BIT", json!({ "via": "ui" }), true);
+    // 正常退出：先通知守护进程不要接力拉起
+    crate::guardian::expect_exit(&ctx);
+    // 已下载更新：退出前静默换装（关闭时自动更新）
+    let _ = crate::update::apply_update(&ctx, false);
     ctx.app.exit(0);
     Ok(json!({ "quit": true }))
 }

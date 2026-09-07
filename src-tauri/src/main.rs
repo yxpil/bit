@@ -29,9 +29,71 @@ mod tray;
 mod tui;
 mod update;
 
+use std::sync::Arc;
 use tauri::Manager;
 
+/// 权威退出函数：所有退出路径（托盘、quit_app 命令、信号、兜底）都走这里。
+/// 与守护进程握手 + 静默更新 + 最终 exit。不阻塞、不 panic。
+fn graceful_quit(ctx: &tauri::AppHandle, via: &str) {
+    if let Some(c) = ctx.try_state::<Arc<crate::state::Ctx>>() {
+        crate::audit::record(&c, "local-app", "app.quit", "BIT",
+            serde_json::json!({ "via": via }), true);
+        crate::guardian::expect_exit(&c);
+        let _ = crate::update::apply_update(&c, false);
+    }
+    ctx.exit(0);
+}
+
 fn main() {
+    // ============ 跨平台渲染 workaround（必须在任何 GTK/WebKit/WebView2 初始化之前） ============
+
+    // Linux (WebKitGTK)：NVIDIA GPU 在 Wayland 上的 DMABUF 渲染器崩溃
+    // （Error 71 / AcceleratedSurfaceDMABuf / 白色空白窗口）。
+    // 参考 Tauri 官方 https://tauri.app/develop/debug/linux-graphics/
+    // 智能检测：只在受影响条件下 + 用户没手动设置过时自动覆盖，
+    // 避免误伤稳定系统和高级用户的自定义配置。
+    #[cfg(target_os = "linux")]
+    {
+        let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        let is_x11 = std::env::var("DISPLAY").is_ok() && !is_wayland;
+
+        if is_wayland {
+            // Wayland + NVIDIA：优先只禁用 explicit sync，保留 DMABUF 硬件加速
+            if std::env::var("__NV_DISABLE_EXPLICIT_SYNC").is_err() {
+                std::env::set_var("__NV_DISABLE_EXPLICIT_SYNC", "1");
+            }
+            // 兜底：禁用整个 DMABUF 渲染器（影响性能但最稳）
+            if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+                std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+            }
+        }
+
+        // X11 + 透明窗口：部分旧 GTK/WebKitGTK 版本需要 GDK_BACKEND=x11
+        // 才能让 transparent:true 正常工作（避免黑色/白色方块背景）。
+        if is_x11 && std::env::var("GDK_BACKEND").is_err() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
+    }
+
+    // Windows：WebView2 透明窗口需要显式设置 BackgroundColor 为透明。
+    // 仅靠 tauri.conf.json 的 transparent: true + CSS background: transparent 不够——
+    // WebView2 默认会渲染不透明黑底（见 tauri-apps/tauri#1739 / termora#98）。
+    // 这里在 Rust Builder 之前先写入 WEBVIEW2 启动参数（追加而非覆盖）。
+    #[cfg(target_os = "windows")]
+    {
+        let mut args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        let need_bg = !args.contains("--default-background-color");
+        if need_bg {
+            if !args.is_empty() {
+                args.push(' ');
+            }
+            args.push_str("--default-background-color=00000000");
+            std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
+        }
+    }
+
+    // ============================================================================================
+
     // 终端模式：`bit tui` 或交互式终端里的裸 `bit` 进入简约 TUI（无窗口 / 无单实例 / 不监听端口，
     // 可与桌面端同时运行，共用数据目录）。generate_context! 只能展开一次，
     // 所以 TUI 与桌面端共用同一个 Builder，仅按模式注册不同的插件与启动逻辑。
@@ -111,6 +173,14 @@ fn main() {
                 });
                 return Ok(());
             }
+
+            // ========== 桌面端：信号兜底 ==========
+            // Ctrl+C 兜底（托盘退出、quit_app、ExitRequested 都已经走 graceful_quit，
+            // 这里只兜底系统级 kill/终端 Ctrl+C 意外退出场景）
+            let handle_sig = app.handle().clone();
+            let _ = ctrlc::set_handler(move || {
+                graceful_quit(&handle_sig, "signal");
+            });
 
             // 守护进程布防：接力日志转存审计（此前发生的被杀/拉起/篡改拒绝事件）→ 写握手文件 → 拉起守护进程
             guardian::drain_log(&ctx);
@@ -290,8 +360,18 @@ fn main() {
             if let tauri::RunEvent::Reopen { .. } = event {
                 tray::show_main_window(app);
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
+
+            // Cmd+Q（macOS）/ 系统退出请求：走真正退出链路，
+            // 与托盘退出 / quit_app command 一致——通知守护进程 + 静默更新
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(ctx) = app.try_state::<Arc<crate::state::Ctx>>() {
+                    crate::audit::record(&ctx, "local-app", "app.quit", "BIT",
+                        serde_json::json!({ "via": "exit_requested" }), true);
+                    crate::guardian::expect_exit(&ctx);
+                    let _ = crate::update::apply_update(&ctx, false);
+                }
+                app.exit(0);
+            }
         });
 }
 

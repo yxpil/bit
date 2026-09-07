@@ -10,6 +10,8 @@ use crate::state::Ctx;
 /// 创建系统托盘：显示窗口 / 远程服务 / 退出
 pub fn create(app: &tauri::AppHandle, ctx: &Arc<Ctx>) -> tauri::Result<()> {
     let menu = build_menu(app, ctx)?;
+    let quit_ctx = ctx.clone();
+    let show_ctx = ctx.clone();
 
     let tray = TrayIconBuilder::with_id("bit-tray")
         .icon(app.default_window_icon().unwrap().clone())
@@ -27,16 +29,14 @@ pub fn create(app: &tauri::AppHandle, ctx: &Arc<Ctx>) -> tauri::Result<()> {
                 toggle_main_window(app);
             }
         })
-        .on_menu_event(|app, event| match event.id.as_ref() {
+        .on_menu_event(move |app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
             "quit" => {
-                if let Some(ctx) = app.try_state::<Arc<Ctx>>() {
-                    crate::audit::record(&ctx, "local-app", "app.quit", "BIT", json!({ "via": "tray" }), true);
-                    // 正常退出：先通知守护进程不要接力拉起，再静默换装/退出
-                    crate::guardian::expect_exit(&ctx);
-                    // 已下载更新：退出前静默换装，下次启动即新版本（关闭时自动更新）
-                    let _ = crate::update::apply_update(&ctx, false);
-                }
+                // 直接用闭包捕获的 ctx，不依赖 try_state（Tauri 在某些平台上
+                // try_state 在菜单事件回调中会返回 None，导致 expect_exit 丢失）
+                crate::audit::record(&quit_ctx, "local-app", "app.quit", "BIT", json!({ "via": "tray" }), true);
+                crate::guardian::expect_exit(&quit_ctx);
+                let _ = crate::update::apply_update(&quit_ctx, false);
                 app.exit(0);
             }
             _ => {}
