@@ -58,6 +58,137 @@ function feedbackText(messages) {
   return last ? String(last.content) : "";
 }
 
+// ── 多协议原生工具调用桥接测试辅助（claude /v1/messages、gemini /v1beta/models/...）──
+
+// Claude 消息文本提取：content 字符串 / 块数组（text / tool_use / tool_result）
+function claudeMsgText(m) {
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content))
+    return m.content
+      .map((b) => {
+        if (b.type === "text") return b.text || "";
+        if (b.type === "tool_use") return JSON.stringify({ tool: b.name, params: b.input ?? {} });
+        if (b.type === "tool_result") return typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
+        return "";
+      })
+      .join("\n");
+  return "";
+}
+
+// Gemini contents 文本提取：parts[].text / functionResponse 整体序列化
+function geminiContentText(c) {
+  return (c.parts || [])
+    .map((p) => p.text || (p.functionResponse ? JSON.stringify(p.functionResponse) : ""))
+    .join("\n");
+}
+
+// 从工具反馈 JSON 里提取 shell stdout（各家反馈格式序列化后字段名一致）
+function stdoutOf(fbText) {
+  return (fbText.match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "";
+}
+
+// Claude SSE 响应：text 块 + 可选 tool_use 块（参数拆两段 input_json_delta 验证增量拼接）
+function sseClaude(res, { text = "", tool = null }) {
+  res.writeHead(200, { "Content-Type": "text/event-stream" });
+  const w = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+  w({ type: "message_start", message: { usage: { input_tokens: 120, cache_read_input_tokens: 96 } } });
+  let idx = 0;
+  if (text) {
+    w({ type: "content_block_start", index: idx, content_block: { type: "text" } });
+    w({ type: "content_block_delta", index: idx, delta: { type: "text_delta", text } });
+    w({ type: "content_block_stop", index: idx });
+    idx++;
+  }
+  if (tool) {
+    const json = JSON.stringify(tool.input);
+    const half = Math.ceil(json.length / 2);
+    w({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: tool.id, name: tool.name } });
+    w({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: json.slice(0, half) } });
+    w({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: json.slice(half) } });
+    w({ type: "content_block_stop", index: idx });
+  }
+  w({ type: "message_delta", delta: { stop_reason: tool ? "tool_use" : "end_turn" }, usage: { output_tokens: 42 } });
+  w({ type: "message_stop" });
+  res.end();
+}
+
+// Gemini SSE 响应：text part + 可选 functionCall part（官方形态：调用整体到达独立 part）
+function sseGemini(res, { text = "", call = null }) {
+  res.writeHead(200, { "Content-Type": "text/event-stream" });
+  const w = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+  if (text) w({ candidates: [{ content: { parts: [{ text }] } }] });
+  if (call) w({ candidates: [{ content: { parts: [{ functionCall: call }] } }] });
+  w({ candidates: [{ finishReason: "STOP" }], usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 42, cachedContentTokenCount: 96 } });
+  res.end();
+}
+
+// ── Claude 协议路由（/v1/messages）：原生 tool_use 桥接 + 文本协议降级路径 ──
+function handleClaude(res, parsed) {
+  const msgs = parsed.messages || [];
+  const sys = typeof parsed.system === "string" ? parsed.system : JSON.stringify(parsed.system ?? "");
+  const all = [sys, ...msgs.map(claudeMsgText)].join("\n");
+  const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+  const last = lastUser ? claudeMsgText(lastUser) : "";
+  // 反馈轮检测：原生 tool_result 块 / 文本协议「Tool result(s)」前缀（claude_apply_cache 会把末条内容包成块数组）
+  const nativeFb = msgs.filter((m) => Array.isArray(m.content) && m.content.some((b) => b.type === "tool_result"));
+  const fbText = [
+    ...nativeFb.flatMap((m) =>
+      m.content.filter((b) => b.type === "tool_result").map((b) => (typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "")))
+    ),
+    ...msgs.filter((m) => m.role === "user" && claudeMsgText(m).startsWith("Tool result(s)")).map((m) => claudeMsgText(m)),
+  ].join("\n");
+
+  // 原生请求被拒（降级开关场景）：400 + 含 tool 的错误体 → BIT 分类为 Unsupported
+  if (all.includes("E2E-CLAUDE-DEGRADE") && parsed.tools) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "tools parameter not supported by this endpoint" } }));
+  }
+  if (all.includes("E2E-CLAUDE-DEGRADE")) {
+    if (fbText) return sseClaude(res, { text: `E2E-FINAL-CLAUDE-DEGRADE stdout=「${stdoutOf(fbText)}」` });
+    return sseClaude(res, { text: '好的，执行：\n[{"tool":"shell","params":{"command":"echo e2e-claude-degrade-ok"}}]' });
+  }
+  // 原生 tool_use：轮0 文本+工具块；反馈轮从 tool_result 回显 stdout
+  if (all.includes("E2E-CLAUDE-NAT")) {
+    if (nativeFb.length > 0) return sseClaude(res, { text: `E2E-FINAL-CLAUDE-NAT stdout=「${stdoutOf(fbText)}」 tool_result=true` });
+    return sseClaude(res, { text: "好的，我来执行命令。", tool: { id: "toolu-e2e-1", name: "shell", input: { command: "echo e2e-claude-native-ok" } } });
+  }
+  if (all.includes("E2E-PLAIN")) return sseClaude(res, { text: "E2E-FINAL-PLAIN: 你好，普通对话正常。" });
+  if ((last.includes("沉淀") || last.includes("总结")) && !last.startsWith("继续（自动推进）")) return sseClaude(res, { text: "已完成后台整理。" });
+  return sseClaude(res, { text: "好的。" });
+}
+
+// ── Gemini 协议路由（/v1beta/models/<model>:generateContent[:stream]）──
+function handleGemini(res, parsed) {
+  const contents = parsed.contents || [];
+  const all = contents.map(geminiContentText).join("\n");
+  const lastUser = [...contents].reverse().find((c) => c.role === "user");
+  const last = lastUser ? geminiContentText(lastUser) : "";
+  // 反馈轮检测：functionResponse part（原生）/「Tool result(s)」前缀（文本协议降级）
+  const frs = contents.flatMap((c) => (c.parts || []).filter((p) => p.functionResponse).map((p) => JSON.stringify(p.functionResponse)));
+  const fbText = [
+    ...frs,
+    ...contents.filter((c) => c.role === "user" && geminiContentText(c).startsWith("Tool result(s)")).map(geminiContentText),
+  ].join("\n");
+
+  // 原生请求被拒（降级开关场景）
+  if (all.includes("E2E-GEMINI-DEGRADE") && parsed.tools) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: { code: 400, message: "function declarations not supported by this endpoint", status: "INVALID_ARGUMENT" } }));
+  }
+  if (all.includes("E2E-GEMINI-DEGRADE")) {
+    if (fbText) return sseGemini(res, { text: `E2E-FINAL-GEMINI-DEGRADE stdout=「${stdoutOf(fbText)}」` });
+    return sseGemini(res, { text: '好的，执行：\n[{"tool":"shell","params":{"command":"echo e2e-gemini-degrade-ok"}}]' });
+  }
+  // 原生 functionCall：轮0 文本+functionCall part；反馈轮从 functionResponse 回显 stdout
+  if (all.includes("E2E-GEMINI-NAT")) {
+    if (frs.length > 0) return sseGemini(res, { text: `E2E-FINAL-GEMINI-NAT stdout=「${stdoutOf(fbText)}」 functionResponse=true` });
+    return sseGemini(res, { text: "好的，我来执行命令。", call: { name: "shell", args: { command: "echo e2e-gemini-native-ok" } } });
+  }
+  if (all.includes("E2E-PLAIN")) return sseGemini(res, { text: "E2E-FINAL-PLAIN: 你好，普通对话正常。" });
+  if ((last.includes("沉淀") || last.includes("总结")) && !last.startsWith("继续（自动推进）")) return sseGemini(res, { text: "已完成后台整理。" });
+  return sseGemini(res, { text: "好的。" });
+}
+
 // 模拟 token 用量：输入随历史增长；工具反馈轮之后命中缓存（前缀一致）→ cached_tokens 约 80%
 function usageFor(messages) {
   const chars = messages.reduce((n, m) => n + contentText(m).length, 0);
@@ -117,6 +248,9 @@ const server = http.createServer((req, res) => {
       return res.end("{}");
     }
     const messages = parsed.messages || [];
+    // ── 多协议路由：Claude / Gemini 原生端点（同端口不同协议路径，原生桥接测试用）──
+    if (req.url.startsWith("/v1/messages")) return handleClaude(res, parsed);
+    if (req.url.includes(":streamGenerateContent") || req.url.includes(":generateContent")) return handleGemini(res, parsed);
     // 带上本次请求历史，便于模拟用量统计
     const respond = (r, p, s) => respondMsg(r, p, s, messages);
     const sse = !!parsed.stream;
@@ -635,6 +769,37 @@ const server = http.createServer((req, res) => {
         '执行：[{"tool":"shell","params":{"command":"echo alpha-one"}},{"tool":"shell","params":{"command":"echo beta-two"}}]',
         sse
       );
+    }
+
+    // OpenAI 原生工具调用被拒场景（T63 strict 提供方，降级开关未开 → 必须报错）：
+    // 当请求携带 tools 参数且消息含 E2E-NAT-STRICT 标记时返回 400，
+    // BIT 应识别为 Unsupported 并检查 text_fallback 开关
+    if (last.includes("E2E-NAT-STRICT") && parsed.tools) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: { message: "tools parameter not supported by this endpoint" } }));
+    }
+
+    // OpenAI 原生 tool_calls 标准流式（带 index）：delta 增量聚合 → 执行；反馈轮走上方通用分支回显 stdout
+    if (last.includes("E2E-NAT-OPENAI") && parsed.tools) {
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        const usage = usageFor(messages);
+        const mk = (d) => JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: d }] });
+        res.write(`data: ${mk({ role: "assistant", tool_calls: [{ index: 0, id: "call-nat-1", type: "function", function: { name: "shell", arguments: "" } }] })}\n\n`);
+        res.write(`data: ${mk({ tool_calls: [{ index: 0, function: { arguments: '{"command":"echo ' } }] })}\n\n`);
+        res.write(`data: ${mk({ tool_calls: [{ index: 0, function: { arguments: 'e2e-native-openai-ok"}' } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [], usage })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      // 一次性请求回退形态：message.tool_calls
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        id: "mock", object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ id: "call-nat-1", type: "function", function: { name: "shell", arguments: '{"command":"echo e2e-native-openai-ok"}' } }] }, finish_reason: "tool_calls" }],
+        usage: usageFor(messages),
+      }));
     }
 
     // 智能引号 + 全角冒号跑偏 JSON（模型笔误形态）：原生请求先拒降级文本协议，

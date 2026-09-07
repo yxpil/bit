@@ -15,6 +15,11 @@ pub struct Provider {
     pub model: String,
     /// 是否为当前激活项（全局仅一个为 true）
     pub active: bool,
+    /// 文本协议降级开关（逐家提供方独立，默认关）：端点明确拒绝 tools 参数时是否
+    /// 允许自动降级文本协议。关闭时探测失败直接报错并提示开启路径——降级是「哪家
+    /// 端点不支持工具调用」的属性，必须判断是哪家的且开关打开才允许，杜绝静默降级
+    #[serde(default)]
+    pub text_fallback: bool,
 }
 
 impl Provider {
@@ -493,6 +498,9 @@ async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
     let mut stopped = false;
     let mut saw_done = false;
     let mut finish = String::new();
+    // 上游原生 tool_calls 增量累积（文本约定模式的冗余桥接）：按 index 聚合
+    // (index, id, name, arguments)，流结束后转文本协议执行
+    let mut native_calls: Vec<(u64, String, String, String)> = Vec::new();
     // 部分端点以 200 + {"error":{...}} 数据行报错（HTTP 层看不出异常）：捕获后显式报错
     let mut upstream_err = String::new();
     read_sse(resp, |data| {
@@ -531,6 +539,36 @@ async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
                     return true;
                 }
             }
+            // 原生 tool_calls 增量（DeepSeek/千问等官方模型的标准调用方式）：
+            // 文本模式此前直接丢弃 → "宣告调工具却没下文"。这里按 index 聚合
+            if let Some(arr) = v.pointer("/choices/0/delta/tool_calls").and_then(|x| x.as_array()) {
+                for tc in arr {
+                    let idx = tc
+                        .get("index")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(native_calls.len() as u64);
+                    let slot = match native_calls.iter_mut().find(|(i, _, _, _)| *i == idx) {
+                        Some(s) => s,
+                        None => {
+                            native_calls.push((idx, String::new(), String::new(), String::new()));
+                            native_calls.last_mut().unwrap()
+                        }
+                    };
+                    if let Some(id) = tc.get("id").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+                        slot.1 = id.to_string();
+                    }
+                    if let Some(n) = tc
+                        .pointer("/function/name")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        slot.2 = n.to_string();
+                    }
+                    if let Some(a) = tc.pointer("/function/arguments").and_then(|x| x.as_str()) {
+                        slot.3.push_str(a);
+                    }
+                }
+            }
             if let Some(delta) = v
                 .pointer("/choices/0/delta/content")
                 .and_then(|x| x.as_str())
@@ -555,6 +593,13 @@ async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
     if !upstream_err.is_empty() {
         return Err(format!("上游返回错误: {upstream_err}"));
     }
+    // 原生调用桥接：即使正文为空（模型只发 tool_calls 不发文字），也能落地执行
+    let calls: Vec<NativeCallPair> = native_calls
+        .iter()
+        .filter(|(_, _, name, _)| !name.is_empty())
+        .map(|(_, _, name, args)| (name.clone(), parse_call_args(args)))
+        .collect();
+    append_calls_as_text(&mut full, &calls);
     if full.is_empty() {
         return Err("流式无内容".into());
     }
@@ -600,6 +645,9 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
     let mut usage = TokenUsage::default();
     let mut stopped = false;
     let mut saw_stop = false; // 是否收到 message_stop（未收到 = 连接异常中断）
+    // 原生 tool_use 桥接（文本约定模式的冗余）：content_block_start(tool_use) 开槽，
+    // input_json_delta 增量拼接，message 后统一转文本协议执行
+    let mut tool_slots: Vec<(usize, String, String)> = Vec::new(); // (index, name, json)
     // input/cache 用量在 message_start，output 用量在 message_delta
     read_sse(resp, |data| {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
@@ -609,10 +657,23 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
                     usage.prompt_tokens = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     usage.cache_read_tokens = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
                     usage.cache_write_tokens = u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    usage.cache_known = u.get("cache_read_input_tokens").is_some()
+                        || u.get("cache_creation_input_tokens").is_some();
                 }
             } else if t == "message_delta" {
                 if let Some(n) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
                     usage.completion_tokens = n;
+                }
+            } else if t == "content_block_start" {
+                // 工具块开启：记名字建槽（index 与 delta 的 content_block.index 对齐）
+                if v.pointer("/content_block/type").and_then(|x| x.as_str()) == Some("tool_use") {
+                    let idx = v.pointer("/index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    let name = v
+                        .pointer("/content_block/name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    tool_slots.push((idx, name, String::new()));
                 }
             } else if t == "content_block_delta" {
                 // thinking_delta：思考过程增量（开思考时先于正文块），不混入回复
@@ -626,6 +687,16 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
                         if !on_token(TokenKind::Think, &think) {
                             stopped = true;
                             return true;
+                        }
+                    }
+                    return false;
+                }
+                // 工具参数增量：按块 index 拼进对应槽
+                if v.pointer("/delta/type").and_then(|x| x.as_str()) == Some("input_json_delta") {
+                    let idx = v.pointer("/index").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    if let Some(pj) = v.pointer("/delta/partial_json").and_then(|x| x.as_str()) {
+                        if let Some(slot) = tool_slots.iter_mut().find(|(i, _, _)| *i == idx) {
+                            slot.2.push_str(pj);
                         }
                     }
                     return false;
@@ -654,6 +725,13 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
     if stopped {
         return Err(STREAM_STOP.into());
     }
+    // 原生 tool_use 桥接：正文为空但模型发了工具块时也能落地
+    let calls: Vec<NativeCallPair> = tool_slots
+        .iter()
+        .filter(|(_, name, _)| !name.is_empty())
+        .map(|(_, name, json)| (name.clone(), parse_call_args(json)))
+        .collect();
+    append_calls_as_text(&mut full, &calls);
     if full.is_empty() {
         return Err("流式无内容".into());
     }
@@ -694,6 +772,9 @@ async fn stream_gemini<F: FnMut(TokenKind, &str) -> bool>(
     let mut full = String::new();
     let mut usage = TokenUsage::default();
     let mut stopped = false;
+    // 原生 functionCall 桥接（文本约定模式的冗余）：Gemini 官方标准把调用放在独立
+    // functionCall part 里整体到达，此前只读 text → "宣告调工具却没下文"
+    let mut native_calls: Vec<NativeCallPair> = Vec::new();
     read_sse(resp, |data| {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             // 每块都带 usageMetadata（渐进累计，取最后一块即最终值）
@@ -703,6 +784,13 @@ async fn stream_gemini<F: FnMut(TokenKind, &str) -> bool>(
             if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(|x| x.as_array()) {
                 // thought=true 的 part 是思考过程（先于正文），其余为正文
                 for part in parts {
+                    if let Some(fc) = part.get("functionCall") {
+                        if let Some(name) = fc.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+                            let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                            native_calls.push((name.to_string(), args));
+                        }
+                        continue;
+                    }
                     let Some(text) = part.get("text").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) else {
                         continue;
                     };
@@ -734,10 +822,45 @@ async fn stream_gemini<F: FnMut(TokenKind, &str) -> bool>(
     if stopped {
         return Err(STREAM_STOP.into());
     }
+    // 原生调用桥接：正文为空（模型只发 functionCall 不发文字）时也能落地执行
+    append_calls_as_text(&mut full, &native_calls);
     if full.is_empty() {
         return Err("流式无内容".into());
     }
     Ok((full, usage))
+}
+
+/// (工具名, 参数)：原生调用桥接的中间形态
+type NativeCallPair = (String, serde_json::Value);
+
+/// 把上游原生工具调用转成文本协议 JSON 行追加到正文（多标准冗余设计）：
+/// 文本约定模式下，官方按「原生 tool_calls 标准」强训练的模型（DeepSeek / 千问 /
+/// Gemini 等）会一边说"让我们来查看："一边把调用放进独立的 tool_calls / tool_use /
+/// functionCall 字段——文本路径此前只读正文，调用被整体丢弃，用户看到"宣告了工具
+/// 却没下文"。桥接后无论模型用哪套标准发调用，agent 的既有文本协议管线
+/// （解析 → 审批 → 执行 → 反馈）都能接住执行。
+fn append_calls_as_text(full: &mut String, calls: &[NativeCallPair]) {
+    if calls.is_empty() {
+        return;
+    }
+    if !full.is_empty() && !full.ends_with('\n') {
+        full.push('\n');
+    }
+    let arr: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|(name, args)| serde_json::json!({ "tool": name, "params": args }))
+        .collect();
+    full.push_str(&serde_json::to_string(&arr).unwrap_or_default());
+}
+
+/// OpenAI 风格 tool_calls 的 arguments 字符串 → 参数值（空串/坏 JSON 退空对象，
+/// 执行期参数校验会把问题如实反馈给模型，模型可自行纠正重试）
+fn parse_call_args(args: &str) -> serde_json::Value {
+    if args.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({}))
+    }
 }
 
 /// OpenAI 兼容协议：/chat/completions
@@ -767,7 +890,26 @@ async fn chat_openai(
         .map(|s| s.to_string())
         // 模糊回退：content 为内容块数组 / 旧版 choices[0].text / Responses API output_text 等
         .or_else(|| fuzzy_text(&value))
-        .ok_or_else(|| "响应中缺少 content".to_string())?;
+        .unwrap_or_default();
+    // 原生 tool_calls 桥接（多标准冗余）：message.tool_calls 转文本协议执行；
+    // 工具型回复的 content 可为 null，先桥接再判空
+    let calls: Vec<NativeCallPair> = value
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|tc| {
+                    let name = tc.pointer("/function/name").and_then(|x| x.as_str())?.to_string();
+                    let args = tc.pointer("/function/arguments").and_then(|x| x.as_str()).unwrap_or("");
+                    Some((name, parse_call_args(args)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    append_calls_as_text(&mut content, &calls);
+    if content.is_empty() {
+        return Err("响应中缺少 content".to_string());
+    }
     // finish_reason=length：输出被截断，显式标注避免“话说一半”像 bug
     if value
         .pointer("/choices/0/finish_reason")
@@ -807,13 +949,34 @@ async fn chat_gemini(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let value = read_json_resp(resp).await?;
-    let text = value
+    let mut text = value
         .pointer("/candidates/0/content/parts/0/text")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         // 模糊回退：多 part 拼接 / 变体结构
         .or_else(|| fuzzy_text(&value))
-        .ok_or_else(|| "响应中缺少 text".to_string())?;
+        .unwrap_or_default();
+    // 原生 functionCall 桥接（多标准冗余）：只读 text 会漏掉调用；
+    // 工具型回复可以没有 text，先桥接再判空
+    let calls: Vec<NativeCallPair> = value
+        .pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| {
+                    let fc = part.get("functionCall")?;
+                    let name = fc.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty())?;
+                    let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    Some((name.to_string(), args))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    append_calls_as_text(&mut text, &calls);
+    if text.is_empty() {
+        return Err("响应中缺少 text".to_string());
+    }
     Ok((text, usage_from_gemini(&value)))
 }
 
@@ -874,13 +1037,36 @@ async fn chat_claude(
         .await
         .map_err(|e| format!("请求失败: {e}"))?;
     let value = read_json_resp(resp).await?;
-    let text = value
+    let mut text = value
         .pointer("/content/0/text")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         // 模糊回退：content 为纯字符串 / 多 text 块拼接 / 变体结构
         .or_else(|| fuzzy_text(&value))
-        .ok_or_else(|| "响应中缺少 text".to_string())?;
+        .unwrap_or_default();
+    // 原生 tool_use 桥接（多标准冗余）：content 块里的 tool_use 转文本协议执行；
+    // 工具型回复可以没有 text 块，先桥接再判空
+    let calls: Vec<NativeCallPair> = value
+        .get("content")
+        .and_then(|v| v.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|x| x.as_str()) != Some("tool_use") {
+                        return None;
+                    }
+                    let name = b.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty())?;
+                    let args = b.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    Some((name.to_string(), args))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    append_calls_as_text(&mut text, &calls);
+    if text.is_empty() {
+        return Err("响应中缺少 text".to_string());
+    }
     Ok((text, usage_from_claude(&value)))
 }
 
@@ -1263,6 +1449,9 @@ pub struct TokenUsage {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub completion_tokens: u64,
+    /// 上游确实返回了缓存统计字段（各家中转站常剥掉 usage 细节，
+    /// 缺字段 ≠ 命中 0——此时 UI 应显示「未知」而不是误导性的 0%）
+    pub cache_known: bool,
 }
 
 impl TokenUsage {
@@ -1271,44 +1460,54 @@ impl TokenUsage {
     }
 }
 
-/// openai 协议 usage（兼容 deepseek 的 prompt_cache_hit_tokens 字段）
+/// openai 协议 usage（兼容 deepseek 的 prompt_cache_hit_tokens 字段）。
+/// 注意：DeepSeek 官方永远返回 prompt_cache_hit_tokens（0 也是显式 0，可信）；
+/// OpenAI/千问在 prompt_tokens_details.cached_tokens；中转站常整体剥掉 → cache_known=false
 fn usage_from_openai(v: &serde_json::Value) -> TokenUsage {
     let u = v.get("usage");
+    let cached = u
+        .and_then(|x| x.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(|x| x.as_u64());
+    let ds_hit = u
+        .and_then(|x| x.get("prompt_cache_hit_tokens"))
+        .and_then(|x| x.as_u64());
     TokenUsage {
         prompt_tokens: u.and_then(|x| x.get("prompt_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
-        cache_read_tokens: u
-            .and_then(|x| x.pointer("/prompt_tokens_details/cached_tokens"))
-            .and_then(|x| x.as_u64())
-            .or_else(|| u.and_then(|x| x.get("prompt_cache_hit_tokens")).and_then(|x| x.as_u64()))
-            .unwrap_or(0),
+        cache_read_tokens: cached.or(ds_hit).unwrap_or(0),
         cache_write_tokens: 0,
         completion_tokens: u.and_then(|x| x.get("completion_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_known: cached.is_some() || ds_hit.is_some(),
     }
 }
 
 /// claude 协议 usage（cache_read/cache_creation 为缓存命中/写入 token）
 fn usage_from_claude(v: &serde_json::Value) -> TokenUsage {
     let u = v.get("usage");
+    let read = u.and_then(|x| x.get("cache_read_input_tokens")).and_then(|x| x.as_u64());
+    let write = u.and_then(|x| x.get("cache_creation_input_tokens")).and_then(|x| x.as_u64());
     TokenUsage {
         prompt_tokens: u.and_then(|x| x.get("input_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
-        cache_read_tokens: u.and_then(|x| x.get("cache_read_input_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
-        cache_write_tokens: u.and_then(|x| x.get("cache_creation_input_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_tokens: read.unwrap_or(0),
+        cache_write_tokens: write.unwrap_or(0),
         completion_tokens: u.and_then(|x| x.get("output_tokens")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_known: read.is_some() || write.is_some(),
     }
 }
 
 /// gemini 协议 usageMetadata
 fn usage_from_gemini(v: &serde_json::Value) -> TokenUsage {
     let u = v.get("usageMetadata");
+    let cached = u.and_then(|x| x.get("cachedContentTokenCount")).and_then(|x| x.as_u64());
     TokenUsage {
         prompt_tokens: u.and_then(|x| x.get("promptTokenCount")).and_then(|x| x.as_u64()).unwrap_or(0),
-        cache_read_tokens: u.and_then(|x| x.get("cachedContentTokenCount")).and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_tokens: cached.unwrap_or(0),
         cache_write_tokens: 0,
         completion_tokens: u
             .and_then(|x| x.get("candidatesTokenCount"))
             .and_then(|x| x.as_u64())
             .or_else(|| u.and_then(|x| x.get("totalTokenCount")).and_then(|x| x.as_u64()))
             .unwrap_or(0),
+        cache_known: cached.is_some(),
     }
 }
 
@@ -2392,6 +2591,46 @@ mod native_tests {
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
 
+    /// 缓存字段「已知 vs 未知」：中转剥掉 usage 细节时不得把缺失当成命中 0%
+    #[test]
+    fn test_cache_known_semantics() {
+        // DeepSeek 官方：显式 prompt_cache_hit_tokens（0 也是可信的 0%）
+        let ds = usage_from_openai(&json!({
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5, "prompt_cache_hit_tokens": 0}
+        }));
+        assert!(ds.cache_known, "DeepSeek 显式返回 0 也算已知");
+        assert_eq!(ds.cache_read_tokens, 0);
+
+        // OpenAI/千问：prompt_tokens_details.cached_tokens
+        let oai = usage_from_openai(&json!({
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5,
+                       "prompt_tokens_details": {"cached_tokens": 80}}
+        }));
+        assert!(oai.cache_known);
+        assert_eq!(oai.cache_read_tokens, 80);
+
+        // 中转剥掉细节字段：未知，不得显示为 0%
+        let relay = usage_from_openai(&json!({
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5}
+        }));
+        assert!(!relay.cache_known, "缺缓存字段应标记未知");
+        assert_eq!(relay.cache_read_tokens, 0);
+
+        // Claude / Gemini
+        let cl = usage_from_claude(&json!({
+            "usage": {"input_tokens": 100, "output_tokens": 5}
+        }));
+        assert!(!cl.cache_known);
+        let cl2 = usage_from_claude(&json!({
+            "usage": {"input_tokens": 100, "output_tokens": 5, "cache_read_input_tokens": 90}
+        }));
+        assert!(cl2.cache_known);
+        let gm = usage_from_gemini(&json!({
+            "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 5}
+        }));
+        assert!(!gm.cache_known);
+    }
+
     /// 极简 mock AI 服务器：按入队顺序逐请求回 (状态码, JSON体)，并把每次收到的请求体记录下来
     async fn spawn_mock_ai(responses: Vec<(u16, String)>) -> (String, Arc<StdMutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2455,6 +2694,7 @@ mod native_tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
             active: true,
+            text_fallback: false,
         }
     }
 
@@ -2745,6 +2985,215 @@ mod native_tests {
             "思考与正文应按 TokenKind 分流"
         );
         assert_eq!(full, "答", "完整正文不应混入思考内容");
+    }
+
+    /// 通用 SSE mock：按原样下发任意 data 帧（各家原生工具调用形态测试用）
+    async fn spawn_raw_sse(frames: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tauri::async_runtime::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 16384];
+            let _ = sock.read(&mut buf).await; // 丢弃请求
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await;
+            for f in &frames {
+                let ev = format!("data: {f}\n\n");
+                let _ = sock.write_all(format!("{:x}\r\n{}\r\n", ev.len(), ev).as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+            let done = "data: [DONE]\n\n";
+            let _ = sock.write_all(format!("{:x}\r\n{}\r\n", done.len(), done).as_bytes()).await;
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_text_mode_bridges_openai_tool_calls() {
+        // DeepSeek/千问按 OpenAI 标准把调用放进独立 tool_calls 字段（参数跨 chunk 增量）：
+        // 文本约定模式下不再被丢弃，桥接成文本协议 JSON 行追加到正文
+        let url = spawn_raw_sse(vec![
+            json!({"choices":[{"delta":{"content":"让我们来查看："}}]}).to_string(),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"shell","arguments":"{\"command\":"}}]}}]}).to_string(),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"echo hi\"}"}}]}}]}).to_string(),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}).to_string(),
+        ])
+        .await;
+        let p = test_provider("openai", &url);
+        let client = reqwest::Client::new();
+        let (full, _) = stream_openai(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |_kind, _t| true,
+        )
+        .await
+        .unwrap();
+        // 断言按 JSON 值比较（键序不敏感）：首行正文，末行桥接的文本协议调用
+        let (head, tail) = full.split_once('\n').unwrap();
+        assert_eq!(head, "让我们来查看：");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(tail).unwrap(),
+            json!([{"tool":"shell","params":{"command":"echo hi"}}]),
+            "原生 tool_calls 应桥接为文本协议执行"
+        );
+    }
+    #[tokio::test]
+    async fn test_text_mode_bridges_claude_tool_use() {
+        // Claude 原生 tool_use：content_block_start 建槽 + input_json_delta 聚合 → 桥接
+        let url = spawn_raw_sse(vec![
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}).to_string(),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text"}}).to_string(),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"让我们来看一看："}}).to_string(),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"shell"}}).to_string(),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}).to_string(),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"echo hi\"}"}}).to_string(),
+            json!({"type":"content_block_stop","index":1}).to_string(),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}).to_string(),
+            json!({"type":"message_stop"}).to_string(),
+        ])
+        .await;
+        let p = test_provider("claude", &url);
+        let client = reqwest::Client::new();
+        let (full, _) = stream_claude(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |_kind, _t| true,
+        )
+        .await
+        .unwrap();
+        let (head, tail) = full.split_once('\n').unwrap();
+        assert_eq!(head, "让我们来看一看：");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(tail).unwrap(),
+            json!([{"tool":"shell","params":{"command":"echo hi"}}]),
+            "原生 tool_use 应桥接为文本协议执行"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_claude_bridges_tool_use() {
+        // 非流式 Claude：text + tool_use 混合块 → 桥接为文本协议
+        let (url, _) = spawn_mock_ai(vec![(
+            200,
+            json!({"content":[
+                {"type":"text","text":"让我们来看一看："},
+                {"type":"tool_use","id":"t1","name":"shell","input":{"command":"echo hi"}}
+            ]}).to_string(),
+        )])
+        .await;
+        let p = test_provider("claude", &url);
+        let client = reqwest::Client::new();
+        let (full, _) = chat_claude(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+        )
+        .await
+        .unwrap();
+        let (head, tail) = full.split_once('\n').unwrap();
+        assert_eq!(head, "让我们来看一看：");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(tail).unwrap(),
+            json!([{"tool":"shell","params":{"command":"echo hi"}}]),
+            "非流式 tool_use 应桥接为文本协议执行"
+        );
+
+        // 纯 tool_use 无 text 块：只桥接调用，不再误报"响应中缺少 text"
+        let (url2, _) = spawn_mock_ai(vec![(
+            200,
+            json!({"content":[
+                {"type":"tool_use","id":"t2","name":"shell","input":{"command":"echo solo"}}
+            ]}).to_string(),
+        )])
+        .await;
+        let (full2, _) = chat_claude(
+            &client, &test_provider("claude", &url2),
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&full2).unwrap(),
+            json!([{"tool":"shell","params":{"command":"echo solo"}}])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_mode_bridges_gemini_function_call() {
+        // Gemini 原生 functionCall part（整体到达）：正文与调用并存时桥接追加
+        let url = spawn_raw_sse(vec![
+            json!({"candidates":[{"content":{"parts":[{"text":"让我们来查看："}]}}]}).to_string(),
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"command":"echo hi"}}}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}).to_string(),
+        ])
+        .await;
+        let p = test_provider("gemini", &url);
+        let client = reqwest::Client::new();
+        let (full, usage) = stream_gemini(
+            &client, &p,
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |_kind, _t| true,
+        )
+        .await
+        .unwrap();
+        let (head, tail) = full.split_once('\n').unwrap();
+        assert_eq!(head, "让我们来查看：");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(tail).unwrap(),
+            json!([{"tool":"shell","params":{"command":"echo hi"}}]),
+            "原生 functionCall 应桥接为文本协议执行"
+        );
+        assert_eq!(usage.prompt_tokens, 10);
+
+        // 纯 functionCall 无正文：只桥接调用，不再误报"流式无内容"
+        let url2 = spawn_raw_sse(vec![
+            json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"shell","args":{"command":"echo solo"}}}]}}]}).to_string(),
+        ])
+        .await;
+        let (full2, _) = stream_gemini(
+            &client, &test_provider("gemini", &url2),
+            &[ChatMessage::user("hi".to_string())], &[], &AiConfig::default(),
+            &mut |_kind, _t| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&full2).unwrap(),
+            json!([{"tool":"shell","params":{"command":"echo solo"}}])
+        );
+    }
+
+    #[test]
+    fn test_parse_call_args() {
+        // 空串/坏 JSON → 空对象（执行期参数校验会把问题如实反馈给模型纠正）
+        assert_eq!(parse_call_args(""), json!({}));
+        assert_eq!(parse_call_args("   "), json!({}));
+        assert_eq!(parse_call_args("{bad json"), json!({}));
+        assert_eq!(parse_call_args("{\"a\":1}"), json!({"a":1}));
+    }
+
+    #[test]
+    fn test_append_calls_as_text() {
+        // 空调用：正文不动
+        let mut s = String::from("正文");
+        append_calls_as_text(&mut s, &[]);
+        assert_eq!(s, "正文");
+        // 正文 + 调用：换行后追加文本协议 JSON 行（按 JSON 值比较，键序不敏感）
+        append_calls_as_text(&mut s, &[("shell".into(), json!({"command":"ls"}))]);
+        let (head, tail) = s.split_once('\n').unwrap();
+        assert_eq!(head, "正文");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(tail).unwrap(),
+            json!([{"tool":"shell","params":{"command":"ls"}}])
+        );
+        // 正文为空：直接追加，无前导换行
+        let mut empty = String::new();
+        append_calls_as_text(&mut empty, &[("add".into(), json!({}))]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&empty).unwrap(),
+            json!([{"tool":"add","params":{}}])
+        );
     }
 
     #[tokio::test]

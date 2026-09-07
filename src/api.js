@@ -47,6 +47,8 @@ export const api = {
     invoke("update_provider", { id, name, protocol, baseUrl: base_url, apiKey: api_key, model }),
   removeProvider: (id) => invoke("remove_provider", { id }),
   setProviderActive: (id, active) => invoke("set_provider_active", { id, active }),
+  // 文本协议降级开关（逐家提供方，默认关）：端点拒绝 tools 参数时是否自动降级
+  setProviderTextFallback: (id, allowed) => invoke("set_provider_text_fallback", { id, allowed }),
   // 模型采样参数：temperature null=默认（0-2）；reasoningEffort ""=默认 / low / medium / high
   getAiParams: () => invoke("get_ai_params"),
   setAiParams: (temperature, reasoning_effort) =>

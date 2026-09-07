@@ -207,6 +207,12 @@ export default function AiSettingsPage({ onStats, stats }) {
     onStats?.();
   };
 
+  // 文本协议降级开关（逐家提供方，默认关）
+  const toggleFallback = async (p) => {
+    await api.setProviderTextFallback(p.id, !p.text_fallback);
+    await load();
+  };
+
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto">
       <div>
@@ -278,6 +284,17 @@ export default function AiSettingsPage({ onStats, stats }) {
                     {t("ai.missingKey")}
                   </span>
                 )}
+                <button
+                  onClick={() => toggleFallback(p)}
+                  title={t("ai.fallbackTip")}
+                  className={`chip shrink-0 transition-colors ${
+                    p.text_fallback
+                      ? "border-neutral-900/70 bg-neutral-900 text-white dark:border-white/70 dark:bg-white dark:text-neutral-900"
+                      : "text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300"
+                  }`}
+                >
+                  {t("ai.fallback")}
+                </button>
               </div>
               <p className="mt-0.5 truncate font-mono text-[11px] text-neutral-500">
                 {p.model} · {p.base_url}

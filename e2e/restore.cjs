@@ -1,13 +1,15 @@
 // 恢复原激活提供方，并移除 mock 提供方与 e2e 测试会话
-// 跨平台：与 activate.cjs 相同的目录判定
+// 目录判定：与 activate.cjs 相同（BIT_DATA_DIR 优先，否则默认数据目录）
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const dir = process.platform === "win32"
-  ? path.join(process.env.APPDATA, "com.bit.hub")
-  : path.join(os.homedir(), ".local", "share", "com.bit.hub");
+const envDir = process.env.BIT_DATA_DIR;
+const dir = envDir
+  || (process.platform === "win32"
+    ? path.join(process.env.APPDATA, "com.bit.hub")
+    : path.join(os.homedir(), ".local", "share", "com.bit.hub"));
 const macDir = path.join(os.homedir(), "Library", "Application Support", "com.bit.hub");
-const p = fs.existsSync(path.join(dir, "ai_config.json")) ? dir : macDir;
+const p = envDir || (fs.existsSync(path.join(dir, "ai_config.json")) ? dir : macDir);
 const orig = fs.readFileSync(path.join(p, "ai_config.json.orig-active"), "utf8");
 const ai = JSON.parse(fs.readFileSync(path.join(p, "ai_config.json"), "utf8"));
 ai.providers = ai.providers.filter((x) => x.id !== "e2e-mock-provider");

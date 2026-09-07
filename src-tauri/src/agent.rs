@@ -131,7 +131,49 @@ fn record_and_payload(ctx: &Arc<Ctx>, session: &str, usage: &ai::TokenUsage) -> 
         "cache_write_tokens": stats.cache_write_tokens,
         "completion_tokens": stats.completion_tokens,
         "hit_rate": (stats.hit_rate() * 1000.0).round() / 1000.0,
+        // 上游从未上报缓存字段时 hit_rate 无意义（中转剥掉 usage 细节），前端显示「未知」
+        "cache_known": stats.cache_known_requests > 0,
     })
+}
+
+/// 原生探测缓存的键 = 激活提供方 id：能否原生调用工具是「哪家端点」的属性而不是
+/// 会话的属性——按会话记会让多家提供方互相污染，也无法回答"是哪家降的级"
+fn probe_key(ctx: &Arc<Ctx>) -> String {
+    ctx.ai_config
+        .lock()
+        .unwrap()
+        .active()
+        .map(|p| p.id.clone())
+        .unwrap_or_default()
+}
+
+/// 原生探测失败（端点明确拒绝 tools 参数）时的降级决策：
+/// ① 开关判断——只有该提供方「文本协议降级」开关打开才允许自动降级（默认关）；
+/// ② 按提供方记忆探测结果（后续会话不再重复探测）；
+/// ③ 审计如实记录是哪家提供方发生了降级。
+/// 返回 Err = 开关未开：直接报错告知用户是哪家端点、去哪里开，不做静默降级
+fn handle_unsupported(ctx: &Arc<Ctx>, err: &str) -> Result<(), String> {
+    let provider = ctx.ai_config.lock().unwrap().active().cloned();
+    let Some(p) = provider else {
+        return Err("未配置任何 AI 提供方".into());
+    };
+    if !p.text_fallback {
+        return Err(format!(
+            "提供方「{}」不支持原生工具调用（{}）。如确认该端点仅支持文本约定，可在「AI 设置」中开启它的「文本协议降级」开关后重试",
+            p.name,
+            ai::user_err(err)
+        ));
+    }
+    ctx.native_probe.lock().unwrap().insert(p.id.clone(), false);
+    crate::audit::record(
+        ctx,
+        "system",
+        "ai.native.degrade",
+        &p.name,
+        json!({ "provider_id": p.id, "error": err }),
+        true,
+    );
+    Ok(())
 }
 
 /// 工具审批：弹出询问卡片等待用户应答（120 秒超时自动拒绝）。
@@ -589,9 +631,10 @@ pub async fn chat_turn(
 
     let iflag = register_interrupt(ctx, &target);
 
-    // 原生工具调用探测：每个会话只探测一次（内存缓存不持久化，新会话自动重新探测，
-    // 模型/接口更新后自适应）；探测过不支持的会话直接用文本约定提示词
-    let mut native_mode = ctx.native_probe.lock().unwrap().get(&target).copied() != Some(false);
+    // 原生工具调用探测：按提供方只探测一次（内存缓存不持久化；改配置/切开关即失效重探）；
+    // 探测过不支持的提供方直接用文本约定提示词
+    let probe_key = probe_key(ctx);
+    let mut native_mode = ctx.native_probe.lock().unwrap().get(&probe_key).copied() != Some(false);
 
     // 2) 构造发给模型的对话（system + 历史 + 每轮追加的工具反馈）
     // 提示词随探测结果切换：原生模式不教文本调用格式，避免两种约定互相干扰
@@ -643,7 +686,7 @@ pub async fn chat_turn(
             }
             match attempt {
                 Ok(r) => {
-                    ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), true);
                     *round_thinking.lock().unwrap() = r.thinking;
                     // 记录本轮用量并推送缓存命中率统计
                     let payload = record_and_payload(ctx, &target, &r.usage);
@@ -662,9 +705,11 @@ pub async fn chat_turn(
                     };
                     (r.content, calls)
                 }
-                Err(ai::NativeErr::Unsupported(_)) => {
-                    // 端点拒绝 tools 参数：本会话降级文本约定（提示词同步切换），下个会话重新探测
-                    ctx.native_probe.lock().unwrap().insert(target.clone(), false);
+                Err(ai::NativeErr::Unsupported(e)) => {
+                    // 端点拒绝 tools 参数：是否允许自动降级由该提供方的「文本协议降级」开关决定
+                    // （默认关：报错并告知是哪家、去哪里开），降级发生时审计记录
+                    handle_unsupported(ctx, &e)?;
+                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), false);
                     native_mode = false;
                     native_exchanges.clear();
                     convo[0] = ChatMessage::system(ai::system_prompt(ctx, Some(&target)));
@@ -933,9 +978,10 @@ pub async fn chat_turn_stream(
 
     let iflag = register_interrupt(ctx, &target);
 
-    // 原生工具调用探测：每个会话只探测一次（内存缓存不持久化，新会话自动重新探测）；
+    // 原生工具调用探测：按提供方只探测一次（内存缓存不持久化；改配置/切开关即失效重探）；
     // 提示词随探测结果切换：原生模式不教文本调用格式，避免两种约定互相干扰
-    let mut native_mode = ctx.native_probe.lock().unwrap().get(&target).copied() != Some(false);
+    let probe_key = probe_key(ctx);
+    let mut native_mode = ctx.native_probe.lock().unwrap().get(&probe_key).copied() != Some(false);
 
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
@@ -1003,7 +1049,7 @@ pub async fn chat_turn_stream(
             }
             match attempt {
                 Ok(r) => {
-                    ctx.native_probe.lock().unwrap().insert(target.clone(), true);
+                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), true);
                     *round_thinking.lock().unwrap() = r.thinking;
                     // 记录本轮用量并随流式通道推送缓存命中率统计
                     let mut payload = record_and_payload(ctx, &target, &r.usage);
@@ -1022,8 +1068,10 @@ pub async fn chat_turn_stream(
                     };
                     (r.content, calls)
                 }
-                Err(ai::NativeErr::Unsupported(_)) => {
-                    ctx.native_probe.lock().unwrap().insert(target.clone(), false);
+                Err(ai::NativeErr::Unsupported(e)) => {
+                    // 端点拒绝 tools 参数：是否允许自动降级由该提供方的「文本协议降级」开关决定
+                    handle_unsupported(ctx, &e)?;
+                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), false);
                     native_mode = false;
                     native_exchanges.clear();
                     convo[0] = ChatMessage::system(ai::system_prompt(ctx, Some(&target)));
@@ -1717,6 +1765,27 @@ mod tests {
     fn test_parse_standard_array() {
         let reply = r#"[{"tool":"shell","params":{"command":"echo hi"}}]"#;
         let calls = parse_tool_calls(reply).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "shell");
+    }
+
+    /// ai.rs 原生调用桥接（OpenAI tool_calls / Claude tool_use / Gemini functionCall
+    /// → 文本协议 JSON 行）的产物必须能被解析端接住执行：
+    /// 正文与调用行分离、键序按 serde_json 字母序（params 在前）、纯调用行无正文
+    #[test]
+    fn test_parse_bridged_native_call_line() {
+        // 正文 + 桥接行（DeepSeek/千问 "宣告了工具却没下文" 场景的修复产物）
+        let reply = "让我们来查看：\n[{\"params\":{\"command\":\"echo hi\"},\"tool\":\"shell\"}]";
+        let calls = parse_tool_calls(reply).unwrap();
+        assert!(looks_like_tool_calls(&calls), "桥接行应识别为工具调用");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["tool"], "shell");
+        assert_eq!(calls[0]["params"]["command"], "echo hi");
+        // 用户可见正文不残留 JSON
+        assert_eq!(strip_tool_json(reply), "让我们来查看：");
+        // 纯 functionCall 无正文的桥接产物（Gemini）
+        let solo = "[{\"params\":{\"command\":\"echo solo\"},\"tool\":\"shell\"}]";
+        let calls = parse_tool_calls(solo).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["tool"], "shell");
     }

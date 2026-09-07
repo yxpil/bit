@@ -227,6 +227,7 @@ fn main() {
             commands::update_provider,
             commands::remove_provider,
             commands::set_provider_active,
+            commands::set_provider_text_fallback,
             commands::chat,
             commands::chat_stream,
             commands::extract_file,

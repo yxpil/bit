@@ -10,17 +10,17 @@ fn ctx<'a>(state: State<'a, Arc<Ctx>>) -> Arc<Ctx> {
     state.inner().clone()
 }
 
-fn resolve_session_id(ctx: &Arc<Ctx>, session_id: &str) -> String {
-    if session_id.is_empty() {
-        ctx.sessions.lock().unwrap().active.clone()
-    } else {
-        session_id.to_string()
-    }
-}
-
 pub fn estimate_context_tokens(ctx: &Arc<Ctx>, session_id: &str, convo: &[crate::ai::ChatMessage]) -> usize {
-    let target = resolve_session_id(ctx, session_id);
-    let native_mode = ctx.native_probe.lock().unwrap().get(&target).copied() != Some(false);
+    let _ = session_id;
+    // 探测缓存按提供方记（能否原生调工具是「哪家端点」的属性）
+    let probe_key = ctx
+        .ai_config
+        .lock()
+        .unwrap()
+        .active()
+        .map(|p| p.id.clone())
+        .unwrap_or_default();
+    let native_mode = ctx.native_probe.lock().unwrap().get(&probe_key).copied() != Some(false);
     let convo_chars: usize = convo
         .iter()
         .map(|m| m.role.chars().count() + m.content.chars().count() + 8)
@@ -726,6 +726,7 @@ pub fn add_provider(
         api_key: api_key.trim().to_string(),
         model,
         active: false,
+        text_fallback: false,
     };
     let id = p.id.clone();
     {
@@ -776,6 +777,8 @@ pub fn update_provider(
         p.api_key = api_key.trim().to_string();
         p.protocol = protocol;
     }
+    // 端点/协议可能已换：清除该提供方的原生探测缓存，下次对话重新探测
+    ctx.native_probe.lock().unwrap().remove(&id);
     ctx.save_ai_config();
     crate::audit::record(&ctx, "local-user", "ai.provider.update", &id, json!({}), true);
     Ok(json!({ "saved": true }))
@@ -795,9 +798,35 @@ pub fn remove_provider(state: State<'_, Arc<Ctx>>, id: String) -> Result<serde_j
             }
         }
     }
+    ctx.native_probe.lock().unwrap().remove(&id);
     ctx.save_ai_config();
     crate::audit::record(&ctx, "local-user", "ai.provider.remove", &id, json!({}), true);
     Ok(json!({ "removed": true }))
+}
+
+/// 文本协议降级开关（逐家提供方独立，默认关）：开启后该端点明确拒绝 tools 参数时
+/// 自动降级文本协议（审计记录）；关闭时探测失败直接报错提示开启路径。
+/// 切换即清除该提供方的探测缓存，下次对话重新探测
+#[tauri::command]
+pub fn set_provider_text_fallback(
+    state: State<'_, Arc<Ctx>>,
+    id: String,
+    allowed: bool,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.ai_config.lock().unwrap();
+        let p = cfg
+            .providers
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or("提供方不存在")?;
+        p.text_fallback = allowed;
+    }
+    ctx.native_probe.lock().unwrap().remove(&id);
+    ctx.save_ai_config();
+    crate::audit::record(&ctx, "local-user", "ai.provider.text_fallback", &id, json!({ "allowed": allowed }), true);
+    Ok(json!({ "saved": true }))
 }
 
 /// 播放/暂停：设定当前激活提供方。active=true 时激活该项并暂停其余（互斥）；

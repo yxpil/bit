@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../../未命名文件夹"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../../AndroidStudioProjects/BitModel"
+		},
+		{
+			"path": "../../bit"
+		}
+	],
+	"settings": {
+		"java.configuration.updateBuildConfiguration": "automatic"
+	}
+}

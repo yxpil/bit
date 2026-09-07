@@ -31,10 +31,13 @@ pub struct CacheStats {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub completion_tokens: u64,
+    /// 上游返回过缓存统计字段的请求数（0 = 本会话命中率不可知，UI 显示「未知」）
+    pub cache_known_requests: u64,
 }
 
 impl CacheStats {
-    /// 提示词缓存命中率 = 命中缓存的输入 token / 总输入 token（0.0 ~ 1.0）
+    /// 提示词缓存命中率 = 命中缓存的输入 token / 总输入 token（0.0 ~ 1.0）。
+    /// 仅当上游确实上报过缓存字段时才有意义（cache_known_requests > 0）
     pub fn hit_rate(&self) -> f64 {
         if self.prompt_tokens == 0 {
             0.0
@@ -61,6 +64,9 @@ pub fn record_usage(ctx: &Arc<Ctx>, session: &str, usage: &crate::ai::TokenUsage
     e.cache_read_tokens += usage.cache_read_tokens;
     e.cache_write_tokens += usage.cache_write_tokens;
     e.completion_tokens += usage.completion_tokens;
+    if usage.cache_known {
+        e.cache_known_requests += 1;
+    }
     e.clone()
 }
 

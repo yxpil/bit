@@ -1631,6 +1631,67 @@ function record(name, ok, detail) {
     record("T57 keepalive-era-expiry", false, e.message);
   }
 
+  // ── T59-T64 多协议原生工具调用桥接 + 受控降级（降级须按提供方判断且开关打开）──
+  // /api/debug/config 的 active_provider 钩子运行时切换提供方；探测缓存按提供方 ID 隔离。
+  // 全新提供方首次对话必走原生探测，保证原生格式场景真正压到各家协议解析
+  try {
+    // T59 OpenAI 原生 tool_calls 流式（标准 index 形态）：delta 增量聚合 → 执行 → role=tool 反馈 → 最终
+    await call("/api/debug/config", { active_provider: "e2e-mock-openai-native" });
+    const r59 = await chat(sid(59), "E2E-NAT-OPENAI go");
+    record("T59 openai-native-toolcalls", /E2E-FINAL-OK stdout=「.*e2e-native-openai-ok」/s.test(r59.reply || ""), `reply=${(r59.reply || "").slice(0, 120)}`);
+  } catch (e) { record("T59 openai-native-toolcalls", false, e.message); }
+
+  try {
+    // T60 Claude 原生 tool_use 流式：content_block_start(tool_use) + input_json_delta 增量 → 桥接执行
+    // → 下一轮 tool_result 块回传 → 最终回复（mock 确认收到 tool_result，标记 tool_result=true）
+    await call("/api/debug/config", { active_provider: "e2e-mock-claude" });
+    const r60 = await chat(sid(60), "E2E-CLAUDE-NAT go");
+    record("T60 claude-native-tooluse", /E2E-FINAL-CLAUDE-NAT stdout=「e2e-claude-native-ok」 tool_result=true/.test(r60.reply || ""), `reply=${(r60.reply || "").slice(0, 140)}`);
+  } catch (e) { record("T60 claude-native-tooluse", false, e.message); }
+
+  try {
+    // T61 Gemini 原生 functionCall 流式：独立 functionCall part → 桥接执行 → 下一轮 functionResponse 回传
+    await call("/api/debug/config", { active_provider: "e2e-mock-gemini" });
+    const r61 = await chat(sid(61), "E2E-GEMINI-NAT go");
+    record("T61 gemini-native-functioncall", /E2E-FINAL-GEMINI-NAT stdout=「e2e-gemini-native-ok」 functionResponse=true/.test(r61.reply || ""), `reply=${(r61.reply || "").slice(0, 140)}`);
+  } catch (e) { record("T61 gemini-native-functioncall", false, e.message); }
+
+  try {
+    // T62 Claude 降级路径：原生请求被 400 拒 → 该提供方降级开关已开 → 自动降级文本协议（claude SSE text）
+    // → 工具照常执行；审计必须如实记录是哪家提供方降的级
+    const r62 = await chat(sid(62), "E2E-CLAUDE-DEGRADE go");
+    const ok62 = /E2E-FINAL-CLAUDE-DEGRADE stdout=「e2e-claude-degrade-ok」/.test(r62.reply || "");
+    const au62 = await getJson("/api/audit");
+    const dg62 = (au62.entries || []).filter((x) => x.action === "ai.native.degrade" && x.detail && x.detail.provider_id === "e2e-mock-claude");
+    record("T62 claude-degrade-with-audit", ok62 && dg62.length > 0, `reply=${(r62.reply || "").slice(0, 110)} degradeAudit=${dg62.length}`);
+  } catch (e) { record("T62 claude-degrade-with-audit", false, e.message); }
+
+  try {
+    // T63 降级开关未开不降级：strict 提供方原生被拒 → 明确报错点名提供方与开启路径，且不产生降级审计
+    await call("/api/debug/config", { active_provider: "e2e-mock-strict" });
+    let body63 = "";
+    try { await chat(sid(63), "E2E-NAT-STRICT go"); } catch (e) { body63 = e.message; }
+    // BIT 的业务错误通过 HTTP body 返回（code=200 但 body 含 error 字段），
+    // chat 函数会 JSON.parse 它并返回含 error 键的对象；此处同时覆盖异常与 body-error 两种形态
+    if (!body63) {
+      try {
+        const r63 = await call("/api/chat", { session_id: sid(63) + "-b", message: "E2E-NAT-STRICT go" });
+        body63 = r.body;
+      } catch (e) { body63 = e.message; }
+    }
+    const au63 = await getJson("/api/audit");
+    const dg63 = (au63.entries || []).filter((x) => x.action === "ai.native.degrade" && x.detail && x.detail.provider_id === "e2e-mock-strict");
+    record("T63 strict-no-fallback-error", /E2E-Mock-Strict/.test(body63) && /降级/.test(body63) && dg63.length === 0, `body=${body63.slice(0, 200)} degradeAudit=${dg63.length}`);
+  } catch (e) { record("T63 strict-no-fallback-error", false, e.message); }
+
+  try {
+    // T64 降级后提供方仍可用 + 探测状态按提供方隔离：strict 被拒后切回 claude（已降级缓存）
+    // → 走文本协议普通对话正常，不串扰其它提供方的探测结果
+    await call("/api/debug/config", { active_provider: "e2e-mock-claude" });
+    const r64 = await chat(sid(64), "E2E-PLAIN after degrade");
+    record("T64 probe-cache-per-provider", /E2E-FINAL-PLAIN/.test(r64.reply || ""), `reply=${(r64.reply || "").slice(0, 100)}`);
+  } catch (e) { record("T64 probe-cache-per-provider", false, e.message); }
+
   // ── T58 守护复活：kill -9 主进程 → 守护进程接力拉起（签名握手，删除/篡改不能解除布防）──
   // 放在最后：复活后实例继续存活，但接力事件转存审计在下次主进程启动才发生
   try {

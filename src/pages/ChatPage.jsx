@@ -245,12 +245,13 @@ export default function ChatPage({ onStats, visible }) {
           tokens: contextTokens,
           limitK: ctxLimitK,
           running: runningCount > 0,
-          cacheHitRate: usage?.hit_rate || 0,
+          cacheHitRate: usage?.cache_known ? usage?.hit_rate || 0 : null,
+          cacheKnown: !!usage?.cache_known,
           showCache: usageKnown,
         },
       }),
     );
-  }, [sessions.length, contextTokens, ctxLimitK, ctxLimitKnown, runningCount, usage?.hit_rate, usageKnown]);
+  }, [sessions.length, contextTokens, ctxLimitK, ctxLimitKnown, runningCount, usage?.hit_rate, usageKnown, usage?.cache_known]);
 
   useEffect(() => {
     activeRef.current = activeId;
@@ -858,9 +859,9 @@ export default function ChatPage({ onStats, visible }) {
               className={`flex items-center gap-2 self-start rounded-full px-3 py-1 text-[11px] ${
                 ctxPct >= 1
                   ? "bg-red-500/10 text-red-600 dark:text-red-400"
-                  : ctxPct >= 0.7 || (usageKnown && (usage.hit_rate || 0) < 0.5)
+                  : ctxPct >= 0.7 || (usage?.cache_known && (usage.hit_rate || 0) < 0.5)
                     ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
-                    : usageKnown && (usage.hit_rate || 0) >= 0.8
+                    : usage?.cache_known && (usage.hit_rate || 0) >= 0.8
                       ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
                     : "text-neutral-400"
               }`}
@@ -903,7 +904,12 @@ export default function ChatPage({ onStats, visible }) {
                   </button>
                 )}{" "}
                 tokens
-                {usageKnown && ` · ${t("chat.cacheHit")} ${Math.round((usage.hit_rate || 0) * 100)}%`}
+                {usageKnown &&
+                  ` · ${
+                    usage?.cache_known
+                      ? `${t("chat.cacheHit")} ${Math.round((usage.hit_rate || 0) * 100)}%`
+                      : t("chat.cacheUnknown")
+                  }`}
               </span>
               {(ctxPct >= 1 || compressing) && (
                 <button

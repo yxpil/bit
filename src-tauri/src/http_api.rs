@@ -1187,6 +1187,21 @@ async fn debug_config(State(ctx): State<Arc<Ctx>>, Json(body): Json<serde_json::
         }
         (cfg.word_repeat_max, cfg.tool_loop_max)
     };
+    // E2E 钩子：运行时切换激活提供方（多协议原生工具调用桥接测试用）。
+    // 与 set_provider_active 同互斥语义；写 ai_config（探测缓存不动，目标提供方首次对话重新探测）
+    if let Some(v) = body.get("active_provider").and_then(|x| x.as_str()) {
+        {
+            let mut ai = ctx.ai_config.lock().unwrap();
+            if ai.providers.iter().any(|p| p.id == v) {
+                for p in ai.providers.iter_mut() {
+                    p.active = p.id == v;
+                }
+                // 必须先 drop MutexGuard 再 save——std::sync::Mutex 不可重入，
+                // save_ai_config 内部会再 lock 同一把，重入会直接死锁
+            }
+        }
+        ctx.save_ai_config();
+    }
     // 可选：清空限速窗口（E2E 用例隔离，避免上一用例的计数影响下一个）
     if body.get("chat_rate_reset").and_then(|x| x.as_bool()) == Some(true) {
         ctx.chat_rate.lock().unwrap().clear();

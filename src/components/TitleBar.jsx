@@ -189,7 +189,9 @@ export default function TitleBar() {
           <>
             <span className="opacity-50">·</span>
             <span>
-              {t("chat.cacheHit")} {Math.round((dash.cacheHitRate || 0) * 100)}%
+              {dash.cacheKnown
+                ? `${t("chat.cacheHit")} ${Math.round((dash.cacheHitRate || 0) * 100)}%`
+                : t("chat.cacheUnknown")}
             </span>
           </>
         )}
