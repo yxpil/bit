@@ -31,6 +31,7 @@ mod update;
 
 use std::sync::Arc;
 use tauri::Manager;
+use tauri::webview::Color;
 
 /// 权威退出函数：所有退出路径（托盘、quit_app 命令、信号、兜底）都走这里。
 /// 与守护进程握手 + 静默更新 + 最终 exit。不阻塞、不 panic。
@@ -172,6 +173,17 @@ fn main() {
                     tui::run_blocking(tui_ctx, handle);
                 });
                 return Ok(());
+            }
+
+            // ========== 透明窗口强制设色 ==========
+            // Rust 端直接调 set_background_color 比 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS 更可靠——
+            // WebView2 的 --default-background-color 参数在某些 wry/WebView2 版本组合下不生效
+            // （见 tauri-apps/tauri#1739 / khiops/termora#98）。macOS 上 transparent: true 也只对
+            // 窗口级生效，WKWebView 自身默认白底，同样需要显式设透明。
+            if let Some(win) = app.get_webview_window("main") {
+                if let Err(e) = win.set_background_color(Some(Color(0, 0, 0, 0))) {
+                    eprintln!("[BIT] set_background_color failed: {e}");
+                }
             }
 
             // ========== 桌面端：信号兜底 ==========
