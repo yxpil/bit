@@ -14,9 +14,21 @@ import { IconImage, IconTrash, IconCheck } from "../components/Icons.jsx";
  *  - 一键恢复默认
  */
 export default function ThemePage() {
-  const { isDark, look, setLook } = useTheme();
+  const { isDark, look, setLook, accent, setAccent } = useTheme();
   const { t } = useLang();
   const fileRef = useRef(null);
+
+  const ACCENT_PRESETS = [
+    { color: null, label: "default" },
+    { color: "#e11d48", label: "rose" },
+    { color: "#ea580c", label: "orange" },
+    { color: "#f59e0b", label: "amber" },
+    { color: "#16a34a", label: "green" },
+    { color: "#0891b2", label: "cyan" },
+    { color: "#2563eb", label: "blue" },
+    { color: "#7c3aed", label: "violet" },
+    { color: "#db2777", label: "pink" },
+  ];
 
   // 浅拷贝避免直接修改原对象
   const patch = (partial) => setLook((l) => ({ ...l, ...partial, enabled: true }));
@@ -61,6 +73,44 @@ export default function ThemePage() {
       </div>
 
       <div className={`space-y-5 ${!look.enabled ? "opacity-40 pointer-events-none" : ""}`}>
+        {/* ==== 主题色（Accent） ==== */}
+        <div className="card">
+          <div className="mb-3 flex items-center justify-between">
+            <span className="font-medium">{t("theme.accent", "主题色")}</span>
+            <span className="font-mono text-xs text-neutral-500 dark:text-neutral-400">
+              {accent || "default"}
+            </span>
+          </div>
+          <div className="mb-3 flex flex-wrap gap-2">
+            {ACCENT_PRESETS.map(({ color, label }) => (
+              <button
+                key={label}
+                title={color || t("theme.reset", "默认")}
+                onClick={() => setAccent(color || "")}
+                className={`h-7 w-7 rounded-full border-2 transition-transform duration-200 hover:scale-110 ${
+                  (accent || "") === (color || "") && (accent || label) === (color || label)
+                    ? "scale-110 border-neutral-900 dark:border-white"
+                    : "border-transparent"
+                }`}
+                style={{
+                  background:
+                    color ||
+                    "conic-gradient(#ef4444,#f59e0b,#22c55e,#06b6d4,#6366f1,#d946ef,#ef4444)",
+                }}
+              />
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={accent || "#2563eb"}
+              onChange={(e) => setAccent(e.target.value)}
+              className="h-8 w-12 cursor-pointer rounded-lg border border-neutral-200 bg-transparent p-0.5 dark:border-neutral-700"
+            />
+            <span className="text-xs text-neutral-400">{t("theme.custom", "自定义颜色")}</span>
+          </div>
+        </div>
+
         {/* ==== 背景色 ==== */}
         <div className="card space-y-4">
           <div className="font-medium">{t("theme.bgColor", "背景颜色")}</div>
