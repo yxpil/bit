@@ -172,7 +172,7 @@ export default function App() {
         window.dispatchEvent(new CustomEvent("bit-new-session"));
       }}
       title={t("chat.newChat")}
-      className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-dashed border-neutral-300 text-neutral-500 transition-colors hover:border-neutral-900 hover:text-neutral-900 dark:border-neutral-700 dark:hover:border-white dark:hover:text-white"
+      className="mx-auto flex h-10 w-10 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-200/60 hover:text-neutral-900 dark:hover:bg-neutral-800/60 dark:hover:text-white"
     >
       <IconPlus size={16} />
     </button>
