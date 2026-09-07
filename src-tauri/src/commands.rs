@@ -2137,10 +2137,16 @@ fn relaunch_with_elevation(exe: &std::path::Path, data_dir: &str, elevate: bool)
         let sh_e = exe_str.replace('\'', "'\\''");
         let sh_d = data_dir.replace('\'', "'\\''");
         if elevate {
-            // with administrator privileges 触发系统管理员授权弹窗；osascript 阻塞到用户决定，
-            // 取消时返回非零。nohup + & 后台拉起，授权对话框关闭即返回
+            // osascript 成功返回 ≠ 子进程真的活下来了：
+            // 1) macOS GUI 进程以 root 身份无法创建 WindowServer 窗口（系统级硬限制）
+            //    —— GUI 应用会在 create_webview 时立即崩掉，进程退出码正常
+            // 2) nohup 在 osascript 的无 tty shell 里会报 "can't detach from console" 导致失败
+            // 修复：不用 nohup，纯 & 后台（osascript shell 本身能正确后台化子进程）；
+            // 命令里同时传递 --data-dir 和 BIT_DATA_DIR（环境在 root shell 里会清空）；
+            // 最重要：osascript 成功后验证新进程是否真的活着，没活就返回错误，
+            // 调用方会保持当前进程运行、不退出老进程（用户不会丢失当前会话）
             let script = format!(
-                "do shell script \"BIT_DATA_DIR='{d}' nohup '{e}' >/dev/null 2>&1 &\" with administrator privileges",
+                "do shell script \"BIT_DATA_DIR='{d}' '{e}' --data-dir '{d}' >/dev/null 2>&1 &\" with administrator privileges",
                 d = sh_d,
                 e = sh_e
             );
@@ -2152,7 +2158,35 @@ fn relaunch_with_elevation(exe: &std::path::Path, data_dir: &str, elevate: bool)
                 let err = String::from_utf8_lossy(&out.stderr);
                 return Err(format!("未获得管理员授权: {}", err.trim()));
             }
-            return Ok(());
+            // 等待并验证 root 子进程是否真的存活（最多 5 次，每次 0.5s）
+            let exe_basename = exe
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("bit");
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let alive = std::process::Command::new("pgrep")
+                    .args(["-x", exe_basename])
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().parse::<u32>().ok())
+                    .map(|pid| {
+                        // 验证该进程是 root 身份
+                        std::process::Command::new("ps")
+                            .args(["-o", "user=", "-p", &pid.to_string()])
+                            .output()
+                            .ok()
+                            .map(|p| String::from_utf8_lossy(&p.stdout).trim() == "root")
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if alive {
+                    return Ok(());
+                }
+            }
+            return Err(
+                "提权启动失败：管理员版进程未成功启动（macOS 系统限制 root 身份无法创建 GUI 窗口）".into()
+            );
         }
         // 降权：su 到控制台登录用户（root 执行 su 无需密码）
         let user = std::process::Command::new("stat")
