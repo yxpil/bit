@@ -209,6 +209,11 @@ pub const NET_TRANSIENT: &str = "[net-transient]";
 pub const STREAM_CUT: &str =
     "[net-transient] stream ended before completion marker (network flap or proxy closed)";
 
+/// finish_reason=length 时追加到正文尾部的显式截断标注。
+/// agent 层的 looks_truncated 以本常量作为最可靠的截断信号，自动补发「继续」，
+/// 因此文案改动必须两处同步（改这里即可，agent 引用同一常量）。
+pub const TRUNCATION_NOTICE: &str = "（回复因达到最大输出长度被截断，可回复“继续”）";
+
 /// Strip the machine-readable marker prefix for user-facing display.
 pub fn user_err(e: &str) -> String {
     match e.strip_prefix(NET_TRANSIENT) {
@@ -559,7 +564,7 @@ async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
     }
     // 达到输出上限：在正文尾部显式标注，避免“话说一半”看起来像 bug
     let full = if finish_truncated(&finish) {
-        format!("{full}\n\n（回复因达到最大输出长度被截断，可回复“继续”）")
+        format!("{full}\n\n{}", TRUNCATION_NOTICE)
     } else {
         full
     };
@@ -769,7 +774,7 @@ async fn chat_openai(
         .and_then(|v| v.as_str())
         .is_some_and(finish_truncated)
     {
-        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+        content.push_str(&format!("\n\n{TRUNCATION_NOTICE}"));
     }
     Ok((content, usage_from_openai(&value)))
 }
@@ -1915,7 +1920,7 @@ async fn native_round_openai_stream(
         .collect();
     let mut content = content;
     if finish_truncated(&finish) {
-        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+        content.push_str(&format!("\n\n{TRUNCATION_NOTICE}"));
     }
     Ok(NativeRound { content, thinking, calls, usage })
 }
@@ -2053,7 +2058,7 @@ async fn native_round_claude_stream(
         }
     }
     if finish_truncated(&stop_reason) {
-        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+        content.push_str(&format!("\n\n{TRUNCATION_NOTICE}"));
     }
     Ok(NativeRound { content, thinking, calls, usage })
 }
@@ -2146,7 +2151,7 @@ async fn native_round_gemini_stream(
 
     let mut content = content;
     if finish_truncated(&finish) {
-        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+        content.push_str(&format!("\n\n{TRUNCATION_NOTICE}"));
     }
     Ok(NativeRound { content, thinking, calls, usage })
 }
@@ -2182,7 +2187,7 @@ async fn native_round_openai(
         .and_then(|v| v.as_str())
         .is_some_and(finish_truncated)
     {
-        content.push_str("\n\n（回复因达到最大输出长度被截断，可回复“继续”）");
+        content.push_str(&format!("\n\n{TRUNCATION_NOTICE}"));
     }
     let mut calls = Vec::new();
     if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {

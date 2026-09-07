@@ -804,12 +804,17 @@ pub async fn chat_turn(
             continue;
         }
 
-        // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」（仅文本约定模式）。
+        // 回复不完整（截断/纯思考残渣）：不结束回合，自动替用户补发「继续」。
+        // 与下方原生分支同理：此处到达时本轮未发起工具调用，补发协议合法。
         // 续发上限 3 次：模型反复输出不完整回复时（如永远撑爆 max_tokens 的超大 JSON），
         // 无限续发会无限烧 token——超限后落库可见部分并按普通回复结束回合
-        if !native_mode && looks_truncated(&reply) && continues < 3 {
+        if looks_truncated(&reply) && continues < 3 {
             continues += 1;
-            let visible = strip_tool_json(&strip_think_blocks(&reply));
+            // 自动接续时去掉「可回复继续」标注：程序替用户续发，提示已无意义
+            let visible = strip_tool_json(&strip_think_blocks(&reply))
+                .replace(crate::ai::TRUNCATION_NOTICE, "")
+                .trim()
+                .to_string();
             if !visible.is_empty() {
                 let mut msg = ChatMessage::assistant(visible);
                 msg.thinking = opt_thinking(&round_thinking);
@@ -1214,11 +1219,18 @@ pub async fn chat_turn_stream(
             continue;
         }
 
-        // 回复不完整（截断/纯思考残渣）：不结束回合，自动补发「继续」（仅文本约定模式）。
+        // 回复不完整（截断/纯思考残渣）：不结束回合，自动补发「继续」。
+        // 文本约定模式与原生 function calling 模式都启用：原生模式到达此分支
+        // 意味着本轮没有发起工具调用（有调用的分支在上面已 continue），
+        // 此时上下文末尾是普通 assistant/user 消息，补发「继续」协议合法。
         // 续发上限 3 次：模型反复截断时超限落库可见部分并结束回合，避免无限烧 token
-        if !native_mode && looks_truncated(&reply) && continues < 3 {
+        if looks_truncated(&reply) && continues < 3 {
             continues += 1;
-            let visible = strip_tool_json(&strip_think_blocks(&reply));
+            // 自动接续时去掉「可回复继续」标注：程序替用户续发，提示已无意义
+            let visible = strip_tool_json(&strip_think_blocks(&reply))
+                .replace(crate::ai::TRUNCATION_NOTICE, "")
+                .trim()
+                .to_string();
             if !visible.is_empty() {
                 let mut msg = ChatMessage::assistant(visible.clone());
                 msg.thinking = opt_thinking(&round_thinking);
@@ -1409,6 +1421,12 @@ fn looks_truncated(reply: &str) -> bool {
     if t.is_empty() {
         return true;
     }
+    // finish_reason=length 的显式截断标注（ai 层追加）：最可靠信号。
+    // 截断常落在句号等"看起来完整"的位置，其他启发式全部漏判——官方 API
+    // （DeepSeek/千问）老老实实返回 length，此前就因漏判这里而要用户手动发「继续」
+    if t.contains(crate::ai::TRUNCATION_NOTICE) {
+        return true;
+    }
     if strip_think_blocks(t).trim().is_empty() {
         return true;
     }
@@ -1431,7 +1449,7 @@ fn looks_truncated(reply: &str) -> bool {
 }
 
 /// 自动续发时补给模型的消息
-const CONTINUE_PROMPT: &str = "继续（你上一条回复未输出完整就被截断了：若要调用工具请按协议单独一行输出 JSON 数组；如需写入大文件，请拆成多次较小的写入避免单次输出过长；若已完成请直接给出最终答案）";
+const CONTINUE_PROMPT: &str = "继续（你上一条回复未输出完整就被截断了，从中断处直接往下写，不要重复已输出的内容；若要调用工具请按协议单独一行输出 JSON 数组；如需写入大文件，请拆成多次较小的写入避免单次输出过长；若已完成请直接给出最终答案）";
 
 /// 扫描 JSON 文本（对象/字符串状态机），到达末尾时是否仍未闭合
 fn is_unbalanced_json(text: &str) -> bool {
@@ -1950,6 +1968,23 @@ mod tests {
     fn test_empty_reply_is_truncated() {
         assert!(looks_truncated(""));
         assert!(looks_truncated("   \n  "));
+    }
+
+    /// finish_reason=length 的显式截断标注必须判为截断（官方 API 的
+    /// length 截断常落在句号收尾处，其他启发式全部漏判 → 用户被迫手动发「继续」）
+    #[test]
+    fn test_truncation_notice_is_truncated() {
+        // 句号收尾 + 标注：此前漏判的真实场景
+        assert!(looks_truncated(&format!(
+            "前半部分正常收尾。{}",
+            crate::ai::TRUNCATION_NOTICE
+        )));
+        assert!(looks_truncated(&format!(
+            "代码如下：\n```python\nprint(1)\n```{}",
+            crate::ai::TRUNCATION_NOTICE
+        )));
+        // 干净回复（无标注）不得误判
+        assert!(!looks_truncated("清理完成，共删除 12 个文件。"));
     }
 
     /// 截图中的真实案例：write_file 的 content 输出到一半被截断——

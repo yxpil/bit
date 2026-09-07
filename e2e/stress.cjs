@@ -24,6 +24,7 @@ function call(path, body, timeout = 300000) {
   });
 }
 
+// S2 并发 8 路的前提：默认每 IP 并发上限是 3，先抬高再跑（独立实例时不依赖 run.cjs 的恢复状态）
 async function chat(session, message) {
   const r = await call("/api/chat", { session_id: session, message });
   let json = {};
@@ -54,6 +55,8 @@ const record = (name, ok, detail = "") => {
 };
 
 async function main() {
+// S2 并发 8 路的前提：默认每 IP 并发上限是 3，先抬高再跑（独立实例时不依赖 run.cjs 的恢复状态）
+try { await call("/api/debug/config", { max_active_per_ip: 16, chat_rate_reset: true }); } catch {}
 
 // ── L1 上行长文本：100KB 消息完整转发到上游 ──
 {
@@ -92,14 +95,18 @@ async function main() {
   );
 }
 
-// ── F2 max_tokens 截断：finish_reason=length → 正文尾部显式标注 ──
+// ── F2 max_tokens 截断：finish_reason=length → BIT 自动补发「继续」接续后半段，
+//    用户无需手动发「继续」；落库消息不得残留截断标注 ──
 {
   const r = await chat("stress-length", "E2E-CMD-LENGTH");
-  const rep = r.reply || "";
+  const msgs = r.messages || [];
+  const lastA = [...msgs].reverse().find((m) => m.role === "assistant");
+  const allText = msgs.map((m) => m.content || "").join("\n");
   record(
-    "F2 截断显式标注",
-    r.code === 200 && rep.includes("回答的前半部分") && rep.includes("达到最大输出长度被截断"),
-    `code=${r.code} tail=${rep.slice(-30)}`
+    "F2 截断自动接续",
+    r.code === 200 && allText.includes("回答的前半部分") && allText.includes("后半部分续写完成")
+      && lastA && lastA.content.includes("后半部分续写完成") && !lastA.content.includes("达到最大输出长度被截断"),
+    `code=${r.code} msgs=${msgs.length} tail=${lastA ? String(lastA.content).slice(-30) : "-"}`
   );
 }
 

@@ -389,7 +389,26 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ error: { message: "mock hard upstream failure" } }));
     }
 
-    // 压测-max_tokens 截断：finish_reason=length（验证 BIT 显式标注截断而不是默默断句）
+    // 压测-max_tokens 截断：finish_reason=length → BIT 应自动补发「继续」，
+    // 续写轮（last 为 CONTINUE_PROMPT，标记在历史里）返回后半部分 + stop，
+    // 验证自动接续闭环
+    const histAll = messages.map(contentText).join("\n");
+    if (histAll.includes("E2E-CMD-LENGTH") && last.startsWith("继续（你上一条回复未输出完整就被截断了")) {
+      const content = "后半部分续写完成，全部内容已补齐";
+      if (sse) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({
+        id: "mock", object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+        usage: usageFor(messages),
+      }));
+    }
     if (last.includes("E2E-CMD-LENGTH")) {
       const content = "回答的前半部分，然后长度到上限了";
       if (sse) {
