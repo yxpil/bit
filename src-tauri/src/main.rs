@@ -76,19 +76,19 @@ fn main() {
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
     }
 
-    let mut builder = tauri::Builder::default();
+    let mut builder = tauri::Builder::default()
+        // 以下插件 TUI 与桌面端共用：autostart 开机自启、notification 系统通知
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
     if !tui_mode {
         // 单实例保护：仅桌面端注册（TUI 需要能与桌面端同时运行）；
         // 二次启动时唤起已有实例的主窗口后退出新进程
-        builder = builder
-            .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-                tray::show_main_window(app);
-            }))
-            .plugin(tauri_plugin_notification::init())
-            .plugin(tauri_plugin_autostart::init(
-                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-                None,
-            ));
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_main_window(app);
+        }));
     }
     builder
         .setup(move |app| {
