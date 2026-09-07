@@ -147,6 +147,26 @@ fn run_compiled(
                 Err(e) => Err(format!("compiler: {e}")),
             }
         }
+        // Swift：swiftc 编译成可执行文件后运行
+        "swift" => {
+            let src = work.join("main.swift");
+            let bin = work.join(if cfg!(windows) { "main.exe" } else { "main" });
+            write_private(&src, code).map_err(|e| format!("Failed to write source: {e}"))?;
+            let mut compile = Command::new(&rt.path); // swiftc
+            compile.arg(&src).arg("-o").arg(&bin);
+            crate::registry::no_window(&mut compile);
+            match run_with_limit(compile, None, CHILD_TIMEOUT) {
+                Ok(o) if o.status.success() => {
+                    let cmd = Command::new(&bin);
+                    run_with_limit(cmd, Some(params), CHILD_TIMEOUT)
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    Err(format!("Swift compilation failed:\n{}", crate::registry::safe_trunc(&err, 4000)))
+                }
+                Err(e) => Err(format!("swiftc: {e}")),
+            }
+        }
         other => Err(format!("Compiled language not supported yet: {other}")),
     };
 

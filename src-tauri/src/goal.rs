@@ -197,15 +197,18 @@ pub fn rewrite_todos(
     }
     let mut count = 0;
     for item in items {
-        let content = item.get("content").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
+        // 同时支持 string 和 object：schema 允许 string[]，但 object[] 更丰富
+        let (content, status_str) = if let Some(s) = item.as_str() {
+            (s.trim().to_string(), "pending".to_string())
+        } else {
+            let c = item.get("content").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
+            let s = item.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+            (c, s)
+        };
         if content.is_empty() {
             continue;
         }
-        let status = item
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("pending");
-        let status = normalize_todo_status(status).unwrap_or("pending").to_string();
+        let status = normalize_todo_status(&status_str).unwrap_or("pending").to_string();
         todos.push(Todo {
             id: uuid::Uuid::new_v4().simple().to_string(),
             ts: now(),

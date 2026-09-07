@@ -80,8 +80,10 @@ fn candidates() -> Vec<(&'static str, &'static str, &'static str, &'static str, 
 fn probe(cmd: &str, version_arg: &str) -> Option<(String, String)> {
     // 版本探测参数可能含空格（powershell），拆分处理
     let args: Vec<&str> = version_arg.split(' ').filter(|s| !s.is_empty()).collect();
+    // 先解析可执行文件的绝对路径（macOS .app 进程 PATH 很干净，which 会扫常见路径兜底）
+    let exe_path = which(cmd)?;
     // 启动时批量探测，必须隐藏子进程控制台窗口（否则启动瞬间黑窗闪烁）
-    let mut c = Command::new(cmd);
+    let mut c = Command::new(&exe_path);
     c.args(&args);
     crate::registry::no_window(&mut c);
     let output = c.output().ok()?;
@@ -94,26 +96,62 @@ fn probe(cmd: &str, version_arg: &str) -> Option<(String, String)> {
     }
     // 取首行、去掉多余前缀
     let ver = ver.lines().next().unwrap_or("").trim().to_string();
-    // 尝试解析可执行文件的真实路径
-    let path = which(cmd).unwrap_or_else(|| cmd.to_string());
-    Some((path, if ver.is_empty() { "unknown".into() } else { ver }))
+    Some((exe_path, if ver.is_empty() { "unknown".into() } else { ver }))
 }
 
 /// 类似 `where` / `which`：定位命令的绝对路径
+/// macOS .app 进程 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，扫常见用户路径兜底
 fn which(cmd: &str) -> Option<String> {
     #[cfg(windows)]
-    let finder = "where";
-    #[cfg(not(windows))]
-    let finder = "which";
-    let mut c = Command::new(finder);
-    c.arg(cmd);
-    crate::registry::no_window(&mut c);
-    let out = c.output().ok()?;
-    if !out.status.success() {
-        return None;
+    {
+        let mut c = Command::new("where");
+        c.arg(cmd);
+        crate::registry::no_window(&mut c);
+        let out = c.output().ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = s.lines().next() {
+                let p = line.trim().to_string();
+                if !p.is_empty() { return Some(p); }
+            }
+        }
+        None
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
+    #[cfg(not(windows))]
+    {
+        // 1) 先试原生 which（PATH 正确时最快）
+        let mut c = Command::new("which");
+        c.arg(cmd);
+        crate::registry::no_window(&mut c);
+        if let Ok(out) = c.output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout);
+                if let Some(line) = s.lines().next() {
+                    let p = line.trim().to_string();
+                    if !p.is_empty() { return Some(p); }
+                }
+            }
+        }
+        // 2) 原生 which 失败 → 扫常见路径（解决 macOS .app PATH 过干净的问题）
+        let home = std::env::var("HOME").unwrap_or_default();
+        let candidates: &[String] = &[
+            format!("/usr/local/bin/{cmd}"),
+            format!("/opt/homebrew/bin/{cmd}"),
+            format!("{home}/.cargo/bin/{cmd}"),
+            format!("{home}/.bun/bin/{cmd}"),
+            format!("{home}/.npm-global/bin/{cmd}"),
+            format!("{home}/.local/bin/{cmd}"),
+            format!("/usr/local/go/bin/{cmd}"),
+            format!("/snap/bin/{cmd}"),
+        ];
+        for path in candidates {
+            let p = std::path::Path::new(path);
+            if p.exists() {
+                return Some(path.clone());
+            }
+        }
+        None
+    }
 }
 
 /// 扫描本机可用运行时
