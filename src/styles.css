@@ -41,11 +41,21 @@
     --accent-fg: #171717;
   }
   body {
-    @apply bg-white text-neutral-900 antialiased;
+    @apply antialiased;
     font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   }
-  .dark body {
-    @apply bg-neutral-900 text-neutral-100;
+  html, body {
+    background-color: transparent;
+  }
+  /* 默认外观：保持 v0.5.22 的"边框白、内部深灰"交换方案
+     #root::before 提供窗口底色，.card 是稍深的内容区 */
+  #root::before {
+    background-color: #ffffff;
+    color-scheme: light;
+  }
+  .dark #root::before {
+    background-color: #0a0a0a;
+    color-scheme: dark;
   }
   /* 滚动条：悬浮小胶囊。thumb 用透明边框内缩（background-clip: padding-box），
      上下端不贴轨道两端、左右不贴容器边缘，圆角容器里也不会顶出圆角 */
@@ -152,6 +162,30 @@
   .dark .icon-btn {
     @apply bg-neutral-900 text-neutral-300 hover:bg-neutral-800 hover:text-white;
   }
+
+  /* ========== 外观引擎：圆角/边框/阴影变量 ========== */
+  /* 默认卡片圆角：24px；无外观配置时就是原始值 */
+  #root {
+    position: relative;
+    isolation: isolate;
+  }
+  /* 让 card / pill / 外层容器的圆角可被 --look-*-radius 覆盖 */
+  .card {
+    border-radius: var(--look-card-radius, 1.5rem);
+  }
+  /* no-border：全局去边框 */
+  html.no-border .card,
+  html.no-border .pill,
+  html.no-border .chip {
+    border: none !important;
+  }
+  /* no-shadow：全局去阴影 */
+  html.no-shadow .card {
+    box-shadow: none !important;
+  }
+  html.no-shadow .pill {
+    box-shadow: none !important;
+  }
 }
 
 /* 入场动画：轻微上浮 + 淡入（页眉仪表盘、会话行、工具卡片） */
@@ -167,4 +201,35 @@
 }
 .anim-rise {
   animation: bit-rise 0.28s var(--ease-pill) both;
+}
+
+/* ========== 背景图 + 遮罩层 ========== */
+#root::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background-color: inherit; /* 从 body/#root 的默认色继承 */
+  background-image: var(--app-bg-image, none);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  opacity: var(--look-bg-opacity, 1);
+  transition: background-image 0.3s ease, opacity 0.3s ease;
+}
+/* 半透明黑遮罩，确保背景图上的文字可读 */
+#root::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background: transparent;
+  pointer-events: none;
+}
+html.has-bg-image #root::after {
+  background: rgba(0, 0, 0, 0.35);
+}
+html.dark.has-bg-image #root::after {
+  background: rgba(0, 0, 0, 0.45);
 }

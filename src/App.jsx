@@ -14,6 +14,7 @@ import SkillsPage from "./pages/SkillsPage.jsx";
 import AuditPage from "./pages/AuditPage.jsx";
 import RemotePage from "./pages/RemotePage.jsx";
 import AiSettingsPage from "./pages/AiSettingsPage.jsx";
+import ThemePage from "./pages/ThemePage.jsx";
 import {
   IconChat,
   IconTool,
@@ -51,12 +52,13 @@ const PAGES = {
   audit: { label: "nav.audit", icon: IconAudit, page: AuditPage },
   remote: { label: "nav.remote", icon: IconGlobe, page: RemotePage },
   ai: { label: "nav.ai", icon: IconSettings, page: AiSettingsPage },
+  theme: { label: "nav.theme", icon: IconShirt, page: ThemePage },
 };
 
 // 主功能：对话（AI 助手本体）单独置顶
 const PRIMARY = "chat";
 // 次级功能：分组列在下方
-const SECONDARY = ["tools", "memory", "skills", "audit", "remote", "ai"];
+const SECONDARY = ["tools", "memory", "skills", "audit", "remote", "ai", "theme"];
 
 export default function App() {
   const [tab, setTab] = useState("chat");
@@ -188,7 +190,7 @@ export default function App() {
   );
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-white text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100">
+    <div className="flex h-screen flex-col overflow-hidden text-neutral-900 dark:text-neutral-100">
       <TitleBar />
 
       {/* 端口切换提示条：远程端口被占用已自动切换（可关闭，纯色不透明） */}
