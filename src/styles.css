@@ -48,13 +48,14 @@
     background-color: transparent;
   }
   /* 默认外观：保持 v0.5.22 的"边框白、内部深灰"交换方案
-     #root::before 提供窗口底色，.card 是稍深的内容区 */
+     #root::before 提供窗口底色，.card 是稍深的内容区
+     当 look.enabled=true 时由第 207 行的 #root::before 覆盖此处 */
   #root::before {
-    background-color: #ffffff;
+    background-color: var(--look-bg-color-light, #ffffff);
     color-scheme: light;
   }
   .dark #root::before {
-    background-color: #0a0a0a;
+    background-color: var(--look-bg-color-dark, #0a0a0a);
     color-scheme: dark;
   }
   /* 滚动条：悬浮小胶囊。thumb 用透明边框内缩（background-clip: padding-box），
@@ -203,20 +204,23 @@
   animation: bit-rise 0.28s var(--ease-pill) both;
 }
 
-/* ========== 背景图 + 遮罩层 ========== */
+/* ========== 背景（纯色 + 可选图片 + 透明度遮罩） ========== */
 #root::before {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -2;
-  background-color: inherit; /* 从 body/#root 的默认色继承 */
+  background-color: var(--look-bg-color-light, #ffffff);
   background-image: var(--app-bg-image, none);
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
   background-attachment: fixed;
   opacity: var(--look-bg-opacity, 1);
-  transition: background-image 0.3s ease, opacity 0.3s ease;
+  transition: background-color 0.2s ease, background-image 0.3s ease, opacity 0.3s ease;
+}
+.dark #root::before {
+  background-color: var(--look-bg-color-dark, #0a0a0a);
 }
 /* 半透明黑遮罩，确保背景图上的文字可读 */
 #root::after {

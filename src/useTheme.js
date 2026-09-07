@@ -38,9 +38,7 @@ function applyLook(look) {
   if (!look || !look.enabled) {
     // 恢复默认
     root.style.removeProperty("--app-bg-image");
-    root.style.removeProperty("--look-border-radius");
     root.style.removeProperty("--look-card-radius");
-    root.style.removeProperty("--look-shadow");
     root.style.removeProperty("--look-bg-color-light");
     root.style.removeProperty("--look-bg-color-dark");
     root.style.removeProperty("--look-bg-opacity");
@@ -65,7 +63,6 @@ function applyLook(look) {
   }
 
   // 圆角
-  root.style.setProperty("--look-border-radius", (look.borderRadius ?? 0) + "px");
   root.style.setProperty("--look-card-radius", (look.cardRadius ?? 24) + "px");
 
   // 边框 & 阴影开关
