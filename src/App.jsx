@@ -188,7 +188,7 @@ export default function App() {
   );
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-neutral-100 text-neutral-900 dark:bg-black dark:text-neutral-100">
+    <div className="flex h-screen flex-col overflow-hidden bg-white text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100">
       <TitleBar />
 
       {/* 端口切换提示条：远程端口被占用已自动切换（可关闭，纯色不透明） */}

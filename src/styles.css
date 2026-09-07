@@ -41,11 +41,11 @@
     --accent-fg: #171717;
   }
   body {
-    @apply bg-neutral-100 text-neutral-900 antialiased;
+    @apply bg-white text-neutral-900 antialiased;
     font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   }
   .dark body {
-    @apply bg-black text-neutral-100;
+    @apply bg-neutral-900 text-neutral-100;
   }
   /* 滚动条：悬浮小胶囊。thumb 用透明边框内缩（background-clip: padding-box），
      上下端不贴轨道两端、左右不贴容器边缘，圆角容器里也不会顶出圆角 */
@@ -119,11 +119,11 @@
   }
   /* 卡片 */
   .card {
-    @apply rounded-3xl border border-neutral-200 bg-white p-5;
+    @apply rounded-3xl border border-neutral-200 bg-neutral-100 p-5;
     box-shadow: var(--shadow-card);
   }
   .dark .card {
-    @apply border-neutral-800 bg-neutral-950;
+    @apply border-neutral-800 bg-neutral-900;
   }
   /* 数据小圆片 */
   .chip {
