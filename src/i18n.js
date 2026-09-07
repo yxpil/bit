@@ -137,7 +137,6 @@ const dict = {
     // 主题
     "theme.accent": "主题色",
     "theme.custom": "自定义颜色",
-    "theme.reset": "恢复默认",
     "chat.newChat": "新对话",
     "chat.noSessions": "暂无对话",
     "chat.running": "执行中",
@@ -561,7 +560,6 @@ const dict = {
     // Theme
     "theme.accent": "Accent color",
     "theme.custom": "Custom color",
-    "theme.reset": "Default",
     "chat.newChat": "New chat",
     "chat.noSessions": "No conversations yet",
     "chat.running": "Running",

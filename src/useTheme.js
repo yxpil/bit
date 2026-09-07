@@ -94,7 +94,7 @@ export function useTheme() {
     try {
       const raw = localStorage.getItem(LOOK_KEY);
       if (raw) return { ...DEFAULT_LOOK, ...JSON.parse(raw) };
-    } catch {}
+    } catch { /* ignore bad JSON */ }
     return { ...DEFAULT_LOOK };
   });
 
