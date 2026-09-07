@@ -1069,98 +1069,158 @@ fn ctx_key(base: &str, id: &str) -> String {
     format!("{}|{id}", base.trim().trim_end_matches('/'))
 }
 
-/// 从提供方 API 拉取可用模型列表（含尽力获取的上下文长度）：
+/// 从提供方 API 拉取可用模型列表（含尽力获取的上下文长度），返回 (生效 base, models)：
 /// - openai 兼容：GET {base}/models（Bearer Key）
 /// - gemini：GET {base}/v1beta/models?key=（inputTokenLimit；name 去 "models/" 前缀）
 /// - claude：GET {base}/v1/models（x-api-key + anthropic-version；无上下文字段用家族默认）
+/// 自动检测：openai 兼容端点要求 base 以 /v1 结尾，用户漏写时自动补试 {base}/v1；
+/// claude/gemini 由本函数拼路径前缀，用户多写 /v1、/v1beta 时自动去掉再试。
+/// 返回第一个拿到合法模型列表的 base，前端据此把输入框纠正为可直接对话的端点。
 pub async fn fetch_provider_models(
     protocol: &str,
     base_url: &str,
     api_key: &str,
-) -> Result<Vec<(String, Option<u64>)>, String> {
+) -> Result<(String, Vec<(String, Option<u64>)>), String> {
     let base = base_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
         return Err("Base URL 不能为空".into());
     }
-    let url = match protocol {
-        "gemini" => format!("{base}/v1beta/models?pageSize=200&key={api_key}"),
-        "claude" => format!("{base}/v1/models?limit=1000"),
-        _ => format!("{base}/models"),
-    };
+    // 候选 base：按可能性排序，第一个是用户原输入（归一化后）
+    let mut candidates: Vec<String> = vec![base.clone()];
+    match protocol {
+        "gemini" => {
+            if let Some(stripped) = base.strip_suffix("/v1beta") {
+                candidates.insert(0, stripped.to_string());
+            }
+        }
+        "claude" => {
+            if let Some(stripped) = base.strip_suffix("/v1") {
+                candidates.insert(0, stripped.to_string());
+            }
+        }
+        _ => {
+            if !base.ends_with("/v1") {
+                candidates.push(format!("{base}/v1"));
+            }
+        }
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut req = client.get(&url);
-    match protocol {
-        "gemini" => {} // Key 已在查询参数中
-        "claude" => {
-            req = req
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        }
-        _ => {
-            if !api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {api_key}"));
+
+    let mut last_err = String::new();
+    for cand in &candidates {
+        let url = match protocol {
+            "gemini" => format!("{cand}/v1beta/models?pageSize=200&key={api_key}"),
+            "claude" => format!("{cand}/v1/models?limit=1000"),
+            _ => format!("{cand}/models"),
+        };
+        let mut req = client.get(&url);
+        match protocol {
+            "gemini" => {} // Key 已在查询参数中
+            "claude" => {
+                req = req
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01");
+            }
+            _ => {
+                if !api_key.is_empty() {
+                    req = req.header("Authorization", format!("Bearer {api_key}"));
+                }
             }
         }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("请求失败: {e}");
+                continue;
+            }
+        };
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            // 错误体常含服务端原始 message，优先透传
+            let msg = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/message")
+                        .and_then(|m| m.as_str())
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| crate::registry::safe_trunc(&body_text, 200));
+            last_err = format!("HTTP {status}: {msg}");
+            continue;
+        }
+        let looks_html = ct.starts_with("text/html") || body_text.trim_start().starts_with('<');
+        let body: serde_json::Value = match serde_json::from_str(&body_text) {
+            Ok(v) => v,
+            Err(_) => {
+                last_err = if looks_html {
+                    "该地址返回的是网页而非 API 响应：OpenAI 兼容端点的 Base URL 通常要以 /v1 结尾（例如 https://example.com/v1）".to_string()
+                } else {
+                    format!("响应不是有效的模型列表 JSON（content-type: {ct}）")
+                };
+                continue;
+            }
+        };
+        let has_list = body.get("data").and_then(|v| v.as_array()).is_some()
+            || body.get("models").and_then(|v| v.as_array()).is_some();
+        if !has_list {
+            last_err = "响应里没有模型列表（缺少 data / models 字段），请确认这是 API 端点而非网页地址".to_string();
+            continue;
+        }
+        let mut models: Vec<(String, Option<u64>)> = match protocol {
+            "gemini" => body
+                .get("models")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let id = m.get("name")?.as_str()?.trim_start_matches("models/").to_string();
+                            let len = m.get("inputTokenLimit").and_then(|v| v.as_u64());
+                            Some((id, len))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            "claude" => body
+                .get("data")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let id = m.get("id")?.as_str()?.to_string();
+                            let len = claude_context_for(&id);
+                            Some((id, len))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => body
+                .get("data")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let id = m.get("id")?.as_str()?.to_string();
+                            Some((id, context_len_from(m)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        models.sort_by(|a, b| a.0.cmp(&b.0));
+        models.dedup_by(|a, b| a.0 == b.0);
+        return Ok((cand.clone(), models));
     }
-    let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
-    let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("响应解析失败: {e}"))?;
-    if !status.is_success() {
-        let msg = body
-            .pointer("/error/message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        return Err(format!("HTTP {status}: {msg}"));
-    }
-    let mut models: Vec<(String, Option<u64>)> = match protocol {
-        "gemini" => body
-            .get("models")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| {
-                        let id = m.get("name")?.as_str()?.trim_start_matches("models/").to_string();
-                        let len = m.get("inputTokenLimit").and_then(|v| v.as_u64());
-                        Some((id, len))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        "claude" => body
-            .get("data")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| {
-                        let id = m.get("id")?.as_str()?.to_string();
-                        let len = claude_context_for(&id);
-                        Some((id, len))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        _ => body
-            .get("data")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| {
-                        let id = m.get("id")?.as_str()?.to_string();
-                        Some((id, context_len_from(m)))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
-    models.sort_by(|a, b| a.0.cmp(&b.0));
-    models.dedup_by(|a, b| a.0 == b.0);
-    Ok(models)
+    Err(last_err)
 }
 
 /// 把拉取到的上下文长度并入 ai_config.model_context 持久缓存并落盘
@@ -1178,8 +1238,9 @@ fn persist_model_context(ctx: &Arc<Ctx>, base_url: &str, models: &[(String, Opti
 
 /// 启动/配置变更时后台刷新激活提供方的模型上下文缓存（失败静默）
 pub async fn refresh_model_context(ctx: &Arc<Ctx>, protocol: &str, base_url: &str, api_key: &str) {
-    if let Ok(models) = fetch_provider_models(protocol, base_url, api_key).await {
-        persist_model_context(ctx, base_url, &models);
+    // 用自动检测后的生效 base 落缓存：与前端纠正后保存的 provider base 对齐
+    if let Ok((effective, models)) = fetch_provider_models(protocol, base_url, api_key).await {
+        persist_model_context(ctx, &effective, &models);
     }
 }
 
@@ -1195,21 +1256,25 @@ pub fn active_max_context(ctx: &Arc<Ctx>) -> Option<u64> {
 }
 
 /// 从提供方 API 拉取可用模型列表（顺带把上下文长度写入持久缓存）：
-/// 返回 [{id, context_length}]，context_length 为 null 表示该端点未提供
+/// 返回 {base, models}，base 为自动检测后的生效端点（纠正过 /v1 时前端据此回填输入框），
+/// models 元素为 {id, context_length}，context_length 为 null 表示该端点未提供
 #[tauri::command]
 pub async fn list_provider_models(
     state: State<'_, Arc<Ctx>>,
     protocol: String,
     base_url: String,
     api_key: String,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    let models = fetch_provider_models(&protocol, &base_url, &api_key).await?;
-    persist_model_context(&ctx, &base_url, &models);
-    Ok(models
-        .into_iter()
-        .map(|(id, len)| json!({ "id": id, "context_length": len }))
-        .collect())
+    let (effective, models) = fetch_provider_models(&protocol, &base_url, &api_key).await?;
+    persist_model_context(&ctx, &effective, &models);
+    Ok(json!({
+        "base": effective,
+        "models": models
+            .into_iter()
+            .map(|(id, len)| json!({ "id": id, "context_length": len }))
+            .collect::<Vec<_>>(),
+    }))
 }
 
 /// AI 接收信息预览：当前会话实际发给模型的 system prompt / 消息 / 工具清单
@@ -2462,7 +2527,7 @@ mod tests {
             eprintln!("跳过：未设置 BIT_FAKE_OPENAI_URL");
             return;
         };
-        let models = super::fetch_provider_models("openai", &base, "")
+        let (effective, models) = super::fetch_provider_models("openai", &base, "")
             .await
             .unwrap();
         let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
@@ -2470,5 +2535,9 @@ mod tests {
             ids.contains(&"mock-model-a") && ids.contains(&"mock-model-b"),
             "应返回 mock 的模型列表: {models:?}"
         );
+        // 自动检测：无论 env 里写没写 /v1，生效 base 都应是能拉到列表的那个端点
+        let norm = base.trim_end_matches('/').to_string();
+        let expect = if norm.ends_with("/v1") { norm } else { format!("{norm}/v1") };
+        assert_eq!(effective, expect, "生效 base 应为自动检测后的端点");
     }
 }

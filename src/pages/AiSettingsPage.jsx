@@ -49,6 +49,7 @@ export default function AiSettingsPage({ onStats, stats }) {
   const [remoteModels, setRemoteModels] = useState(null);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [fetchModelsErr, setFetchModelsErr] = useState("");
+  const [baseHint, setBaseHint] = useState("");
   // 高权限模式：elevation=null=探测中；elevErr=上次授权失败原因（v0.5.14 黑屏修复：声明漏写导致渲染期 ReferenceError 整树卸载）
   const [elevation, setElevation] = useState(null);
   const [elevErr, setElevErr] = useState("");
@@ -140,9 +141,17 @@ export default function AiSettingsPage({ onStats, stats }) {
   const fetchModels = async () => {
     setFetchingModels(true);
     setFetchModelsErr("");
+    setBaseHint("");
     try {
-      const list = await api.listProviderModels(form.protocol, form.base_url, form.api_key);
+      // 后端返回 {base, models}：base 为自动检测后的生效端点（如补了 /v1）
+      const res = await api.listProviderModels(form.protocol, form.base_url, form.api_key);
+      const list = Array.isArray(res) ? res : res?.models || [];
       setRemoteModels(list);
+      const effective = Array.isArray(res) ? null : res?.base;
+      if (effective && effective !== form.base_url.trim().replace(/\/+$/, "")) {
+        setForm((f) => ({ ...f, base_url: effective }));
+        setBaseHint(t("ai.baseAutoFixed").replace("{base}", effective));
+      }
     } catch (err) {
       setRemoteModels(null);
       setFetchModelsErr(String(err));
@@ -565,6 +574,9 @@ export default function AiSettingsPage({ onStats, stats }) {
           />
           {fetchModelsErr && (
             <p className="mt-1 px-2 text-[11px] text-red-600">{fetchModelsErr}</p>
+          )}
+          {baseHint && !fetchModelsErr && (
+            <p className="mt-1 px-2 text-[11px] text-emerald-600 dark:text-emerald-400">{baseHint}</p>
           )}
           {Array.isArray(remoteModels) && remoteModels.length > 0 && (
             <div className="mt-2 max-h-40 overflow-y-auto rounded-xl border border-neutral-200/80 dark:border-neutral-800">
