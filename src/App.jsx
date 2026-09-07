@@ -318,7 +318,7 @@ export default function App() {
             <div className="mt-4 flex flex-col items-center gap-1.5">
               <div className="rounded-xl border border-neutral-200 bg-white p-2 dark:border-neutral-700">
                 {androidQr ? (
-                  <div className="h-28 w-28 [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: androidQr }} />
+                  <div className="h-28 w-28 aspect-square [&>svg]:block [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: androidQr }} />
                 ) : (
                   <div className="flex h-28 w-28 items-center justify-center text-xs text-neutral-400">…</div>
                 )}
