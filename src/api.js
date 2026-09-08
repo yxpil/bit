@@ -39,12 +39,16 @@ export const api = {
   getSystemPrompt: () => invoke("get_system_prompt"),
   setSystemPrompt: (system_prompt) => invoke("set_system_prompt", { systemPrompt: system_prompt }),
   getBehaviorSettings: () => invoke("get_behavior_settings"),
-  setBehaviorSettings: (auto_drive, tool_approval, moderation_enabled, auto_delegate) =>
+  // blocked_words 敏感词表：传数组=整体替换；传 [] = 恢复内置默认；不传 = 保持原值
+  setBehaviorSettings: (auto_drive, tool_approval, moderation_enabled, auto_delegate, compat_mode, subagent_max, blocked_words) =>
     invoke("set_behavior_settings", {
       autoDrive: auto_drive,
       toolApproval: tool_approval,
       moderationEnabled: moderation_enabled,
       autoDelegate: auto_delegate,
+      compatMode: compat_mode,
+      subagentMax: subagent_max ?? 3,
+      blockedWords: blocked_words,
     }),
   // 子代理（宿主调度）：模型侧无此工具，只有宿主/用户能派生
   spawnSubagent: (task, title, session_id) =>
@@ -64,8 +68,6 @@ export const api = {
     invoke("update_provider", { id, name, protocol, baseUrl: base_url, apiKey: api_key, model }),
   removeProvider: (id) => invoke("remove_provider", { id }),
   setProviderActive: (id, active) => invoke("set_provider_active", { id, active }),
-  // 文本协议降级开关（逐家提供方，默认关）：端点拒绝 tools 参数时是否自动降级
-  setProviderTextFallback: (id, allowed) => invoke("set_provider_text_fallback", { id, allowed }),
   // 模型采样参数：temperature null=默认（0-2）；reasoningEffort ""=默认 / low / medium / high
   getAiParams: () => invoke("get_ai_params"),
   setAiParams: (temperature, reasoning_effort) =>
@@ -120,6 +122,12 @@ export const api = {
   setAutostart: (enabled) => invoke("set_autostart", { enabled }),
   getElevation: () => invoke("get_elevation"),
   setElevation: (enabled) => invoke("set_elevation", { enabled }),
+  // 自动运行：后台自主循环（记忆总结 / 技能提炼 / 目标行动），AI 设置里的圆钮开关
+  toggleAutopilot: () => invoke("toggle_autopilot"),
+  // ── 版本更新：检查 / 后台下载（进度走 update-progress 事件）/ 换装重启 ──
+  checkUpdates: () => invoke("check_updates"),
+  updateDownload: () => invoke("update_download"),
+  updateApply: () => invoke("update_apply"),
   getToolStats: () => invoke("get_tool_stats"),
   getDiagnostics: () => invoke("get_diagnostics"),
   contextPreview: (session_id) => invoke("context_preview", { sessionId: session_id || "" }),

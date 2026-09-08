@@ -916,10 +916,11 @@ async fn invoke_tool(
 // 均在 /api/* 双重认证（Client Key + 访问密码）之下。
 
 /// 在途子代理数量
-async fn list_subagents() -> Json<serde_json::Value> {
+async fn list_subagents(State(ctx): State<Arc<Ctx>>) -> Json<serde_json::Value> {
+    let max_concurrent = ctx.config.lock().unwrap().subagent_max;
     Json(json!({
         "running": crate::registry::subagent_depth(),
-        "max_concurrent": crate::delegation::MAX_CONCURRENT,
+        "max_concurrent": max_concurrent,
     }))
 }
 
@@ -1142,6 +1143,10 @@ async fn debug_interrupt(State(ctx): State<Arc<Ctx>>, Json(body): Json<serde_jso
 async fn debug_config(State(ctx): State<Arc<Ctx>>, Json(body): Json<serde_json::Value>) -> Response {
     let (w, t) = {
         let mut cfg = ctx.config.lock().unwrap();
+        if let Some(v) = body.get("compat_mode").and_then(|x| x.as_bool()) {
+            // 兼容模式（文本约定）：E2E 用于整体切换协议族，切换后新会话生效
+            cfg.compat_mode = v;
+        }
         if let Some(v) = body.get("word_repeat_max").and_then(|x| x.as_u64()) {
             cfg.word_repeat_max = (v.min(10000)) as u32;
         }
@@ -1236,8 +1241,8 @@ async fn debug_config(State(ctx): State<Arc<Ctx>>, Json(body): Json<serde_json::
         }
         (cfg.word_repeat_max, cfg.tool_loop_max)
     };
-    // E2E 钩子：运行时切换激活提供方（多协议原生工具调用桥接测试用）。
-    // 与 set_provider_active 同互斥语义；写 ai_config（探测缓存不动，目标提供方首次对话重新探测）
+    // E2E 钩子：运行时切换激活提供方（多协议原生工具调用测试用）。
+    // 与 set_provider_active 同互斥语义，写 ai_config；协议族由全局 compat_mode 钩子决定
     if let Some(v) = body.get("active_provider").and_then(|x| x.as_str()) {
         {
             let mut ai = ctx.ai_config.lock().unwrap();
@@ -1493,9 +1498,6 @@ async fn remote_chat(
 #[derive(serde::Deserialize)]
 struct OaiRequest {
     // 接收但忽略：实际路由始终由 BIT 激活的 Provider 决定
-    #[allow(dead_code)]
-    #[serde(default)]
-    model: String,
     messages: Vec<OaiMessage>,
     #[serde(default)]
     stream: bool,

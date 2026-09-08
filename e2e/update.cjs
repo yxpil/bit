@@ -16,6 +16,14 @@ const MOCK_PORT = 9903;
 const API_PORT = 8766;
 const KEY = "bit_e2e_update_test_key";
 const ASSET_BYTES = 2 * 1024 * 1024;
+// 当前版本从 src-tauri/Cargo.toml 读取（与二进制 env!("CARGO_PKG_VERSION") 同源，避免断言过期）
+const PKG_VERSION = (() => {
+  try {
+    const m = fs.readFileSync(path.join(__dirname, "../src-tauri/Cargo.toml"), "utf8").match(/^version\s*=\s*"([^"]+)"/m);
+    if (m) return m[1];
+  } catch {}
+  return "0.0.0";
+})();
 const results = [];
 const record = (name, ok, detail) => {
   results.push({ name, ok, detail });
@@ -132,7 +140,7 @@ function findConflicts() {
       let chkOk = false;
       try {
         const j = JSON.parse(chk.body);
-        chkOk = chk.code === 200 && j.has_update === true && j.latest === "999.0.0" && j.current === "0.4.9";
+        chkOk = chk.code === 200 && j.has_update === true && j.latest === "999.0.0" && j.current === PKG_VERSION;
       } catch {}
       record("U1 check-has-update", chkOk, `code=${chk.code} body=${chk.body.slice(0, 120)}`);
 

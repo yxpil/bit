@@ -36,11 +36,6 @@ pub async fn run(ctx: Arc<Ctx>) {
     }
 }
 
-/// 立即执行一次总结周期（供「立即总结」按钮远程/本地触发）
-pub async fn tick_public(ctx: &Arc<Ctx>) -> Result<(), String> {
-    tick(ctx).await
-}
-
 /// 自主行动：AI 围绕当前目标/待办，自己决定并调用工具（写代码 / 注册工具 / 沉淀技能 / 更新待办）。
 /// 复用 agent::execute_tool_call 的全套能力，与用户在对话框里手动驱动完全一致，
 /// 区别只是这里由播放开关自动触发、无需用户逐条发消息。
@@ -57,51 +52,60 @@ async fn autonomous_step(ctx: &Arc<Ctx>) -> Result<(), String> {
     }
 
     // 组织一轮自主提示：让 AI 挑一件当前最该推进的事去做。
-    // Autopilot 同属宿主侧调度，优先走原生 function calling（与对话主链路同一套工具契约），
-    // 端点不支持 tools 时才退回文本约定——不再让模型手写裸 JSON 数组。
+    // Autopilot 同属宿主侧调度，与对话主链路共用协议选择——默认走原生 function calling
+    // （与主链路同一套工具契约）；「兼容模式」开启时跳过原生试探、直接用文本约定
+    // （正文单行 JSON 数组），不再先吃一次端点的 400
     let user = "现在处于 Autopilot 自主模式。请审视上面的目标与待办，挑选当前最该推进的【一件】事去做：\
         可以调用工具、用 run_script 临时执行代码、用 add_tool 沉淀为常驻工具、用 skill 沉淀技能、\
         plan_update 标记进度或目标状态。需要行动就直接发起工具调用（互不依赖的调用放在同一轮）；\
         若当前无事可做或全部完成，直接输出一句简短说明，不要发起任何调用。";
 
-    let native = {
-        let convo = vec![
-            ChatMessage::system(ai::system_prompt_native(ctx, None)),
-            ChatMessage::user(user),
-        ];
-        ai::chat_native_round(ctx, &convo, &[], &[]).await
-    };
-    match native {
-        Ok(round) => {
-            // 无调用 = 模型认为当前无需行动，记为一条自主思考
-            if round.calls.is_empty() {
-                let note = round.content.trim();
-                if !note.is_empty() {
-                    crate::audit::record(ctx, "autopilot", "autonomous.idle", "think", json!({ "note": note.chars().take(200).collect::<String>() }), true);
+    let compat = ctx.config.lock().unwrap().compat_mode;
+    if !compat {
+        let native = {
+            let convo = vec![
+                ChatMessage::system(ai::system_prompt_native(ctx, None)),
+                ChatMessage::user(user),
+            ];
+            ai::chat_native_round(ctx, &convo, &[], &[]).await
+        };
+        match native {
+            Ok(round) => {
+                // 无调用 = 模型认为当前无需行动，记为一条自主思考
+                if round.calls.is_empty() {
+                    let note = round.content.trim();
+                    if !note.is_empty() {
+                        crate::audit::record(ctx, "autopilot", "autonomous.idle", "think", json!({ "note": note.chars().take(200).collect::<String>() }), true);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            let mut done = 0;
-            for c in round.calls.iter().take(4) {
-                if c.name.is_empty() {
-                    continue;
-                }
-                match crate::agent::execute_tool_call(ctx, &c.name, &c.args, None).await {
-                    Ok(_) => done += 1,
-                    Err(e) => {
-                        crate::audit::record(ctx, "autopilot", "autonomous.tool_error", &c.name, json!({ "error": e }), false);
+                let mut done = 0;
+                for c in round.calls.iter().take(4) {
+                    if c.name.is_empty() {
+                        continue;
+                    }
+                    match crate::agent::execute_tool_call(ctx, &c.name, &c.args, None).await {
+                        Ok(_) => done += 1,
+                        Err(e) => {
+                            crate::audit::record(ctx, "autopilot", "autonomous.tool_error", &c.name, json!({ "error": e }), false);
+                        }
                     }
                 }
+                crate::audit::record(ctx, "autopilot", "autonomous.step", "act", json!({ "calls": done, "mode": "native" }), true);
+                return Ok(());
             }
-            crate::audit::record(ctx, "autopilot", "autonomous.step", "act", json!({ "calls": done, "mode": "native" }), true);
-            return Ok(());
-        }
-        Err(e) => {
-            crate::audit::record(ctx, "autopilot", "autonomous.native_fallback", "native", json!({ "error": format!("{e:?}") }), false);
+            Err(e) => {
+                crate::audit::record(ctx, "autopilot", "autonomous.native_error", "native", json!({ "error": format!("{e:?}") }), false);
+                // 标准协议不做自动降级：端点拒绝 tools 参数时报错并指路「兼容模式」
+                return Err(format!(
+                    "Autopilot 调用的 AI 端点不支持原生工具调用（{}）。若确认该端点仅支持文本约定，请在「AI 设置 → AI 行为设置」中开启「兼容模式」",
+                    ai::user_err(&format!("{e:?}"))
+                ));
+            }
         }
     }
 
-    // 文本约定兜底：端点不支持原生工具参数时走老路径
+    // 兼容模式（文本约定）：请求不声明工具，提示词注入 JSON 调用契约，靠正文单行数组发起调用
     let messages = vec![
         ChatMessage::system(ai::system_prompt(ctx, None)),
         ChatMessage::user("现在处于 Autopilot 自主模式。请审视上面的目标与待办，挑选当前最该推进的【一件】事去做：\

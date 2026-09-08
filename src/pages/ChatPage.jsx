@@ -18,8 +18,6 @@ import {
   IconCopy,
   IconCheck,
   IconTarget,
-  IconChevronDown,
-  IconChevronRight,
 } from "../components/Icons.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
 import PendingToolCard from "../components/PendingToolCard.jsx";
@@ -86,6 +84,11 @@ export default function ChatPage({ onStats, visible }) {
   const [delegateTask, setDelegateTask] = useState("");
   const [delegateBusy, setDelegateBusy] = useState(false);
   const [delegateErr, setDelegateErr] = useState("");
+  // 设置里「子代理自动委派」开关：true 时 popover 切观察态，不暴露手动派出入口
+  const [autoDelegate, setAutoDelegate] = useState(false);
+  // 观察态用：活跃目标与未开始待办（仅在 popover 打开 + 自动模式时拉取并定期刷新）
+  const [delegateGoals, setDelegateGoals] = useState([]);
+  const [delegateTodos, setDelegateTodos] = useState([]);
   const subList = Object.entries(subs).map(([id, v]) => ({ session_id: id, ...v }));
 
   // 审批模式初始化 + 全局审批请求监听 + 非流式对话的用量统计监听
@@ -125,6 +128,46 @@ export default function ChatPage({ onStats, visible }) {
     });
     return () => un.then((f) => f());
   }, []);
+
+  // 取「子代理自动委派」开关：决定 popover 走手动态（手动输入任务+派出）还是观察态（只读）
+  useEffect(() => {
+    let stop = false;
+    api
+      .getBehaviorSettings()
+      .then((r) => {
+        if (!stop && r) setAutoDelegate(!!r.auto_delegate);
+      })
+      .catch(() => {});
+    return () => {
+      stop = true;
+    };
+  }, []);
+
+  // 观察态：popover 打开时拉活跃目标 + 未开始待办；自动模式下每 5s 刷新一次
+  useEffect(() => {
+    if (!delegateOpen) return;
+    let stop = false;
+    const fetchAll = () => {
+      api
+        .listGoals()
+        .then((r) => {
+          if (!stop) setDelegateGoals((r?.goals || []).filter((g) => g.status === "active"));
+        })
+        .catch(() => {});
+      api
+        .listTodos()
+        .then((r) => {
+          if (!stop) setDelegateTodos((r?.todos || []).filter((t) => t.status === "pending"));
+        })
+        .catch(() => {});
+    };
+    fetchAll();
+    const timer = autoDelegate ? setInterval(fetchAll, 5000) : null;
+    return () => {
+      stop = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [delegateOpen, autoDelegate]);
 
   // 宿主调度：把一段自包含任务派给子代理（阻塞直到它跑完，结论原样带回本会话）
   const delegate = async () => {
@@ -175,7 +218,6 @@ export default function ChatPage({ onStats, visible }) {
   // 完成项绿色圆点+绿字，未完成白色圆点；小箭头折叠/展开（localStorage 记忆展开状态）
   const [planGoals, setPlanGoals] = useState([]);
   const [planTodos, setPlanTodos] = useState([]);
-  const [planOpen, setPlanOpen] = useState(() => localStorage.getItem("bit.planOpen") === "1");
   const loadPlans = () => {
     api.listGoals().then((r) => setPlanGoals(r.goals || [])).catch(() => {});
     api.listTodos().then((r) => setPlanTodos(r.todos || [])).catch(() => {});
@@ -189,11 +231,6 @@ export default function ChatPage({ onStats, visible }) {
       unFocus.then((f) => f());
     };
   }, []);
-  const togglePlanOpen = () =>
-    setPlanOpen((v) => {
-      localStorage.setItem("bit.planOpen", v ? "0" : "1");
-      return !v;
-    });
 
   // 后台会话变动（如子智能体新建会话 / 完成任务）：自动刷新侧栏与当前会话内容
   useEffect(() => {
@@ -205,7 +242,6 @@ export default function ChatPage({ onStats, visible }) {
     });
     return () => un.then((f) => f());
     // 仅随 activeId 重挂监听；loadSessions/loadMessages 闭包引用刻意冻结
-    // eslint-disable-next-line
   }, [activeId]);
 
   // 派生：当前会话状态与全局运行数
@@ -227,10 +263,6 @@ export default function ChatPage({ onStats, visible }) {
     planVisibleTodos.length > 0 &&
     planTodoDone === planVisibleTodos.length &&
     planVisibleGoals.every((g) => g.status === "achieved");
-  // 没有进行中的内容（无 active 目标且无未完成待办）时整个隐藏，已完成/已放弃的不占位置
-  const planHasActive =
-    planVisibleGoals.some((g) => g.status !== "achieved") ||
-    planVisibleTodos.some((td) => td.status !== "completed");
 
   // 上下文用量估算：优先使用后端按真实上下文构造得到的统一口径，
   // 前端仅在结果返回前用消息长度做兜底估算。
@@ -602,7 +634,7 @@ export default function ChatPage({ onStats, visible }) {
               endLive();
             } else {
               if (activeRef.current === sid) {
-                setMessages((msgs) => [
+                setMessages(() => [
                   // 上游断流前已流出的部分回复先入列（后端已落库），避免已显示的内容消失
                   ...(ev.partial ? [{ role: "assistant", content: ev.partial }] : []),
                   { role: "assistant", content: t("chat.callFailed") + ev.error },
@@ -1408,35 +1440,107 @@ export default function ChatPage({ onStats, visible }) {
               </button>
               {delegateOpen && (
                 <div className="card absolute bottom-11 left-0 z-20 w-80 p-2.5">
-                  <p className="mb-1.5 text-xs font-medium">{t("chat.delegate")}</p>
-                  <textarea
-                    autoFocus
-                    rows={4}
-                    value={delegateTask}
-                    onChange={(e) => setDelegateTask(e.target.value)}
-                    placeholder={t("chat.delegatePlaceholder")}
-                    className="field w-full resize-none text-xs"
-                  />
-                  <p className="mt-1 text-[11px] leading-relaxed text-neutral-400">{t("chat.delegateHint")}</p>
-                  {delegateErr && <p className="mt-1 text-[11px] text-red-500">{delegateErr}</p>}
-                  <div className="mt-2 flex items-center justify-end gap-2">
-                    <button
-                      onClick={() => {
-                        setDelegateOpen(false);
-                        setDelegateErr("");
-                      }}
-                      className="pill pill-hover"
-                    >
-                      {t("common.close")}
-                    </button>
-                    <button
-                      onClick={delegate}
-                      disabled={!delegateTask.trim() || delegateBusy}
-                      className="accent-solid rounded-full px-3 py-1 text-xs disabled:opacity-40"
-                    >
-                      {delegateBusy ? t("chat.thinking") : t("chat.delegateSubmit")}
-                    </button>
-                  </div>
+                  {autoDelegate ? (
+                    // 观察态：设置里开了自动委派，UI 只展示「活跃目标 + 未开始待办 + 在跑子代理」，
+                    // 不暴露手动派出入口——子智能体的生命周期由宿主周期接管，UI 只读
+                    <>
+                      <div className="mb-1.5 flex items-center justify-between gap-2">
+                        <p className="text-xs font-medium">{t("chat.delegateAutoTitle")}</p>
+                        <span className="chip">{t("chat.delegateAutoOn")}</span>
+                      </div>
+                      <p className="text-[11px] leading-relaxed text-neutral-500">
+                        {t("chat.delegateAutoHint")}
+                      </p>
+                      <div className="mt-2 space-y-1.5 text-[11px]">
+                        <div>
+                          <p className="mb-0.5 text-neutral-500">{t("chat.delegateAutoGoals")}</p>
+                          {delegateGoals.length === 0 ? (
+                            <p className="text-neutral-400">{t("chat.delegateAutoEmpty")}</p>
+                          ) : (
+                            <ul className="space-y-0.5">
+                              {delegateGoals.map((g) => {
+                                const n = delegateTodos.filter((t) => t.goal_id === g.id).length;
+                                return (
+                                  <li
+                                    key={g.id}
+                                    className="flex items-center justify-between gap-2 rounded-md px-1.5 py-0.5 hover:bg-neutral-900/5 dark:hover:bg-white/10"
+                                  >
+                                    <span className="truncate">{g.title}</span>
+                                    <span className="shrink-0 text-neutral-400">
+                                      {n} {t("chat.delegateAutoTodos")}
+                                    </span>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
+                        </div>
+                        <div>
+                          <p className="mb-0.5 text-neutral-500">{t("chat.delegateAutoRunning")}</p>
+                          {subList.length === 0 ? (
+                            <p className="text-neutral-400">{t("chat.delegateAutoEmpty")}</p>
+                          ) : (
+                            <ul className="space-y-0.5">
+                              {subList.map((s) => {
+                                const done = s.phase === "done";
+                                const failed = s.phase === "error";
+                                return (
+                                  <li
+                                    key={s.session_id}
+                                    className={`truncate rounded-md px-1.5 py-0.5 ${
+                                      failed
+                                        ? "text-red-500"
+                                        : done
+                                        ? "text-emerald-600 dark:text-emerald-400"
+                                        : "text-neutral-600 dark:text-neutral-300"
+                                    }`}
+                                  >
+                                    {s.title || t("chat.subagent")}
+                                    <span className="ml-1 text-neutral-400">
+                                      {failed ? "✗" : done ? "✓" : "…"}
+                                    </span>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    // 手动态：原有 UI；输入框去胶囊（rounded-lg）以与消息输入框区分
+                    <>
+                      <p className="mb-1.5 text-xs font-medium">{t("chat.delegate")}</p>
+                      <textarea
+                        autoFocus
+                        rows={4}
+                        value={delegateTask}
+                        onChange={(e) => setDelegateTask(e.target.value)}
+                        placeholder={t("chat.delegatePlaceholder")}
+                        className="w-full resize-none rounded-lg border border-neutral-300 bg-white px-3 py-2 text-xs text-neutral-900 outline-none transition-colors placeholder:text-neutral-400 focus:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-500 dark:focus:border-neutral-200"
+                      />
+                      <p className="mt-1 text-[11px] leading-relaxed text-neutral-400">{t("chat.delegateHint")}</p>
+                      {delegateErr && <p className="mt-1 text-[11px] text-red-500">{delegateErr}</p>}
+                      <div className="mt-2 flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => {
+                            setDelegateOpen(false);
+                            setDelegateErr("");
+                          }}
+                          className="pill pill-hover"
+                        >
+                          {t("common.close")}
+                        </button>
+                        <button
+                          onClick={delegate}
+                          disabled={!delegateTask.trim() || delegateBusy}
+                          className="accent-solid rounded-full px-3 py-1 text-xs disabled:opacity-40"
+                        >
+                          {delegateBusy ? t("chat.thinking") : t("chat.delegateSubmit")}
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
             </div>

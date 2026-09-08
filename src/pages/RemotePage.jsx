@@ -3,13 +3,6 @@ import { api } from "../api.js";
 import { useLang } from "../i18n.js";
 import { IconGlobe, IconCheck, IconRefresh } from "../components/Icons.jsx";
 
-// STUN SocketAddr 形态："[v6]:p" / "v4:p"；只取 IP 部分（实际端口由 BIT 监听口决定）
-const ipOnly = (s) => {
-  const x = String(s || "");
-  if (x.startsWith("[")) return x.substring(1, x.indexOf("]"));
-  return /:\d+$/.test(x) ? x.substring(0, x.lastIndexOf(":")) : x;
-};
-
 // 远程访问：端口/Client Key/访问密码管理，测试通过才可保存
 export default function RemotePage({ onStats }) {
   const { t } = useLang();

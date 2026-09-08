@@ -5,7 +5,6 @@
 use crate::state::Ctx;
 use std::io::Write;
 use std::sync::Arc;
-use tauri::Manager;
 
 const HELP: &str = "\
 命令：

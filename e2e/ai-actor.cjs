@@ -366,7 +366,6 @@ function sameBinaryPids(bin) {
             api_key: "sk-actor",
             model: "actor-1",
             active: true,
-            text_fallback: true,
           },
         ],
       },

@@ -43,13 +43,20 @@ export default function AiSettingsPage({ onStats, stats }) {
   // 幻觉防护阈值：word_repeat_max=单回复词重复上限 / tool_loop_max=单回合工具轮上限（0=关闭）
   const [limits, setLimits] = useState({ word_repeat_max: 20, tool_loop_max: 20 });
   const [limitsSaved, setLimitsSaved] = useState(false);
-  // AI 行为设置：自动推进 / 审批模式 / 敏感词审核
+  // AI 行为设置：自动推进 / 审批模式 / 敏感词审核 / 兼容模式
   const [behavior, setBehavior] = useState({
     auto_drive: true,
     auto_delegate: false,
+    subagent_max: 3,
     tool_approval: "ask",
     moderation_enabled: true,
+    compat_mode: false,
   });
+  // 敏感词审核词表：文本为当前生效词表（未自定义时展示内置默认），每行一个词
+  const [wordsText, setWordsText] = useState("");
+  const [wordsCustom, setWordsCustom] = useState(false); // 是否已在用自定义词表
+  const [wordsDirty, setWordsDirty] = useState(false);
+  const [wordsSaved, setWordsSaved] = useState(false);
   // 用户自定义提示词/人设
   const [customPrompt, setCustomPrompt] = useState("");
   const [promptSaved, setPromptSaved] = useState(false);
@@ -66,6 +73,8 @@ export default function AiSettingsPage({ onStats, stats }) {
   // 高权限模式：elevation=null=探测中；elevErr=上次授权失败原因（v0.5.14 黑屏修复：声明漏写导致渲染期 ReferenceError 整树卸载）
   const [elevation, setElevation] = useState(null);
   const [elevErr, setElevErr] = useState("");
+  // 自动运行（后台自主循环：记忆总结 / 技能提炼 / 目标行动）——运行总览里的小圆钮
+  const [autoRun, setAutoRun] = useState(false);
 
   const load = () =>
     api.listProviders().then((r) => setProviders(r.providers || [])).catch(() => {});
@@ -75,20 +84,28 @@ export default function AiSettingsPage({ onStats, stats }) {
     api.getGuardLimits().then((r) => setLimits({ word_repeat_max: r?.word_repeat_max ?? 20, tool_loop_max: r?.tool_loop_max ?? 20 })).catch(() => {});
     api
       .getBehaviorSettings()
-      .then((r) =>
+      .then((r) => {
         setBehavior({
           auto_drive: r?.auto_drive ?? true,
           auto_delegate: r?.auto_delegate ?? false,
+          subagent_max: r?.subagent_max ?? 3,
           tool_approval: r?.tool_approval || "ask",
           moderation_enabled: r?.moderation_enabled ?? true,
-        })
-      )
+          compat_mode: r?.compat_mode ?? false,
+        });
+        setWordsText((r?.blocked_words || []).join("\n"));
+        setWordsCustom(!!r?.blocked_words_custom);
+        setWordsDirty(false);
+      })
       .catch(() => {});
     api.getCustomPrompt().then((r) => setCustomPrompt(r?.custom_prompt || "")).catch(() => {});
     api.getSystemPrompt().then((r) => setSystemPrompt(r?.system_prompt || "")).catch(() => {});
     api.getAutostart().then((r) => setAutostart(!!r?.enabled)).catch(() => setAutostart(false));
     api.getElevation().then((r) => setElevation({ active: !!r?.active, enabled: !!r?.enabled })).catch(() => setElevation({ active: false, enabled: false }));
   }, []);
+
+  // App 定时轮询 overview，stats.autopilot_running 变化时同步小圆钮状态
+  useEffect(() => setAutoRun(!!stats?.autopilot_running), [stats]);
 
   // 开机自启开关：先落系统登录项，失败回滚显示原状态
   const toggleAutostart = (enabled) => {
@@ -138,8 +155,49 @@ export default function AiSettingsPage({ onStats, stats }) {
   const saveBehavior = (next) => {
     setBehavior(next);
     api
-      .setBehaviorSettings(next.auto_drive, next.tool_approval, next.moderation_enabled, next.auto_delegate)
+      .setBehaviorSettings(next.auto_drive, next.tool_approval, next.moderation_enabled, next.auto_delegate, next.compat_mode, next.subagent_max)
       .catch(() => {});
+  };
+  // 敏感词表：按行/中英文逗号/分号切分。空文本=空数组=恢复内置默认
+  const wordsToList = (text) =>
+    text
+      .split(/[\n,，;；]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  const wordsCount = (text) => wordsToList(text).length;
+  const saveWords = (list) => {
+    api
+      .setBehaviorSettings(behavior.auto_drive, behavior.tool_approval, behavior.moderation_enabled, behavior.auto_delegate, behavior.compat_mode, behavior.subagent_max, list)
+      .then(() => {
+        setWordsSaved(true);
+        setTimeout(() => setWordsSaved(false), 1500);
+        setWordsDirty(false);
+        if (!list.length) {
+          // 恢复内置默认：重新拉取内置词表展示
+          api
+            .getBehaviorSettings()
+            .then((r) => {
+              setWordsText((r?.blocked_words || []).join("\n"));
+              setWordsCustom(false);
+            })
+            .catch(() => {});
+        } else {
+          setWordsCustom(true);
+          setWordsText(list.join("\n"));
+        }
+      })
+      .catch(() => {});
+  };
+
+  // 自动运行圆钮：状态以后端返回为准，失败保持原状
+  const toggleAutoRun = async () => {
+    try {
+      const r = await api.toggleAutopilot();
+      setAutoRun(!!r?.running);
+      onStats?.();
+    } catch {
+      // 切换失败：保持原状态，不打扰用户
+    }
   };
 
   const editing = form.id !== null;
@@ -239,12 +297,6 @@ export default function AiSettingsPage({ onStats, stats }) {
     onStats?.();
   };
 
-  // 文本协议降级开关（逐家提供方，默认关）
-  const toggleFallback = async (p) => {
-    await api.setProviderTextFallback(p.id, !p.text_fallback);
-    await load();
-  };
-
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto">
       <div>
@@ -278,6 +330,12 @@ export default function AiSettingsPage({ onStats, stats }) {
             <span className={`chip ${stats.remote?.enabled ? "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" : ""}`}>
               {stats.remote?.enabled ? `${t("ai.remoteOn")}${stats.remote.addr}` : t("ai.remoteOff")}
             </span>
+            <PillSwitch
+              size="sm"
+              checked={autoRun}
+              onChange={toggleAutoRun}
+              title={autoRun ? t("ai.autoOnTip") : t("ai.autoOffTip")}
+            />
           </div>
         </div>
       )}
@@ -316,17 +374,6 @@ export default function AiSettingsPage({ onStats, stats }) {
                     {t("ai.missingKey")}
                   </span>
                 )}
-                <button
-                  onClick={() => toggleFallback(p)}
-                  title={t("ai.fallbackTip")}
-                  className={`chip shrink-0 transition-colors ${
-                    p.text_fallback
-                      ? "border-neutral-900/70 bg-neutral-900 text-white dark:border-white/70 dark:bg-white dark:text-neutral-900"
-                      : "text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300"
-                  }`}
-                >
-                  {t("ai.fallback")}
-                </button>
               </div>
               <p className="mt-0.5 truncate font-mono text-[11px] text-neutral-500">
                 {p.model} · {p.base_url}
@@ -507,6 +554,43 @@ export default function AiSettingsPage({ onStats, stats }) {
           />
         </div>
 
+        {behavior.auto_delegate && (
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p className="text-sm">{t("ai.subagentMax")}</p>
+              <p className="text-xs text-neutral-500">{t("ai.subagentMaxHint")}</p>
+            </div>
+            <input
+              className="field tabular-nums"
+              style={{ width: 76 }}
+              type="number"
+              min="1"
+              max="8"
+              value={behavior.subagent_max}
+              onChange={(e) =>
+                saveBehavior({
+                  ...behavior,
+                  subagent_max: Math.max(1, Math.min(8, parseInt(e.target.value, 10) || 1)),
+                })
+              }
+            />
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm">兼容模式</p>
+            <p className="text-xs text-neutral-500">
+              默认走标准协议（原生工具调用）。开启后改用文本约定：注入 JSON 调用契约，
+              并识别回复中的单行 JSON 工具调用——用于不支持 tools 参数的端点
+            </p>
+          </div>
+          <PillSwitch
+            checked={!!behavior.compat_mode}
+            onChange={(v) => saveBehavior({ ...behavior, compat_mode: v })}
+          />
+        </div>
+
         <div className="flex items-center justify-between gap-4">
           <div>
             <p className="text-sm">敏感词审核</p>
@@ -516,6 +600,60 @@ export default function AiSettingsPage({ onStats, stats }) {
             checked={behavior.moderation_enabled}
             onChange={(v) => saveBehavior({ ...behavior, moderation_enabled: v })}
           />
+        </div>
+
+        <div className="flex flex-col gap-2 border-t border-neutral-200/70 pt-3 dark:border-neutral-800/70">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm text-neutral-700 dark:text-neutral-300">审核词表</p>
+              <p className="text-xs text-neutral-500">
+                每行一个词（也支持逗号/分号分隔）。保存后整体替换内置词库；留空保存 = 恢复内置。关闭审核时不可编辑。
+              </p>
+            </div>
+            {wordsSaved && (
+              <span className="flex shrink-0 items-center gap-1 text-xs text-neutral-500">
+                <IconCheck size={14} />
+                已保存
+              </span>
+            )}
+          </div>
+          <textarea
+            className="field !rounded-lg min-h-[130px] resize-y font-mono text-xs leading-relaxed disabled:cursor-not-allowed disabled:opacity-50"
+            value={wordsText}
+            onChange={(e) => {
+              setWordsText(e.target.value);
+              setWordsDirty(true);
+            }}
+            placeholder={"每行一个词，例如：\n儿童色情\n制毒教程\nchild porn"}
+            disabled={!behavior.moderation_enabled}
+          />
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[11px] text-neutral-400 dark:text-neutral-500">
+              {behavior.moderation_enabled
+                ? wordsCustom
+                  ? `自定义词库 · ${wordsCount(wordsText)} 条（已替换内置）`
+                  : `内置默认词库 · ${wordsCount(wordsText)} 条`
+                : "审核已关闭，当前词表暂不生效"}
+            </span>
+            <div className="flex gap-2">
+              {wordsCustom && (
+                <button
+                  className="pill text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={!behavior.moderation_enabled}
+                  onClick={() => saveWords([])}
+                >
+                  恢复内置默认
+                </button>
+              )}
+              <button
+                className="pill pill-hover text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={!behavior.moderation_enabled || !wordsDirty}
+                onClick={() => saveWords(wordsToList(wordsText))}
+              >
+                保存词表
+              </button>
+            </div>
+          </div>
         </div>
 
         <div className="flex items-center justify-between gap-4">

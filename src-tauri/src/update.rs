@@ -1,7 +1,11 @@
 // yxpil · BIT
+use futures_util::StreamExt;
 use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::state::Ctx;
 use tauri::Emitter;
@@ -20,8 +24,26 @@ pub struct LatestInfo {
     pub assets: Option<serde_json::Value>,
 }
 
+/// 进程内短缓存：检测按钮反复点击、开机自检等多触发点复用同一份 latest，
+/// 避免每点一次就把镜像/GitHub/假源三处全打一遍（国内 6s×3 串行 ≈18s 体感迟钝）。
+const LATEST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+static LATEST_CACHE: std::sync::Mutex<Option<(LatestInfo, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
 /// 检测最新版本。BIT_FAKE_UPDATE_URL 指向的源优先（e2e 测试注入）。
+/// 三个源（fake + 镜像 + 备用域名）并发探测，取首个 2xx 且含 version 的响应；
+/// 全部失败再回退 GitHub API。结果在 60s 内复用。
 pub async fn fetch_latest() -> Result<LatestInfo, String> {
+    // 1) 缓存命中：直接复用，省一次网络
+    {
+        let cache = LATEST_CACHE.lock().unwrap();
+        if let Some((info, at)) = cache.as_ref() {
+            if at.elapsed() < LATEST_CACHE_TTL {
+                return Ok(info.clone());
+            }
+        }
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(6))
         .build()
@@ -33,59 +55,80 @@ pub async fn fetch_latest() -> Result<LatestInfo, String> {
     sources.push("https://yxpil.github.io/bit/latest.json".into());
     sources.push("https://osbt.space/latest.json".into());
 
-    for src in &sources {
-        if let Ok(resp) = client.get(src).send().await {
-            if let Ok(j) = resp.json::<serde_json::Value>().await {
-                if let Some(ver) = j.get("version").and_then(|x| x.as_str()) {
-                    return Ok(LatestInfo {
-                        version: ver.trim_start_matches('v').to_string(),
-                        notes: j
-                            .get("notes")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        url: j
-                            .get("url")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("https://osbt.space")
-                            .to_string(),
-                        assets: j.get("assets").cloned(),
-                    });
-                }
+    // 2) 并发探测（之前是串行，首源挂时最坏要等 6s×3）
+    let client = std::sync::Arc::new(client);
+    let futs = sources.into_iter().map(|src| {
+        let client = client.clone();
+        async move {
+            let resp = match client.get(&src).send().await {
+                Ok(r) => r,
+                Err(_) => return None,
+            };
+            if !resp.status().is_success() {
+                return None;
             }
+            let j: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            let ver = j.get("version").and_then(|x| x.as_str())?;
+            Some(LatestInfo {
+                version: ver.trim_start_matches('v').to_string(),
+                notes: j
+                    .get("notes")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                url: j
+                    .get("url")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("https://osbt.space")
+                    .to_string(),
+                assets: j.get("assets").cloned(),
+            })
         }
+    });
+    let results = futures_util::future::join_all(futs).await;
+    for info in results.into_iter().flatten() {
+        *LATEST_CACHE.lock().unwrap() = Some((info.clone(), std::time::Instant::now()));
+        return Ok(info);
     }
-    // 回退：GitHub API（拿 tag_name / body / html_url）
+
+    // 3) 回退：GitHub API（拿 tag_name / body / html_url）
     if let Ok(v) = client
         .get("https://api.github.com/repos/yxpil/bit/releases/latest")
         .header("User-Agent", "BIT-Agent")
         .send()
         .await
     {
-        if let Ok(j) = v.json::<serde_json::Value>().await {
-            let ver = j
-                .get("tag_name")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim_start_matches('v')
-                .to_string();
-            if !ver.is_empty() {
-                return Ok(LatestInfo {
-                    version: ver,
-                    notes: j
-                        .get("body")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .chars()
-                        .take(300)
-                        .collect(),
-                    url: j
-                        .get("html_url")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("https://osbt.space")
-                        .to_string(),
-                    assets: None,
-                });
+        if v.status().is_success() {
+            if let Ok(j) = v.json::<serde_json::Value>().await {
+                let ver = j
+                    .get("tag_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim_start_matches('v')
+                    .to_string();
+                if !ver.is_empty() {
+                    let info = LatestInfo {
+                        version: ver,
+                        notes: j
+                            .get("body")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .chars()
+                            .take(300)
+                            .collect(),
+                        url: j
+                            .get("html_url")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("https://osbt.space")
+                            .to_string(),
+                        assets: None,
+                    };
+                    *LATEST_CACHE.lock().unwrap() = Some((info.clone(), std::time::Instant::now()));
+                    return Ok(info);
+                }
             }
         }
     }
@@ -96,10 +139,30 @@ pub async fn fetch_latest() -> Result<LatestInfo, String> {
 /// 防止 latest.json 被篡改时把任意主机的安装包喂给换装逻辑（HTTPS 之外一律拒绝）。
 /// 注意 GitHub release 下载会 302 到 objects/release-assets.githubusercontent.com。
 fn trusted_asset_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
+    trusted_asset_url_impl(url, std::env::var_os("BIT_FAKE_UPDATE_URL").is_some())
+}
+
+/// 纯函数实现。allow_loopback 仅由 e2e 注入变量 BIT_FAKE_UPDATE_URL 开启：
+/// 此时允许 http(s)://127.0.0.1 / localhost 回环资产（本地 mock 源），
+/// 生产未设该变量 → 严格 HTTPS 白名单，行为不变。
+fn trusted_asset_url_impl(url: &str, allow_loopback: bool) -> bool {
+    let rest = if let Some(r) = url.strip_prefix("https://") {
+        r
+    } else if allow_loopback {
+        match url.strip_prefix("http://") {
+            Some(r) => r,
+            None => return false,
+        }
+    } else {
         return false;
     };
     let host = rest.split('/').next().unwrap_or("");
+    if allow_loopback {
+        let bare = host.split(':').next().unwrap_or("");
+        if matches!(bare, "127.0.0.1" | "localhost") {
+            return true;
+        }
+    }
     matches!(
         host,
         "github.com"
@@ -180,7 +243,12 @@ fn save_state(ctx: &Ctx, v: serde_json::Value) {
     let _ = std::fs::write(state_path(ctx), serde_json::to_string_pretty(&v).unwrap_or_default());
 }
 
-/// 静默下载当前平台的更新包到升级目录（已存在且版本一致则直接复用，不重复下载）。
+/// 下载互斥：自动静默下载与「关于」里的手动下载可能同时触发，
+/// 用进程内原子开关挡住并发写同一份更新包（本函数是两条路径的唯一入口）。
+static DL_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// 下载当前平台的更新包到升级目录（已存在且版本一致则直接复用，不重复下载）。
+/// 流式落盘，期间每 ~200ms 广播一次 update-progress（含已下载字节/总量/瞬时速度）。
 /// 完成后写 state.json 并返回状态。
 pub async fn download_update(ctx: &Arc<Ctx>) -> Result<serde_json::Value, String> {
     let latest = fetch_latest().await?;
@@ -206,12 +274,29 @@ pub async fn download_update(ctx: &Arc<Ctx>) -> Result<serde_json::Value, String
             }
         }
     }
+    if DL_BUSY.swap(true, AtomicOrdering::SeqCst) {
+        return Err("更新已在下载中，请稍候".into());
+    }
+    let result = stream_to_file(ctx, &latest, &url, &dest, &name).await;
+    DL_BUSY.store(false, AtomicOrdering::SeqCst);
+    result
+}
+
+/// 流式下载核心：分块写盘 + 进度事件（speed 单位：字节/秒）。
+/// 不做并发处理，由调用方（download_update）持有互斥标志。
+async fn stream_to_file(
+    ctx: &Arc<Ctx>,
+    latest: &LatestInfo,
+    url: &str,
+    dest: &Path,
+    name: &str,
+) -> Result<serde_json::Value, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client
-        .get(&url)
+        .get(url)
         .header("User-Agent", "BIT-Agent")
         .send()
         .await
@@ -220,12 +305,46 @@ pub async fn download_update(ctx: &Arc<Ctx>) -> Result<serde_json::Value, String
     if !status.is_success() {
         return Err(format!("下载失败: HTTP {status}"));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("下载失败: {e}"))?;
-    if bytes.is_empty() {
+    let total = resp.content_length().unwrap_or(0);
+    let _ = std::fs::create_dir_all(upgrade_dir(ctx));
+    let mut file = std::fs::File::create(dest).map_err(|e| format!("写入失败: {e}"))?;
+    let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = 0;
+    let mut last_at = Instant::now();
+    let mut last_bytes: u64 = 0;
+    while let Some(item) = stream.next().await {
+        let chunk = item.map_err(|e| format!("下载失败: {e}"))?;
+        file.write_all(&chunk).map_err(|e| format!("写入失败: {e}"))?;
+        downloaded += chunk.len() as u64;
+        // 进度事件节流：~200ms 一条，避免高频刷新
+        let el = last_at.elapsed();
+        if el.as_millis() >= 200 {
+            let speed = if el.as_secs_f64() > 0.0 {
+                ((downloaded - last_bytes) as f64 / el.as_secs_f64()) as u64
+            } else {
+                0
+            };
+            last_bytes = downloaded;
+            last_at = Instant::now();
+            let _ = ctx.app.emit(
+                "update-progress",
+                serde_json::json!({
+                    "state": "downloading",
+                    "version": latest.version,
+                    "file": name,
+                    "downloaded": downloaded,
+                    "total": total,
+                    "speed": speed,
+                }),
+            );
+        }
+    }
+    file.flush().map_err(|e| format!("写入失败: {e}"))?;
+    drop(file);
+    if downloaded == 0 {
+        let _ = std::fs::remove_file(dest);
         return Err("下载失败: 内容为空".into());
     }
-    let _ = std::fs::create_dir_all(upgrade_dir(ctx));
-    std::fs::write(&dest, &bytes).map_err(|e| format!("写入失败: {e}"))?;
     let st = serde_json::json!({
         "version": latest.version,
         "file": name,
@@ -233,8 +352,8 @@ pub async fn download_update(ctx: &Arc<Ctx>) -> Result<serde_json::Value, String
         "time": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     });
     save_state(ctx, st);
-    crate::audit::record(ctx, "local-app", "app.update.download", &latest.version, serde_json::json!({ "file": name, "bytes": bytes.len() }), true);
-    Ok(json_status("downloaded", &latest, Some(&dest)))
+    crate::audit::record(ctx, "local-app", "app.update.download", &latest.version, serde_json::json!({ "file": name, "bytes": downloaded }), true);
+    Ok(json_status("downloaded", latest, Some(dest)))
 }
 
 fn json_status(state: &str, latest: &LatestInfo, file: Option<&Path>) -> serde_json::Value {
@@ -414,6 +533,16 @@ mod tests {
         assert!(!crate::commands::version_gt("0.4.9", "0.4.9"));
         assert!(!crate::commands::version_gt("0.4.8", "0.4.9"));
         assert!(crate::commands::version_gt("v0.5.0", "0.4.9"));
+        // R 后缀（0.6R1/0.6R2…）：R 后数字作为下一段，保证 0.6 < 0.6R1 < 0.6R2
+        assert!(crate::commands::version_gt("0.6R1", "0.5.36"));
+        assert!(crate::commands::version_gt("0.6R2", "0.6R1"));
+        assert!(crate::commands::version_gt("0.6R1", "0.6"));
+        assert!(!crate::commands::version_gt("0.6R1", "0.6R1"));
+        assert!(!crate::commands::version_gt("0.6R1", "0.6R2"));
+        assert!(!crate::commands::version_gt("0.5.36", "0.6R1"));
+        assert!(crate::commands::version_gt("v0.6R1", "0.6"));
+        // 不带 R 时 R<...> 段被忽略，仍按基础三段比较
+        assert!(crate::commands::version_gt("0.6.1", "0.6"));
     }
 
     #[test]
@@ -473,6 +602,22 @@ mod tests {
         };
         assert!(url == format!("https://github.com/yxpil/bit/releases/download/v0.5.0/{name}"));
         assert!(name.contains("0.5.0"));
+    }
+
+    #[test]
+    fn trusted_url_loopback_only_with_fake_env() {
+        // e2e 注入（allow_loopback=true）：仅放行回环 http/https
+        assert!(trusted_asset_url_impl("http://127.0.0.1:9903/asset.bin", true));
+        assert!(trusted_asset_url_impl("https://127.0.0.1/asset.bin", true));
+        assert!(trusted_asset_url_impl("http://localhost:9903/asset.bin", true));
+        // 即便注入变量存在，非回环主机仍被拒绝
+        assert!(!trusted_asset_url_impl("http://evil.com/asset.bin", true));
+        assert!(!trusted_asset_url_impl("https://evil.com/asset.bin", true));
+        // 生产（allow_loopback=false）：回环 http 一律拒绝，HTTPS 白名单照常生效
+        assert!(!trusted_asset_url_impl("http://127.0.0.1:9903/asset.bin", false));
+        assert!(!trusted_asset_url_impl("http://github.com/a.bin", false));
+        assert!(trusted_asset_url_impl("https://github.com/yxpil/bit/releases/download/v1/x", false));
+        assert!(trusted_asset_url_impl("https://osbt.space/bit.dmg", false));
     }
 
     #[test]

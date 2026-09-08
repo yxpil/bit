@@ -96,9 +96,6 @@ pub struct Ctx {
     pub interrupts: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// 同会话回合互斥：同一会话同时只允许一个对话回合在跑，防止并发回合交错写会话历史
     pub turn_locks: Mutex<HashMap<String, ()>>,
-    /// 原生工具调用探测缓存（session_id → 该会话端点是否支持 tools 参数）。
-    /// 只存内存、不持久化：每个会话首次请求时探测一次，模型/接口更新后新会话自动重新探测
-    pub native_probe: Mutex<HashMap<String, bool>>,
     /// 提示词缓存命中率统计（session_id → 累计用量）。内存态，重启清零
     pub cache_stats: Mutex<HashMap<String, CacheStats>>,
     /// 待审批工具调用（request_id → 应答通道 + 元信息，供审批列表接口展示）
@@ -213,7 +210,6 @@ impl Ctx {
             mcp_sessions: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
             turn_locks: Mutex::new(HashMap::new()),
-            native_probe: Mutex::new(HashMap::new()),
             cache_stats: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             approval_seq: AtomicU64::new(1),

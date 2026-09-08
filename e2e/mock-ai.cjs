@@ -58,7 +58,7 @@ function feedbackText(messages) {
   return last ? String(last.content) : "";
 }
 
-// ── 多协议原生工具调用桥接测试辅助（claude /v1/messages、gemini /v1beta/models/...）──
+// ── 多协议原生工具调用测试辅助（claude /v1/messages、gemini /v1beta/models/...）──
 
 // Claude 消息文本提取：content 字符串 / 块数组（text / tool_use / tool_result）
 function claudeMsgText(m) {
@@ -138,7 +138,8 @@ function handleClaude(res, parsed) {
     ...msgs.filter((m) => m.role === "user" && claudeMsgText(m).startsWith("Tool result(s)")).map((m) => claudeMsgText(m)),
   ].join("\n");
 
-  // 原生请求被拒（降级开关场景）：400 + 含 tool 的错误体 → BIT 分类为 Unsupported
+  // 端点形态：拒绝 tools 参数（标准协议带 tools 来就 400 + 含 tool 的错误体 → BIT 分类
+  // Unsupported 后报错）；兼容模式（不带 tools）下直接走下方文本约定分支
   if (all.includes("E2E-CLAUDE-DEGRADE") && parsed.tools) {
     res.writeHead(400, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "tools parameter not supported by this endpoint" } }));
@@ -170,7 +171,7 @@ function handleGemini(res, parsed) {
     ...contents.filter((c) => c.role === "user" && geminiContentText(c).startsWith("Tool result(s)")).map(geminiContentText),
   ].join("\n");
 
-  // 原生请求被拒（降级开关场景）
+  // 原生 tool_use / functionCall 执行场景（标准协议，请求带 tools；T60/T61）
   if (all.includes("E2E-GEMINI-DEGRADE") && parsed.tools) {
     res.writeHead(400, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ error: { code: 400, message: "function declarations not supported by this endpoint", status: "INVALID_ARGUMENT" } }));
@@ -727,8 +728,9 @@ const server = http.createServer((req, res) => {
     // 自动续发轮：上一条回复被截断，BIT 自动补发「继续」→ 直接给最终答案
     if (last.startsWith("继续（")) return respond(res, "E2E-CONTINUE-OK 内容已补全完成", sse);
 
-    // 截断场景：原生请求先拒（BIT 自动降级文本协议），文本轮输出半截工具 JSON
-    // （looks_truncated 命中 → BIT 自动续发「继续」→ 下一轮命中上方续发分支）
+    // 截断场景（兼容模式/文本约定下跑）：输出半截工具 JSON
+    // （looks_truncated 命中 → BIT 自动续发「继续」→ 下一轮命中上方续发分支）；
+    // 若以标准协议（带 tools）请求本端点同样返回 400 —— 拒绝 tools 的端点形态
     if (last.includes("E2E-CMD-CONTINUE")) {
       if (parsed.tools) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -771,9 +773,9 @@ const server = http.createServer((req, res) => {
       );
     }
 
-    // OpenAI 原生工具调用被拒场景（T63 strict 提供方，降级开关未开 → 必须报错）：
-    // 当请求携带 tools 参数且消息含 E2E-NAT-STRICT 标记时返回 400，
-    // BIT 应识别为 Unsupported 并检查 text_fallback 开关
+    // 标准协议拒绝 tools 场景（T63 strict 提供方，兼容模式关 → 必须明确报错、不做自动降级）：
+    // 请求携带 tools 参数且消息含 E2E-NAT-STRICT 标记时返回 400，
+    // BIT 应识别为 Unsupported 并给出「兼容模式」指引
     if (last.includes("E2E-NAT-STRICT") && parsed.tools) {
       res.writeHead(400, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: { message: "tools parameter not supported by this endpoint" } }));
@@ -802,8 +804,8 @@ const server = http.createServer((req, res) => {
       }));
     }
 
-    // 智能引号 + 全角冒号跑偏 JSON（模型笔误形态）：原生请求先拒降级文本协议，
-    // 验证 jsonish_repair 兜底后工具正常执行
+    // 智能引号 + 全角冒号跑偏 JSON（模型笔误形态，兼容模式/文本约定下跑）：
+    // 验证 jsonish_repair 兜底后工具正常执行；带 tools 的标准协议请求同样视为拒绝 tools
     if (last.includes("E2E-SMART-JSON")) {
       if (parsed.tools) {
         res.writeHead(400, { "Content-Type": "application/json" });

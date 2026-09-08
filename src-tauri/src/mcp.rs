@@ -45,8 +45,6 @@ pub struct Discovered {
 
 #[derive(Deserialize)]
 struct RpcResp {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
     result: Option<serde_json::Value>,
     error: Option<RpcErr>,
 }

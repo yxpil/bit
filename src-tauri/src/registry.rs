@@ -399,11 +399,11 @@ pub fn set_enabled(ctx: &Arc<crate::state::Ctx>, id: &str, enabled: bool) -> Res
     Ok(enabled)
 }
 
-/// 在途子代理计数（进程级）：既是嵌套深度，也是「现在有几个子代理在跑」，
-/// 宿主调度据此限流（见 delegation::MAX_CONCURRENT）。
+/// 在途子代理计数（进程级）：「现在有几个子代理在跑」。
+/// 宿主调度据此限流（delegation 按 config.subagent_max 判断是否还能再派）。
 static SUBAGENT_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-/// 当前在跑的子代理数量（含嵌套层）
+/// 当前在跑的子代理数量
 pub fn subagent_depth() -> usize {
     SUBAGENT_DEPTH.load(Ordering::SeqCst)
 }
@@ -831,11 +831,14 @@ async fn builtin_invoke(
                     SUBAGENT_DEPTH.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            // 嵌套上限 3 层，防止子智能体再派生子智能体无限递归
+            // 子代理会话内模型没有 sub_agent 工具（is_host_only_tool），宿主也只在顶层派发，
+            // 不会发生递归嵌套；计数只用于「在跑数」限流（delegation 按 config.subagent_max）
+            // 与 UI 展示。保留一个防御性硬顶，防止宿主逻辑 bug 导致计数失控自增
+            const SANITY_MAX: usize = 32;
             let depth = SUBAGENT_DEPTH.fetch_add(1, Ordering::SeqCst);
             let _guard = DecGuard;
-            if depth >= 3 {
-                return Err("Sub-agent nesting too deep (max 3 levels); complete the task directly in this session".into());
+            if depth >= SANITY_MAX {
+                return Err("Too many sub-agents running (safety cap hit)".into());
             }
             let task = params.get("task").and_then(|v| v.as_str()).ok_or("Missing parameter: task")?.to_string();
             if task.trim().is_empty() {
@@ -859,9 +862,9 @@ async fn builtin_invoke(
             // Box::pin：builtin_invoke → chat_turn → execute_tool_call → builtin_invoke 递归，需手动打断无限大小
             let mut run = Box::pin(crate::agent::chat_turn(ctx, &sid, &task, Vec::new()));
             const SUB_TIMEOUT_SECS: u64 = 15 * 60;
-            let mut sleep = tokio::time::sleep(std::time::Duration::from_secs(SUB_TIMEOUT_SECS));
+            let sleep = tokio::time::sleep(std::time::Duration::from_secs(SUB_TIMEOUT_SECS));
             // 主会话点「停止」时立刻取消子任务，而不是干等子任务跑完
-            let mut watch = async {
+            let watch = async {
                 loop {
                     if parent
                         .as_deref()

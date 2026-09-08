@@ -51,6 +51,7 @@ fn tokenize(text: &str) -> Vec<String> {
 }
 
 /// 搜索专用纯净分词：去重 + 长词在前（与参考实现 splitWords 等价）
+#[cfg(test)]
 pub fn split_words(text: &str) -> Vec<String> {
     let mut uniq: Vec<String> = tokenize(text);
     uniq.sort();

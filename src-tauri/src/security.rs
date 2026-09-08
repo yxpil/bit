@@ -148,6 +148,7 @@ pub fn bitcrypt_encrypt(plaintext: &str) -> String {
     format!("{CRYPT_PREFIX}{}", base64::engine::general_purpose::STANDARD.encode(&buf))
 }
 
+#[cfg(test)]
 pub fn bitcrypt_decrypt(blob: &str) -> Result<String, &'static str> {
     use base64::Engine;
     let raw = blob

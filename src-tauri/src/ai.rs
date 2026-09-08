@@ -15,11 +15,6 @@ pub struct Provider {
     pub model: String,
     /// 是否为当前激活项（全局仅一个为 true）
     pub active: bool,
-    /// 文本协议降级开关（逐家提供方独立，默认关）：端点明确拒绝 tools 参数时是否
-    /// 允许自动降级文本协议。关闭时探测失败直接报错并提示开启路径——降级是「哪家
-    /// 端点不支持工具调用」的属性，必须判断是哪家的且开关打开才允许，杜绝静默降级
-    #[serde(default)]
-    pub text_fallback: bool,
 }
 
 impl Provider {
@@ -1631,12 +1626,6 @@ pub struct TokenUsage {
     pub cache_known: bool,
 }
 
-impl TokenUsage {
-    fn is_empty(&self) -> bool {
-        self.prompt_tokens == 0 && self.completion_tokens == 0
-    }
-}
-
 /// openai 协议 usage（兼容 deepseek 的 prompt_cache_hit_tokens 字段）。
 /// 注意：DeepSeek 官方永远返回 prompt_cache_hit_tokens（0 也是显式 0，可信）；
 /// OpenAI/千问在 prompt_tokens_details.cached_tokens；中转站常整体剥掉 → cache_known=false
@@ -1698,9 +1687,9 @@ pub struct NativeRound {
     pub usage: TokenUsage,
 }
 
-/// 原生调用错误：Unsupported 表示端点不支持 tools 参数（应降级文本约定）
+/// 原生调用错误：Unsupported 表示端点拒绝 tools 参数。
+/// 由调用方报错并提示在「AI 行为设置」开启「兼容模式」（文本约定）后重试
 #[derive(Debug)]
-#[allow(dead_code)] // Unsupported 携带的原始报错仅用于排查，降级是静默自动的
 pub enum NativeErr {
     Unsupported(String),
     Other(String),
@@ -1815,7 +1804,7 @@ async fn read_json_native(resp: reqwest::Response) -> Result<serde_json::Value, 
 }
 
 /// 非 2xx 响应分类（流式与一次性共用）：错误体含 tool/function/schema → Unsupported
-/// （探测失败，调用方降级文本约定）；其余 → Other（流式路径可退回一次性请求）。
+/// （调用方据此报错提示开启「兼容模式」）；其余 → Other（流式路径可退回一次性请求）。
 /// 仅在非 2xx 时调用（会消耗响应体读取错误详情）
 async fn native_err_from_resp(status: reqwest::StatusCode, resp: reqwest::Response) -> NativeErr {
     let text = resp.text().await.unwrap_or_default();
@@ -2011,7 +2000,7 @@ pub enum NativeEvent<'a> {
 
 /// 原生一轮（流式）：文本/思考增量实时回调，工具调用增量在本地聚合；
 /// 回调返回 false 立即停止（会话中断，返回 STREAM_STOP 哨兵）。
-/// 端点拒绝流式/工具参数（Unsupported）原样上抛（调用方降级文本约定）；
+/// 端点拒绝流式/工具参数（Unsupported）原样上抛（调用方据此报错提示开启「兼容模式」）；
 /// 其他流式失败在尚未输出任何增量时自动退回一次性请求（整段以单事件补发）。
 pub async fn chat_native_round_stream<F: FnMut(NativeEvent) -> bool + Send>(
     ctx: &Arc<crate::state::Ctx>,
@@ -2202,7 +2191,7 @@ async fn native_round_openai_stream(
                                 // 无 index 无 id：参数增量续写最近的槽；还没有任何槽时新开
                                 match tc_last {
                                     Some(i) => i,
-                                    None => { let s = tc_next; tc_next += 1; tc_last = Some(s); s }
+                                    None => { let s = tc_next; tc_next += 1; s }
                                 }
                             }
                         }
@@ -2846,7 +2835,6 @@ mod native_tests {
             api_key: "test-key".into(),
             model: "test-model".into(),
             active: true,
-            text_fallback: false,
         }
     }
 
@@ -3021,7 +3009,7 @@ mod native_tests {
 
     #[tokio::test]
     async fn test_native_error_classification() {
-        // 4xx 且报错提到 tools/function → Unsupported（触发降级）
+        // 4xx 且报错提到 tools/function → Unsupported（调用方报错并指路「兼容模式」）
         let (url, _) = spawn_mock_ai(vec![(
             400,
             json!({"error":{"message":"'tools' is not supported by this model"}}).to_string(),
@@ -3033,7 +3021,7 @@ mod native_tests {
         let r = native_round_openai(&client, &p, &[ChatMessage::user("hi".to_string())], &[], &[], &defs, &AiConfig::default()).await;
         assert!(matches!(r, Err(NativeErr::Unsupported(_))), "应识别为不支持原生工具: {r:?}");
 
-        // 401 鉴权错误 → Other（不应误降级）
+        // 401 鉴权错误 → Other（不应误分类为不支持工具）
         let (url2, _) = spawn_mock_ai(vec![(401, json!({"error":{"message":"invalid api key"}}).to_string())]).await;
         let p2 = test_provider("openai", &url2);
         let r2 = native_round_openai(&client, &p2, &[ChatMessage::user("hi".to_string())], &[], &[], &defs, &AiConfig::default()).await;

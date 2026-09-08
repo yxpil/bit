@@ -14,7 +14,7 @@ import { IconImage, IconTrash, IconCheck } from "../components/Icons.jsx";
  *  - 一键恢复默认
  */
 export default function ThemePage() {
-  const { isDark, look, setLook, accent, setAccent } = useTheme();
+  const { look, setLook, accent, setAccent } = useTheme();
   const { t } = useLang();
   const fileRef = useRef(null);
 

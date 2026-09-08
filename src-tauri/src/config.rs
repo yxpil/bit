@@ -28,6 +28,15 @@ pub struct Config {
     /// 模型侧无该工具（宿主管控），这里只是宿主是否主动派活的开关；默认关闭以免悄悄烧 token
     #[serde(default)]
     pub auto_delegate: bool,
+    /// 自动委派并行子代理数上限（1..=8）：宿主每周期最多同时推进这么多条待办。
+    /// 子代理会完整跑 agent 循环（多轮工具 + token），默认 3；越大越烧配额
+    #[serde(default = "default_subagent_max")]
+    pub subagent_max: u32,
+    /// 兼容模式（全局）：默认关 = 标准协议（原生 function calling，请求带 tools 参数）；
+    /// 开启 = 文本约定——在系统提示词注入 JSON 调用契约，并解析回复正文里的单行 JSON 数组
+    /// 工具调用。只用于不支持 tools 参数的端点（纯文本中转等），无需探测、不做自动降级
+    #[serde(default)]
+    pub compat_mode: bool,
     /// 幻觉防护：单个词在一条回复里出现次数达到该值即判定为幻觉循环（0=关闭）
     #[serde(default = "default_word_repeat_max")]
     pub word_repeat_max: u32,
@@ -107,6 +116,10 @@ fn default_word_repeat_max() -> u32 {
     20
 }
 
+fn default_subagent_max() -> u32 {
+    3
+}
+
 fn default_tool_loop_max() -> u32 {
     20
 }
@@ -164,6 +177,8 @@ impl Default for Config {
             tool_approval: default_approval(),
             auto_drive: true,
             auto_delegate: false,
+            subagent_max: default_subagent_max(),
+            compat_mode: false,
             word_repeat_max: default_word_repeat_max(),
             tool_loop_max: default_tool_loop_max(),
             custom_prompt: String::new(),

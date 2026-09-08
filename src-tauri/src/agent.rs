@@ -147,46 +147,6 @@ fn record_and_payload(ctx: &Arc<Ctx>, session: &str, usage: &ai::TokenUsage) -> 
     })
 }
 
-/// 原生探测缓存的键 = 激活提供方 id：能否原生调用工具是「哪家端点」的属性而不是
-/// 会话的属性——按会话记会让多家提供方互相污染，也无法回答"是哪家降的级"
-fn probe_key(ctx: &Arc<Ctx>) -> String {
-    ctx.ai_config
-        .lock()
-        .unwrap()
-        .active()
-        .map(|p| p.id.clone())
-        .unwrap_or_default()
-}
-
-/// 原生探测失败（端点明确拒绝 tools 参数）时的降级决策：
-/// ① 开关判断——只有该提供方「文本协议降级」开关打开才允许自动降级（默认关）；
-/// ② 按提供方记忆探测结果（后续会话不再重复探测）；
-/// ③ 审计如实记录是哪家提供方发生了降级。
-/// 返回 Err = 开关未开：直接报错告知用户是哪家端点、去哪里开，不做静默降级
-fn handle_unsupported(ctx: &Arc<Ctx>, err: &str) -> Result<(), String> {
-    let provider = ctx.ai_config.lock().unwrap().active().cloned();
-    let Some(p) = provider else {
-        return Err("未配置任何 AI 提供方".into());
-    };
-    if !p.text_fallback {
-        return Err(format!(
-            "提供方「{}」不支持原生工具调用（{}）。如确认该端点仅支持文本约定，可在「AI 设置」中开启它的「文本协议降级」开关后重试",
-            p.name,
-            ai::user_err(err)
-        ));
-    }
-    ctx.native_probe.lock().unwrap().insert(p.id.clone(), false);
-    crate::audit::record(
-        ctx,
-        "system",
-        "ai.native.degrade",
-        &p.name,
-        json!({ "provider_id": p.id, "error": err }),
-        true,
-    );
-    Ok(())
-}
-
 /// 工具审批：弹出询问卡片等待用户应答（120 秒超时自动拒绝）。
 /// 是否需要询问由 auto_pass() 在调用方判定，这里只负责"问"。
 /// 等待期间每 500ms 轮询一次会话中断标志：用户点「停止」可立即取消审批中的工具
@@ -549,13 +509,13 @@ pub async fn chat_turn(
 
     let iflag = register_interrupt(ctx, &target);
 
-    // 原生工具调用探测：按提供方只探测一次（内存缓存不持久化；改配置/切开关即失效重探）；
-    // 探测过不支持的提供方直接用文本约定提示词
-    let probe_key = probe_key(ctx);
-    let mut native_mode = ctx.native_probe.lock().unwrap().get(&probe_key).copied() != Some(false);
+    // 协议选择：默认标准原生 function calling（请求带 tools 参数）；「兼容模式」开启时改用
+    // 文本约定（提示词注入 JSON 调用契约、解析正文单行 JSON 数组工具调用）。开关是全局
+    // 静态值，回合内不再探测、不中途变轨——端点不支持 tools 时直接报错指路兼容模式
+    let native_mode = !ctx.config.lock().unwrap().compat_mode;
 
     // 2) 构造发给模型的对话（system + 历史 + 每轮追加的工具反馈）
-    // 提示词随探测结果切换：原生模式不教文本调用格式，避免两种约定互相干扰
+    // 提示词随协议选择切换：原生模式不教文本调用格式，避免两种约定互相干扰
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
         let sess = store.sessions.iter().find(|s| s.id == target).ok_or("会话不存在")?;
@@ -590,7 +550,7 @@ pub async fn chat_turn(
         // 图片只在第一轮（真正的用户轮）随请求发送；view_image 看过的图从第二轮起随请求注入
         let round_images: &[String] = if round == 1 { &images } else { &pending_images };
 
-        // 拿到本轮回复：原生 function calling 优先，未探测过/已支持时尝试；失败降级文本约定
+        // 拿到本轮回复：按会话确定的协议（原生 function calling 或兼容模式的文本约定）
         let round_thinking = Arc::new(std::sync::Mutex::new(String::new()));
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
             // 流式原生请求（文本/思考增量实时到达；HTTP API 无事件通道，回调仅作聚合）
@@ -604,35 +564,20 @@ pub async fn chat_turn(
             }
             match attempt {
                 Ok(r) => {
-                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), true);
                     *round_thinking.lock().unwrap() = r.thinking;
                     // 记录本轮用量并推送缓存命中率统计
                     let payload = record_and_payload(ctx, &target, &r.usage);
                     let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
-                    // 结构化调用为空时兜底解析文本约定（有的模型在原生模式下仍爱手写 TOOL: 行）
-                    let calls = if !r.calls.is_empty() {
-                        r.calls
-                    } else if let Some(tc) = parse_tool_calls(&r.content) {
-                        if !tc.is_empty() && looks_like_tool_calls(&tc) {
-                            text_calls_to_native(&tc)
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    (r.content, calls)
+                    // 原生模式只认协议字段里的调用；正文 JSON 解析是兼容模式（文本约定）的专属职责
+                    (r.content, r.calls)
                 }
                 Err(ai::NativeErr::Unsupported(e)) => {
-                    // 端点拒绝 tools 参数：是否允许自动降级由该提供方的「文本协议降级」开关决定
-                    // （默认关：报错并告知是哪家、去哪里开），降级发生时审计记录
-                    handle_unsupported(ctx, &e)?;
-                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), false);
-                    native_mode = false;
-                    native_exchanges.clear();
-                    convo[0] = ChatMessage::system(ai::system_prompt(ctx, Some(&target)));
-                    round -= 1; // 重走本轮（保留第一轮携带图片的语义）
-                    continue;
+                    // 端点拒绝 tools 参数：标准协议直接报错，不做自动降级/探测重试。
+                    // 确认该端点只支持文本时，在「AI 设置 → AI 行为设置」开启「兼容模式」后重试
+                    return Err(format!(
+                        "AI 端点不支持原生工具调用（{}）。若确认该端点仅支持文本约定，请在「AI 设置 → AI 行为设置」中开启「兼容模式」后重试",
+                        ai::user_err(&e)
+                    ));
                 }
                 // 瞬态网络错误（流截断/连接失败）：自动重走本轮，业务错误不重试
                 Err(ai::NativeErr::Other(ref e)) if ai::is_transient_net_error(e) && net_retries > 0 => {
@@ -799,7 +744,9 @@ pub async fn chat_turn(
             if !reply.trim().is_empty() {
                 convo.push(ChatMessage::assistant(reply.clone()));
             }
-            convo.push(ChatMessage::user(CONTINUE_PROMPT));
+            // 续发提示词按协议区分：兼容模式继续沿用文本约定的 JSON 行格式，
+            // 原生模式用中性提示词，避免把文本约定的指令灌给走原生协议的路
+            convo.push(ChatMessage::user(if native_mode { CONTINUE_PROMPT_NATIVE } else { CONTINUE_PROMPT }));
             continue;
         }
         // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
@@ -897,10 +844,9 @@ pub async fn chat_turn_stream(
 
     let iflag = register_interrupt(ctx, &target);
 
-    // 原生工具调用探测：按提供方只探测一次（内存缓存不持久化；改配置/切开关即失效重探）；
-    // 提示词随探测结果切换：原生模式不教文本调用格式，避免两种约定互相干扰
-    let probe_key = probe_key(ctx);
-    let mut native_mode = ctx.native_probe.lock().unwrap().get(&probe_key).copied() != Some(false);
+    // 协议选择：默认标准原生 function calling；「兼容模式」开启时改用文本约定。
+    // 全局静态开关，回合内不再探测、不中途变轨，提示词随协议选择切换
+    let native_mode = !ctx.config.lock().unwrap().compat_mode;
 
     let mut convo: Vec<ChatMessage> = {
         let store = ctx.sessions.lock().unwrap();
@@ -918,7 +864,7 @@ pub async fn chat_turn_stream(
     };
 
     // 工具调用轮次不设上限：链式任务可能需要任意多轮，由模型自行决定何时给出最终答案
-    // 端点不支持 tools 参数时立即降级文本约定；原生模式下本轮回复一次性下发
+    // 原生模式下本轮回复一次性下发（调用已随协议字段返回）
     let mut native_exchanges: Vec<ai::ToolExchange> = Vec::new();
     let mut pending_images: Vec<String> = Vec::new();
     let mut round = 0usize;
@@ -942,7 +888,7 @@ pub async fn chat_turn_stream(
         // 图片只在第一轮随请求发送；view_image 看过的图从第二轮起随请求注入
         let round_images: &[String] = if round == 1 { &images } else { &pending_images };
 
-        // 拿到本轮回复：原生 function calling 优先，失败降级文本约定
+        // 拿到本轮回复：按会话确定的协议（原生 function calling 或兼容模式的文本约定）
         let (reply, native_calls): (String, Vec<ai::NativeToolCall>) = if native_mode {
             // 流式原生请求：文本/思考增量实时推送（tool_calls 增量在 ai 层聚合，结束后一次性返回）
             let emit_native = &emit;
@@ -968,34 +914,24 @@ pub async fn chat_turn_stream(
             }
             match attempt {
                 Ok(r) => {
-                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), true);
                     *round_thinking.lock().unwrap() = r.thinking;
                     // 记录本轮用量并随流式通道推送缓存命中率统计
                     let mut payload = record_and_payload(ctx, &target, &r.usage);
                     payload["type"] = json!("usage");
                     emit(payload);
-                    let calls = if !r.calls.is_empty() {
-                        r.calls
-                    } else if let Some(tc) = parse_tool_calls(&r.content) {
-                        if !tc.is_empty() && looks_like_tool_calls(&tc) {
-                            text_calls_to_native(&tc)
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    (r.content, calls)
+                    // 原生模式只认协议字段里的调用；正文 JSON 解析是兼容模式（文本约定）的专属职责
+                    (r.content, r.calls)
                 }
                 Err(ai::NativeErr::Unsupported(e)) => {
-                    // 端点拒绝 tools 参数：是否允许自动降级由该提供方的「文本协议降级」开关决定
-                    handle_unsupported(ctx, &e)?;
-                    ctx.native_probe.lock().unwrap().insert(probe_key.clone(), false);
-                    native_mode = false;
-                    native_exchanges.clear();
-                    convo[0] = ChatMessage::system(ai::system_prompt(ctx, Some(&target)));
-                    round -= 1;
-                    continue;
+                    // 端点拒绝 tools 参数：标准协议直接报错，不做自动降级。
+                    // 确认该端点只支持文本时，在「AI 设置 → AI 行为设置」开启「兼容模式」后重试
+                    clear_interrupt(ctx, &target, &iflag);
+                    let e = format!(
+                        "AI 端点不支持原生工具调用（{}）。若确认该端点仅支持文本约定，请在「AI 设置 → AI 行为设置」中开启「兼容模式」后重试",
+                        ai::user_err(&e)
+                    );
+                    emit(json!({ "type": "error", "error": e.clone() }));
+                    return Err(e);
                 }
                 // 瞬态网络错误（流截断/连接失败）：自动重走本轮；本轮已流出的半截内容由前端清空
                 Err(ai::NativeErr::Other(ref e)) if ai::is_transient_net_error(e) && net_retries > 0 => {
@@ -1226,7 +1162,8 @@ pub async fn chat_turn_stream(
             if !reply.trim().is_empty() {
                 convo.push(ChatMessage::assistant(reply.clone()));
             }
-            convo.push(ChatMessage::user(CONTINUE_PROMPT));
+            // 续发提示词按协议区分：兼容模式沿用文本约定的 JSON 行格式，原生模式用中性提示词
+            convo.push(ChatMessage::user(if native_mode { CONTINUE_PROMPT_NATIVE } else { CONTINUE_PROMPT }));
             continue;
         }
         // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
@@ -1279,7 +1216,13 @@ pub fn build_context(
         .iter()
         .find(|s| s.id == target)
         .ok_or("会话不存在")?;
-    let mut v = vec![ChatMessage::system(ai::system_prompt(ctx, Some(&target)))];
+    // 预览提示词随协议选择（与 chat_turn 一致）：兼容模式用文本约定版，否则原生版
+    let compat = ctx.config.lock().unwrap().compat_mode;
+    let mut v = vec![ChatMessage::system(if compat {
+        ai::system_prompt(ctx, Some(&target))
+    } else {
+        ai::system_prompt_native(ctx, Some(&target))
+    })];
     for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
         v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None });
     }
@@ -1422,8 +1365,10 @@ fn looks_truncated(reply: &str) -> bool {
     false
 }
 
-/// 自动续发时补给模型的消息
+/// 自动续发时补给模型的消息（兼容模式/文本约定版：延续单行 JSON 数组的工具调用格式）
 const CONTINUE_PROMPT: &str = "继续（你上一条回复未输出完整就被截断了，从中断处直接往下写，不要重复已输出的内容；若要调用工具请按协议单独一行输出 JSON 数组；如需写入大文件，请拆成多次较小的写入避免单次输出过长；若已完成请直接给出最终答案）";
+/// 自动续发时补给模型的消息（标准原生模式版：不带任何文本约定指令，避免两种协议互相干扰）
+const CONTINUE_PROMPT_NATIVE: &str = "继续（你上一条回复未输出完整就被截断了，从中断处直接往下写，不要重复已输出的内容；如需调用工具请按原生工具调用协议发起；如需写入大文件，请拆成多次较小的写入避免单次输出过长；若已完成请直接给出最终答案）";
 
 /// 扫描 JSON 文本（对象/字符串状态机），到达末尾时是否仍未闭合
 fn is_unbalanced_json(text: &str) -> bool {

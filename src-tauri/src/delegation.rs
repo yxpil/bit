@@ -13,12 +13,10 @@ use std::sync::Arc;
 
 use crate::state::Ctx;
 
-/// 同一时刻允许在跑的子代理数量（宿主保守值）。
-/// 子代理会完整跑一遍 agent 循环（多轮工具 + token），并发放开容易烧穿配额。
-pub const MAX_CONCURRENT: usize = 1;
-
-/// 嵌套上限：与 registry 内的判定保持一致，仅用于提示文案
-pub const MAX_DEPTH: usize = 3;
+/// 并行子代理数的可配置上限（config.subagent_max 的可调范围 1..=MAX）。
+/// 子代理会完整跑一遍 agent 循环（多轮工具 + token），数字越大越烧配额。
+/// 默认 3，用户在设置页可调。
+pub const MAX_CFG_SUBAGENTS: usize = 8;
 
 /// 显式派生一个子代理（宿主入口）。阻塞直到子代理跑完（内部上限 15 分钟），
 /// 返回 sub_agent 工具的原始结果 { session_id, final_answer, truncated, note }。
@@ -32,10 +30,16 @@ pub async fn spawn(
     if task.is_empty() {
         return Err("任务描述不能为空".into());
     }
-    let running = crate::registry::subagent_depth();
-    if running >= MAX_CONCURRENT {
+    let (running, limit) = {
+        let cfg = ctx.config.lock().unwrap();
+        (
+            crate::registry::subagent_depth(),
+            cfg.subagent_max.clamp(1, MAX_CFG_SUBAGENTS as u32) as usize,
+        )
+    };
+    if running >= limit {
         return Err(format!(
-            "已有 {running} 个子代理在跑（上限 {MAX_CONCURRENT}），等它结束后再派生"
+            "已有 {running} 个子代理在跑（并行上限 {limit}，可在设置里调整），等有位置再派生"
         ));
     }
     let mut params = json!({ "task": task });
@@ -49,18 +53,21 @@ pub async fn spawn(
 ///
 /// 保守边界（防止失控）：
 /// 1. 只在 config.auto_delegate 打开时生效；
-/// 2. 同一时刻只允许 MAX_CONCURRENT 个子代理在跑；
+/// 2. 并行在跑数不超过 config.subagent_max（1..=MAX_CFG_SUBAGENTS，设置页可调）；
 /// 3. 派出的待办立刻置 in_progress，下一周期不会重复派生同一条；
 /// 4. 子代理在后台跑，不阻塞 Autopilot 心跳；结束按成败回写待办状态。
 ///
 /// 返回被派出的待办 id（None = 本次不派生）。
 pub fn auto_step(ctx: &Arc<Ctx>) -> Option<String> {
-    if !ctx.config.lock().unwrap().auto_delegate {
-        return None;
-    }
+    let limit = {
+        let cfg = ctx.config.lock().unwrap();
+        if !cfg.auto_delegate {
+            return None;
+        }
+        cfg.subagent_max.clamp(1, MAX_CFG_SUBAGENTS as u32) as usize
+    };
     let running = crate::registry::subagent_depth();
-    // 并发上限（宿主策略）+ 嵌套硬上限（registry 判定）双重保险
-    if running >= MAX_CONCURRENT || running >= MAX_DEPTH {
+    if running >= limit {
         return None;
     }
 
@@ -160,10 +167,9 @@ pub fn auto_step(ctx: &Arc<Ctx>) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// 并发上限必须为正且不超过 registry 的嵌套上限，否则策略永远派不出去或失控
+    /// 可配置并行上限必须为正，否则策略永远派不出去
     #[test]
-    fn limits_sane() {
-        assert!(MAX_CONCURRENT >= 1);
-        assert!(MAX_CONCURRENT <= super::MAX_DEPTH);
+    fn cfg_limit_sane() {
+        assert!(MAX_CFG_SUBAGENTS >= 1);
     }
 }

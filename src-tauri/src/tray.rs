@@ -11,7 +11,6 @@ use crate::state::Ctx;
 pub fn create(app: &tauri::AppHandle, ctx: &Arc<Ctx>) -> tauri::Result<()> {
     let menu = build_menu(app, ctx)?;
     let quit_ctx = ctx.clone();
-    let show_ctx = ctx.clone();
 
     let tray = TrayIconBuilder::with_id("bit-tray")
         .icon(app.default_window_icon().unwrap().clone())

@@ -12,26 +12,20 @@ fn ctx<'a>(state: State<'a, Arc<Ctx>>) -> Arc<Ctx> {
 
 pub fn estimate_context_tokens(ctx: &Arc<Ctx>, session_id: &str, convo: &[crate::ai::ChatMessage]) -> usize {
     let _ = session_id;
-    // 探测缓存按提供方记（能否原生调工具是「哪家端点」的属性）
-    let probe_key = ctx
-        .ai_config
-        .lock()
-        .unwrap()
-        .active()
-        .map(|p| p.id.clone())
-        .unwrap_or_default();
-    let native_mode = ctx.native_probe.lock().unwrap().get(&probe_key).copied() != Some(false);
+    // 兼容模式（文本约定）下工具清单以压缩形式内联在系统提示词里，已计入 convo_chars；
+    // 标准原生模式才需要额外估算 tools 参数的 token 占用
+    let compat = ctx.config.lock().unwrap().compat_mode;
     let convo_chars: usize = convo
         .iter()
         .map(|m| m.role.chars().count() + m.content.chars().count() + 8)
         .sum();
-    let tool_chars = if native_mode {
+    let tool_chars = if compat {
+        0
+    } else {
         serde_json::to_string(&crate::ai::native_tool_defs(ctx))
             .unwrap_or_default()
             .chars()
             .count()
-    } else {
-        0
     };
     (convo_chars + tool_chars).div_ceil(2)
 }
@@ -373,16 +367,28 @@ pub fn subagent_running() -> usize {
     crate::registry::subagent_depth()
 }
 
-/// AI 行为设置（设置页读写）：自动推进 / 子代理自动委派 / 审批模式 / 敏感词审核
+/// AI 行为设置（设置页读写）：自动推进 / 子代理自动委派 / 审批模式 / 敏感词审核 / 兼容模式
 #[tauri::command]
 pub fn get_behavior_settings(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
     let cfg = ctx.config.lock().unwrap();
+    // 当前生效敏感词表：用户未自定义（None/空）时回退内置默认词库，供设置页直接展示编辑
+    let words: Vec<String> = match cfg.blocked_words.as_ref() {
+        Some(l) if !l.is_empty() => l.clone(),
+        _ => crate::security::DEFAULT_BLOCKED_WORDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
     json!({
         "auto_drive": cfg.auto_drive,
         "auto_delegate": cfg.auto_delegate,
+        "subagent_max": cfg.subagent_max,
         "tool_approval": cfg.tool_approval,
         "moderation_enabled": cfg.moderation_enabled,
+        "compat_mode": cfg.compat_mode,
+        "blocked_words": words,
+        "blocked_words_custom": matches!(cfg.blocked_words.as_ref(), Some(l) if !l.is_empty()),
     })
 }
 
@@ -393,6 +399,9 @@ pub fn set_behavior_settings(
     tool_approval: String,
     moderation_enabled: bool,
     auto_delegate: Option<bool>,
+    compat_mode: Option<bool>,
+    subagent_max: Option<u32>,
+    blocked_words: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     {
@@ -403,6 +412,21 @@ pub fn set_behavior_settings(
         // 可选参数：老前端不传时保持原值
         if let Some(v) = auto_delegate {
             cfg.auto_delegate = v;
+        }
+        if let Some(v) = compat_mode {
+            cfg.compat_mode = v;
+        }
+        if let Some(v) = subagent_max {
+            cfg.subagent_max = v.clamp(1, crate::delegation::MAX_CFG_SUBAGENTS as u32);
+        }
+        // 敏感词表：传入即整体替换（清空空白项）；空数组 = 恢复内置默认（置 None），未传 = 保持原值
+        if let Some(list) = blocked_words {
+            let clean: Vec<String> = list
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cfg.blocked_words = if clean.is_empty() { None } else { Some(clean) };
         }
         drop(cfg);
     }
@@ -829,7 +853,6 @@ pub fn add_provider(
         api_key: api_key.trim().to_string(),
         model,
         active: false,
-        text_fallback: false,
     };
     let id = p.id.clone();
     {
@@ -880,8 +903,6 @@ pub fn update_provider(
         p.api_key = api_key.trim().to_string();
         p.protocol = protocol;
     }
-    // 端点/协议可能已换：清除该提供方的原生探测缓存，下次对话重新探测
-    ctx.native_probe.lock().unwrap().remove(&id);
     ctx.save_ai_config();
     crate::audit::record(&ctx, "local-user", "ai.provider.update", &id, json!({}), true);
     Ok(json!({ "saved": true }))
@@ -901,35 +922,9 @@ pub fn remove_provider(state: State<'_, Arc<Ctx>>, id: String) -> Result<serde_j
             }
         }
     }
-    ctx.native_probe.lock().unwrap().remove(&id);
     ctx.save_ai_config();
     crate::audit::record(&ctx, "local-user", "ai.provider.remove", &id, json!({}), true);
     Ok(json!({ "removed": true }))
-}
-
-/// 文本协议降级开关（逐家提供方独立，默认关）：开启后该端点明确拒绝 tools 参数时
-/// 自动降级文本协议（审计记录）；关闭时探测失败直接报错提示开启路径。
-/// 切换即清除该提供方的探测缓存，下次对话重新探测
-#[tauri::command]
-pub fn set_provider_text_fallback(
-    state: State<'_, Arc<Ctx>>,
-    id: String,
-    allowed: bool,
-) -> Result<serde_json::Value, String> {
-    let ctx = ctx(state);
-    {
-        let mut cfg = ctx.ai_config.lock().unwrap();
-        let p = cfg
-            .providers
-            .iter_mut()
-            .find(|p| p.id == id)
-            .ok_or("提供方不存在")?;
-        p.text_fallback = allowed;
-    }
-    ctx.native_probe.lock().unwrap().remove(&id);
-    ctx.save_ai_config();
-    crate::audit::record(&ctx, "local-user", "ai.provider.text_fallback", &id, json!({ "allowed": allowed }), true);
-    Ok(json!({ "saved": true }))
 }
 
 /// 播放/暂停：设定当前激活提供方。active=true 时激活该项并暂停其余（互斥）；
@@ -1905,7 +1900,8 @@ pub fn delete_skills(
     Ok(json!({ "removed": removed }))
 }
 
-/// 小圆片播放/暂停：控制 SKILL 与记忆的自动总结循环
+// 自动运行开关：控制后台自主循环（记忆总结 / 技能提炼 / 目标行动）。
+// 早期版本有聊天页的「小圆片」播放/暂停 UI；现收敛为 AI 设置里的一个小圆钮。
 #[tauri::command]
 pub fn toggle_autopilot(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
@@ -1919,11 +1915,8 @@ pub fn toggle_autopilot(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
         json!({}),
         true,
     );
-    // 同步托盘菜单文案与其它窗口
-    crate::tray::refresh(&ctx.app);
-    if let Some(win) = ctx.app.get_webview_window("main") {
-        let _ = win.emit("autopilot-changed", next);
-    }
+    // 通知各窗口刷新小圆钮状态（App 侧另有 overview 轮询兜底）
+    let _ = ctx.app.emit("autopilot-changed", next);
     json!({ "running": next })
 }
 
@@ -2021,17 +2014,6 @@ pub fn quit_app(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String>
     let _ = crate::update::apply_update(&ctx, false);
     ctx.app.exit(0);
     Ok(json!({ "quit": true }))
-}
-
-/// 立即触发一次自动总结（不等周期）
-#[tauri::command]
-pub async fn run_autopilot_now(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
-    let ctx = ctx(state);
-    let ctx2 = ctx.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = crate::autopilot::tick_public(&ctx2).await;
-    });
-    Ok(json!({ "triggered": true }))
 }
 
 /// ── 文件打开（send_file 文件卡片用）──
@@ -2586,19 +2568,25 @@ pub struct UpdateInfo {
     pub downloaded: bool,
 }
 
-/// 版本号比较：a 是否大于 b（按数字段逐位比较）
+/// 版本号比较：a 是否大于 b（按数字段逐位比较，最多 4 段；支持 "v" 前缀与 "R<n>" 后缀）。
+///
+/// 典型用法：
+/// - "0.5.36" → [0, 5, 36]
+/// - "0.6R1"  → [0, 6, 1]   （R 后紧跟的数字作为下一段，保证 0.6 < 0.6R1 < 0.6R2）
+/// - "v1.0.0" → [1, 0, 0]
 pub fn version_gt(a: &str, b: &str) -> bool {
-    let pa: Vec<u64> = a
-        .trim_start_matches('v')
-        .split('.')
-        .filter_map(|x| x.parse().ok())
-        .collect();
-    let pb: Vec<u64> = b
-        .trim_start_matches('v')
-        .split('.')
-        .filter_map(|x| x.parse().ok())
-        .collect();
-    for i in 0..3 {
+    fn parse(v: &str) -> Vec<u64> {
+        // "0.6R1" / "0.6r2" → "0.6.1" / "0.6.2"，统一为 dot 切分
+        let normalized = v.trim_start_matches('v').replace('R', ".").replace('r', ".");
+        normalized
+            .split('.')
+            .filter_map(|x| x.trim().parse::<u64>().ok())
+            .collect()
+    }
+    let pa = parse(a);
+    let pb = parse(b);
+    let n = pa.len().max(pb.len()).min(4);
+    for i in 0..n {
         let x = pa.get(i).copied().unwrap_or(0);
         let y = pb.get(i).copied().unwrap_or(0);
         if x != y {
