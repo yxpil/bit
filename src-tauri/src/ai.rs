@@ -1312,13 +1312,6 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         })
         .collect();
 
-    // shell 工具说明按平台区分：Windows 用 PowerShell，macOS/Linux 用 POSIX shell
-    let shell_syntax = if cfg!(windows) {
-        "run command lines (PowerShell syntax on Windows; use C:\\ style paths)"
-    } else {
-        "run command lines (POSIX shell syntax; use / style paths, e.g. /Users/xxx and /home/xxx)"
-    };
-
     // 用户自定义提示词/人设（空则不注入）
     let custom_prompt = {
         let cfg = ctx.config.lock().unwrap();
@@ -1384,8 +1377,11 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
     let static_template = if !system_prompt_override.is_empty() {
         system_prompt_override
     } else {
-        default_system_prompt_static(native, shell_syntax, skill_examples)
+        default_system_prompt_static(native, skill_examples)
     };
+
+    let tools_at_a_glance = dynamic_tools_at_a_glance(ctx, native);
+    let static_template = static_template.replace("{DYNAMIC_TOOLS_AT_A_GLANCE}", &tools_at_a_glance);
 
     format!(
         "{custom_prompt}\
@@ -1402,15 +1398,129 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
     )
 }
 
+/// 把 JSON Schema 的 properties 压缩成单行可读字符串（用于文本模式的 Tools at a glance）
+fn compact_schema(v: &serde_json::Value) -> String {
+    let props = match v.get("properties").and_then(|x| x.as_object()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return String::new(),
+    };
+    let required: std::collections::HashSet<&str> = v
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let parts: Vec<String> = props
+        .iter()
+        .map(|(k, val)| {
+            let typ = schema_type_hint(val);
+            let opt = if required.contains(k.as_str()) { "" } else { "(optional)" };
+            if opt.is_empty() {
+                format!("{}:{}", k, typ)
+            } else {
+                format!("{}:{}{}", k, typ, opt)
+            }
+        })
+        .collect();
+    format!("{{\"{}\"}}", parts.join(","))
+}
+
+fn schema_type_hint(v: &serde_json::Value) -> String {
+    if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
+        match t {
+            "array" => {
+                let item = v.get("items").map(schema_type_hint).unwrap_or_else(|| "any".into());
+                format!("[{}]", item)
+            }
+            "object" => {
+                let nested = compact_schema(v);
+                if nested.is_empty() { "object".into() } else { nested }
+            }
+            _ => t.into(),
+        }
+    } else if let Some(enm) = v.get("enum").and_then(|x| x.as_array()) {
+        let vals: Vec<String> = enm
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect();
+        if vals.is_empty() {
+            "enum".into()
+        } else {
+            format!("enum[{}]", vals.join("|"))
+        }
+    } else {
+        "any".into()
+    }
+}
+
+/// 动态生成当前可用工具清单。工具被暂停或删除后会自动从清单中消失，
+/// 并随 system_prompt 注入到模型上下文（即同步告知 AI）。
+fn dynamic_tools_at_a_glance(ctx: &Arc<crate::state::Ctx>, native: bool) -> String {
+    let mut tools: Vec<crate::registry::ToolDef> = ctx
+        .tools
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|t| t.enabled)
+        .cloned()
+        .collect();
+    tools.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let mut lines = Vec::new();
+    for t in tools {
+        let params = if native {
+            String::new()
+        } else {
+            compact_schema(&t.parameters)
+        };
+        let owner = match &t.kind {
+            crate::registry::ToolKind::Builtin { .. } => "",
+            crate::registry::ToolKind::Interpreter { .. } | crate::registry::ToolKind::Script { .. } => {
+                " (self-added)"
+            }
+            crate::registry::ToolKind::Remote { .. } => " (remote)",
+            crate::registry::ToolKind::Mcp { .. } => " (MCP)",
+        };
+        let mut line = if t.name == "shell" {
+            let shell_syntax = if cfg!(windows) {
+                "run command lines (PowerShell syntax on Windows; use C:\\\\ style paths)"
+            } else {
+                "run command lines (POSIX shell syntax; use / style paths, e.g. /Users/xxx and /home/xxx)"
+            };
+            if params.is_empty() {
+                format!("- shell: {}", shell_syntax)
+            } else {
+                format!("- shell: {}. Params {}", shell_syntax, params)
+            }
+        } else if params.is_empty() {
+            format!("- {}{}: {}", t.name, owner, t.description)
+        } else {
+            format!("- {}{}: {}. Params {}", t.name, owner, t.description, params)
+        };
+        // 原生模式下参数 schema 已由函数定义单独下发，提示词里不再重复参数细节
+        if native {
+            line = format!("- {}{}: {}", t.name, owner, t.description);
+        }
+        lines.push(line);
+    }
+    // 常驻但不在注册表里的补充能力（无法被暂停/删除）
+    lines.push("- run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {\"runtime\":string,\"code\":string,\"params\":object}".to_string());
+    lines.push("- add_memory: store a long-term memory. Params {\"content\":string,\"kind\":string}".to_string());
+
+    if lines.is_empty() {
+        "(no tools available)".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// 默认系统提示词的「静态部分」—— 不含 manual / skill_examples / closing / runtime_info，
 /// 这些在 build_system_prompt 里始终自动拼接。command 返回给前端显示时也用它。
-pub fn default_system_prompt_static(native: bool, shell_syntax: &str, skill_examples: &str) -> String {
-    format!(
-        "\
+pub fn default_system_prompt_static(_native: bool, skill_examples: &str) -> String {
+    let template = "\
 You are BIT, a self-extending AI assistant. You can call tools, and write code to add new tools for yourself.
 Always reply in the user's language (e.g. reply in Chinese when the user writes Chinese).
-You are a local-first agent: every tool call executes on the user's own machine and all data stays on their device. 
-Your underlying model may be hosted by a remote API provider, but never present yourself as a cloud service — 
+You are a local-first agent: every tool call executes on the user's own machine and all data stays on their device.
+Your underlying model may be hosted by a remote API provider, but never present yourself as a cloud service —
 if asked about your nature, answer honestly: a local agent running on this device, with a model served remotely.
 
 ## Conduct
@@ -1419,47 +1529,30 @@ if asked about your nature, answer honestly: a local agent running on this devic
 - Act decisively; ask the user when truly stuck.
 
 ## Tools at a glance
-- shell: {shell_syntax}. Params {{\"command\":string,\"cwd\":string(optional)}}
-- write_file: create/overwrite a file (document editing). Params {{\"path\":string,\"content\":string}}
-- plan: make a plan; register a goal with step todos. Params {{\"goal\":string,\"steps\":[string]}}
-- plan_update: update plan/todo states (the ONLY update tool). Params {{\"goal_id\":string,\"goal_status\":string(optional, active|achieved|abandoned),\"todos\":[{{\"id\":string,\"status\":string}}]}}
-- edit: patch a file with exact string replacement. Params {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(optional)}}
-- add_tool: add a tool for yourself — persist a piece of code with a local interpreter as a resident tool. Params {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}. Re-registering the same name overwrites your own interpreter/script tool in place (you may rewrite the same-name tool to fix your earlier mistakes); system/remote tools cannot be overwritten
-- skill: read/write the skill library. Save a skill {{\"action\":\"save\",\"name\":string,\"summary\":string}} (same name overwrites); search skills {{\"action\":\"search\",\"query\":string}} (empty query returns all)
-- sub_agent: spawn a sub-agent — it runs a self-contained big task (research / bulk processing / writing large files) in a separate session, blocks until done, and returns its final conclusion verbatim into this conversation (no file-location convention needed; just continue from the returned content). The sub-session stays in the sidebar for full review. Params {{\"task\":string,\"title\":string(optional)}}. The task must be self-contained: the sub-agent cannot see this conversation, so spell out background, goal and acceptance criteria
-- send_file: deliver an existing file to the user — a clickable file card appears in the chat, like sending a file (reports/HTML/images/data files etc.). Params {{\"path\":string,\"note\":string(optional, one-line note)}}
-- delete_tool: delete a tool you created via add_tool (interpreter/script tools only; built-in/remote/MCP tools cannot be deleted). Params {{\"name\":string}}
-- view_image: look at a local image — the image is injected into your next request, so vision models (GPT/Gemini/Claude/deepseek-vision etc.) can actually see it. Params {{\"path\":string,\"note\":string(optional, what to focus on)}}
-- truncate_history: truncate this session's history, keeping only the most recent `keep` messages (default 12). Use proactively when history grows long and early content is no longer valuable. Params {{\"keep\":integer(optional)}}
-- compact_history: compact this session — replace all earlier history with a summary you write (the last 2 messages are kept as-is). Put all key conclusions, decisions, unfinished work and next steps into `summary`. Params {{\"summary\":string}}
+{DYNAMIC_TOOLS_AT_A_GLANCE}
+
 {skill_examples}
 
 ## Extension actions
-- run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {{\"runtime\":string,\"code\":string,\"params\":object}}
-- add_memory {{\"content\":string,\"kind\":string}} — store a long-term memory
-- add_skill {{\"name\":string,\"summary\":string}} — save a reusable skill
+- run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {\"runtime\":string,\"code\":string,\"params\":object}
+- add_memory {\"content\":string,\"kind\":string} — store a long-term memory
 ## Know this before calling anything
 - Only call tools listed in the tools parameter or the Tools at a glance section below. Do NOT invent names — unknown calls will be returned with an available list.
 - Script I/O: read one JSON from stdin, print result JSON to stdout. Examples:
-  Node: `const p=JSON.parse(require('fs').readFileSync(0,'utf8')||'{{}}');console.log(JSON.stringify({{sum:(p.a||0)+(p.b||0)}}))`
-  Python: `import sys,json; p=json.loads(sys.stdin.read() or '{{}}'); print(json.dumps({{'sum':p.get('a',0)+p.get('b',0)}}))`
+  Node: `const p=JSON.parse(require('fs').readFileSync(0,'utf8')||'{}');console.log(JSON.stringify({sum:(p.a||0)+(p.b||0)}))`
+  Python: `import sys,json; p=json.loads(sys.stdin.read() or '{}'); print(json.dumps({'sum':p.get('a',0)+p.get('b',0)}))`
   Compiled langs: same stdin/stdout contract, BIT compiles then runs.
 - Only use runtime ids listed under Local interpreters below.
-- Skill list shows names only; search with skill(action=search) to get full content.",
-        shell_syntax = shell_syntax,
-        skill_examples = skill_examples,
-    )
+- Skill list shows names only; search with skill(action=search) to get full content.";
+    template.replace("{skill_examples}", skill_examples)
 }
 
-/// 获取一份带默认值的系统提示词（仅用于前端显示，原生模式）
-pub fn default_system_prompt_for_display() -> String {
-    let shell_syntax = if cfg!(windows) {
-        "run command lines (PowerShell syntax on Windows; use C:\\\\ style paths)"
-    } else {
-        "run command lines (POSIX shell syntax; use / style paths, e.g. /Users/xxx and /home/xxx)"
-    };
+
+pub fn default_system_prompt_for_display(ctx: &Arc<crate::state::Ctx>) -> String {
     let skill_examples = "The SKILL list in this prompt shows names only. When a skill name looks relevant to the current task, fetch its full content first via Tool skill with action=search and query=that name, then follow it.";
-    default_system_prompt_static(true, shell_syntax, skill_examples)
+    let template = default_system_prompt_static(true, skill_examples);
+    let tools_at_a_glance = dynamic_tools_at_a_glance(ctx, true);
+    template.replace("{DYNAMIC_TOOLS_AT_A_GLANCE}", &tools_at_a_glance)
 }
 
 // ============ 原生工具调用（function calling）：OpenAI / Claude / Gemini ============
@@ -1598,19 +1691,9 @@ pub fn native_tool_defs(ctx: &Arc<crate::state::Ctx>) -> Vec<serde_json::Value> 
             serde_json::json!({"type":"object","properties":{"runtime":{"type":"string","description":"本机可用解释器 id"},"code":{"type":"string","description":"完整代码"},"params":{"type":"object","description":"传给代码的参数"}},"required":["runtime","code"]}),
         ),
         (
-            "write_tool",
-            "用本机解释器把一段代码沉淀为常驻工具；同名工具若为你自建则原位覆盖更新（可借此修正有误的实现）",
-            serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"runtime":{"type":"string"},"code":{"type":"string"}},"required":["name","description","runtime","code"]}),
-        ),
-        (
             "add_memory",
             "沉淀一条长期记忆",
             serde_json::json!({"type":"object","properties":{"content":{"type":"string"},"kind":{"type":"string","description":"如 preference/fact"}},"required":["content"]}),
-        ),
-        (
-            "add_skill",
-            "沉淀一条可复用技能",
-            serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"summary":{"type":"string"}},"required":["name","summary"]}),
         ),
     ];
     for (name, desc, params) in extra {

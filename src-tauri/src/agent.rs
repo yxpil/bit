@@ -275,10 +275,11 @@ pub(crate) fn auto_pass(mode: &str, tool: &str) -> bool {
 fn is_safe_tool(tool: &str) -> bool {
     const SAFE: &[&str] = &[
         "add_memory",
-        "add_skill",
         "plan_update",
-        "write_plugin",
-        "write_tool",
+        // 自扩展（注册/覆盖工具）是沉淀类动作，auto 模式自动放行
+        "add_tool",
+        "delete_tool",
+        "list_tools",
     ];
     if SAFE.iter().any(|s| s.eq_ignore_ascii_case(tool)) {
         return true;
@@ -311,37 +312,7 @@ pub async fn execute_tool_call(
         request_approval(ctx, name, params, session_id, "ai-self").await?;
     }
     match name {
-        // ---- AI 基础能力：为自己写插件并注册 ----
-        "write_plugin" => {
-            let (pname, desc, code) = (
-                params.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                params.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                params.get("code").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            );
-            if pname.is_empty() || code.is_empty() {
-                return Err("write_plugin requires name and code parameters".into());
-            }
-            // 注册前先试运行一次，确保脚本可用
-            crate::script::run(&code, json!({})).map_err(|e| format!("插件代码校验失败: {e}"))?;
-            let tool = crate::registry::register(
-                ctx,
-                &pname,
-                &desc,
-                json!({"type": "object", "properties": {}, "additionalProperties": true}),
-                crate::registry::ToolKind::Script { code },
-                "ai-self",
-            )?;
-            crate::audit::record(
-                ctx,
-                "ai-self",
-                "plugin.write",
-                &tool.name,
-                json!({ "description": desc }),
-                true,
-            );
-            Ok(json!({ "registered": tool.name, "id": tool.id }))
-        }
-        // ---- AI 基础能力：用本机解释器直接执行一段 JS/PY 代码 ----
+        // ---- AI 基础能力：用本机解释器直接执行一段 JS/PY 代码（临时，不落地） ----
         "run_script" => {
             let runtime = params.get("runtime").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -360,34 +331,6 @@ pub async fn execute_tool_call(
             crate::audit::record(ctx, "ai-self", "script.run", "run_script", json!({ "ok": out.is_ok() }), out.is_ok());
             out
         }
-        // ---- AI 基础能力：把一段 JS/PY 代码沉淀为常驻工具 ----
-        "write_tool" => {
-            let (tname, desc, runtime, code) = (
-                params.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                params.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                params.get("runtime").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                params.get("code").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            );
-            if tname.is_empty() || runtime.is_empty() || code.is_empty() {
-                return Err("write_tool requires name / runtime / code parameters".into());
-            }
-            match crate::runtime::get(ctx, &runtime) {
-                None => return Err(format!("Interpreter `{runtime}` is not registered")),
-                Some(rt) if !rt.enabled => return Err(format!("Interpreter `{runtime}` is paused; cannot be used for a new tool")),
-                _ => {}
-            }
-            let tool = crate::registry::register_opts(
-                ctx,
-                &tname,
-                &desc,
-                json!({"type": "object", "properties": {}, "additionalProperties": true}),
-                crate::registry::ToolKind::Interpreter { runtime: runtime.clone(), code },
-                "ai-self",
-                true, // 同名自建工具覆盖更新（修正错误实现）
-            )?;
-            crate::audit::record(ctx, "ai-self", "tool.write", &tool.name, json!({ "runtime": runtime }), true);
-            Ok(json!({ "registered": tool.name, "id": tool.id }))
-        }
         "add_memory" => {
             let content = params.get("content").and_then(|v| v.as_str()).unwrap_or_default();
             let kind = params.get("kind").and_then(|v| v.as_str()).unwrap_or("raw");
@@ -397,17 +340,7 @@ pub async fn execute_tool_call(
             crate::memory::add_memory(ctx, content, kind, "ai");
             Ok(json!({ "saved": content }))
         }
-        // ---- AI 基础能力：技能沉淀 ----
-        "add_skill" => {
-            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-            let summary = params.get("summary").and_then(|v| v.as_str()).unwrap_or_default();
-            if name.is_empty() || summary.is_empty() {
-                return Err("add_skill requires name and summary parameters".into());
-            }
-            crate::memory::add_skill(ctx, name, summary, "ai");
-            Ok(json!({ "skill": name }))
-        }
-        // ---- 已注册工具（内置 / 远程 / AI 自写脚本插件） ----
+        // ---- 已注册工具（内置 / 远程 / AI 自建解释器工具） ----
         other => {
             let tool = {
                 let tools = ctx.tools.lock().unwrap();
@@ -1782,8 +1715,8 @@ mod tests {
         assert!(auto_pass("allow_all", "edit"));
         assert!(auto_pass("allow_all", "delete_tool"));
         // auto：沉淀类与只读类放行，执行类询问
-        assert!(auto_pass("auto", "add_skill"));
         assert!(auto_pass("auto", "add_memory"));
+        assert!(auto_pass("auto", "add_tool"));
         assert!(auto_pass("auto", "list_tools"));
         assert!(auto_pass("auto", "view_image"));
         // skill 工具含 save 分支（有写入语义），保守处理：询问
@@ -1794,7 +1727,7 @@ mod tests {
         assert!(!auto_pass("auto", "delete_tool"));
         // ask：全部询问
         assert!(!auto_pass("ask", "shell"));
-        assert!(!auto_pass("ask", "add_skill"));
+        assert!(!auto_pass("ask", "add_memory"));
         assert!(!auto_pass("ask", "list_tools"));
         // 未知模式按 ask 处理（保守）
         assert!(!auto_pass("", "shell"));

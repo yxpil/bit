@@ -56,7 +56,7 @@ async fn autonomous_step(ctx: &Arc<Ctx>) -> Result<(), String> {
     // 组织一轮自主提示：让 AI 挑一件当前最该推进的事去做
     let system = ai::system_prompt(ctx, None);
     let user = "现在处于 Autopilot 自主模式。请审视上面的目标与待办，挑选当前最该推进的【一件】事去做：\
-        可以调用工具、用 run_script/write_tool 写代码、write_plugin 写插件、add_skill 沉淀技能、\
+        可以调用工具、用 run_script 临时执行代码、用 add_tool 沉淀为常驻工具、用 skill 沉淀技能、\
         plan_update 标记进度或目标状态。若需要行动就【只输出】工具调用 JSON 数组；若当前无事可做或全部完成，\
         直接输出一句简短说明（不要输出 JSON）。";
     let messages = vec![

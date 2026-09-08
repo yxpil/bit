@@ -634,7 +634,7 @@ export default function ToolsPage({ onStats }) {
                   />
                 </div>
                 <div className="flex w-8 justify-center">
-                  {tool.kind !== "builtin" && (
+                  {tool.kind?.kind !== "builtin" && (
                     <button onClick={() => remove(tool.id)} className="icon-btn shrink-0" title={t("common.delete")}>
                       <IconTrash size={13} />
                     </button>

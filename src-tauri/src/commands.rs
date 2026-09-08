@@ -444,7 +444,7 @@ pub fn get_system_prompt(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let stored = cfg.system_prompt.trim();
     if stored.is_empty() {
         // 返回默认模板让前端直接显示
-        json!({ "system_prompt": crate::ai::default_system_prompt_for_display(), "is_default": true })
+        json!({ "system_prompt": crate::ai::default_system_prompt_for_display(&ctx), "is_default": true })
     } else {
         json!({ "system_prompt": stored, "is_default": false })
     }
