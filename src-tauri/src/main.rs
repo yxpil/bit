@@ -9,6 +9,7 @@ mod autopilot;
 mod commands;
 mod config;
 mod crash;
+mod delegation;
 mod extract;
 mod goal;
 mod guardian;
@@ -327,6 +328,8 @@ fn main() {
             commands::set_provider_text_fallback,
             commands::chat,
             commands::chat_stream,
+            commands::subagent_spawn,
+            commands::subagent_running,
             commands::extract_file,
             commands::fetch_webpage,
             commands::check_port,

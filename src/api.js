@@ -39,7 +39,17 @@ export const api = {
   getSystemPrompt: () => invoke("get_system_prompt"),
   setSystemPrompt: (system_prompt) => invoke("set_system_prompt", { systemPrompt: system_prompt }),
   getBehaviorSettings: () => invoke("get_behavior_settings"),
-  setBehaviorSettings: (auto_drive, tool_approval, moderation_enabled) => invoke("set_behavior_settings", { autoDrive: auto_drive, toolApproval: tool_approval, moderationEnabled: moderation_enabled }),
+  setBehaviorSettings: (auto_drive, tool_approval, moderation_enabled, auto_delegate) =>
+    invoke("set_behavior_settings", {
+      autoDrive: auto_drive,
+      toolApproval: tool_approval,
+      moderationEnabled: moderation_enabled,
+      autoDelegate: auto_delegate,
+    }),
+  // 子代理（宿主调度）：模型侧无此工具，只有宿主/用户能派生
+  spawnSubagent: (task, title, session_id) =>
+    invoke("subagent_spawn", { task, title: title || null, sessionId: session_id || null }),
+  subagentRunning: () => invoke("subagent_running"),
   // 远程二维码：网络探测（LAN/公网候选 + NAT 粗判）→ 返回 { payload, svg }
   getRemoteQr: () => invoke("get_remote_qr"),
   getLanInfo: () => invoke("get_lan_info"),

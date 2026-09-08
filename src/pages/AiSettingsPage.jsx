@@ -44,7 +44,12 @@ export default function AiSettingsPage({ onStats, stats }) {
   const [limits, setLimits] = useState({ word_repeat_max: 20, tool_loop_max: 20 });
   const [limitsSaved, setLimitsSaved] = useState(false);
   // AI 行为设置：自动推进 / 审批模式 / 敏感词审核
-  const [behavior, setBehavior] = useState({ auto_drive: true, tool_approval: "ask", moderation_enabled: true });
+  const [behavior, setBehavior] = useState({
+    auto_drive: true,
+    auto_delegate: false,
+    tool_approval: "ask",
+    moderation_enabled: true,
+  });
   // 用户自定义提示词/人设
   const [customPrompt, setCustomPrompt] = useState("");
   const [promptSaved, setPromptSaved] = useState(false);
@@ -68,7 +73,17 @@ export default function AiSettingsPage({ onStats, stats }) {
     load();
     api.getAiParams().then((r) => setParams({ temperature: r?.temperature ?? null, reasoning_effort: r?.reasoning_effort || "" })).catch(() => {});
     api.getGuardLimits().then((r) => setLimits({ word_repeat_max: r?.word_repeat_max ?? 20, tool_loop_max: r?.tool_loop_max ?? 20 })).catch(() => {});
-    api.getBehaviorSettings().then((r) => setBehavior({ auto_drive: r?.auto_drive ?? true, tool_approval: r?.tool_approval || "ask", moderation_enabled: r?.moderation_enabled ?? true })).catch(() => {});
+    api
+      .getBehaviorSettings()
+      .then((r) =>
+        setBehavior({
+          auto_drive: r?.auto_drive ?? true,
+          auto_delegate: r?.auto_delegate ?? false,
+          tool_approval: r?.tool_approval || "ask",
+          moderation_enabled: r?.moderation_enabled ?? true,
+        })
+      )
+      .catch(() => {});
     api.getCustomPrompt().then((r) => setCustomPrompt(r?.custom_prompt || "")).catch(() => {});
     api.getSystemPrompt().then((r) => setSystemPrompt(r?.system_prompt || "")).catch(() => {});
     api.getAutostart().then((r) => setAutostart(!!r?.enabled)).catch(() => setAutostart(false));
@@ -122,7 +137,9 @@ export default function AiSettingsPage({ onStats, stats }) {
   };
   const saveBehavior = (next) => {
     setBehavior(next);
-    api.setBehaviorSettings(next.auto_drive, next.tool_approval, next.moderation_enabled).catch(() => {});
+    api
+      .setBehaviorSettings(next.auto_drive, next.tool_approval, next.moderation_enabled, next.auto_delegate)
+      .catch(() => {});
   };
 
   const editing = form.id !== null;
@@ -476,6 +493,17 @@ export default function AiSettingsPage({ onStats, stats }) {
           <PillSwitch
             checked={behavior.auto_drive}
             onChange={(v) => saveBehavior({ ...behavior, auto_drive: v })}
+          />
+        </div>
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm">{t("ai.autoDelegate")}</p>
+            <p className="text-xs text-neutral-500">{t("ai.autoDelegateHint")}</p>
+          </div>
+          <PillSwitch
+            checked={!!behavior.auto_delegate}
+            onChange={(v) => saveBehavior({ ...behavior, auto_delegate: v })}
           />
         </div>
 

@@ -278,8 +278,9 @@ fn is_safe_tool(tool: &str) -> bool {
         "plan_update",
         // 自扩展（注册/覆盖工具）是沉淀类动作，auto 模式自动放行
         "add_tool",
-        "delete_tool",
         "list_tools",
+        // delete_tool 不在 SAFE 中：删除是破坏性语义，即使内置了 registry.rs 的删除保护
+        // （builtin/remote/MCP 不可删），仍要求 auto 模式下需审批确认
     ];
     if SAFE.iter().any(|s| s.eq_ignore_ascii_case(tool)) {
         return true;
@@ -348,10 +349,15 @@ pub async fn execute_tool_call(
                     Some(t) => t,
                     None => {
                         // 未知工具 → 不报错，而是返回可用工具列表让模型自动纠正
-                        let available: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                        // （宿主管控工具不下发给模型，也不出现在纠正列表里）
+                        let available: Vec<String> = tools
+                            .iter()
+                            .filter(|t| t.enabled && !crate::ai::is_host_only_tool(&t.name))
+                            .map(|t| t.name.clone())
+                            .collect();
                         return Ok(json!({
                             "error": format!("Unknown tool '{other}'. Available: {}", available.join(", ")),
-                            "hint": "Call one of the available tools above instead."
+                            "hint": "Retry with one of the available tools above, using its exact name and schema."
                         }));
                     }
                 }
@@ -415,7 +421,7 @@ fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> 
     let pending: Vec<&crate::goal::Todo> = all.iter().filter(|t| t.status != "completed").collect();
     // 安全上限：同一目标最多 AUTO_DRIVE_MAX 轮自动推进
     let mut counts = ctx.auto_drive_counts.lock().unwrap();
-    let n = counts.entry(gid).or_insert(0);
+    let n = counts.entry(gid.clone()).or_insert(0);
     *n += 1;
     if *n > crate::config::AUTO_DRIVE_MAX {
         return None;
@@ -424,8 +430,11 @@ fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> 
     let done = all.len() - pending.len();
     let next_step = match pending.first() {
         Some(t) => format!("下一步：「{}」。请执行这一步。", t.content),
-        // 待办全部完成但目标还挂着：让 AI 收尾（标记 achieved 并总结）
-        None => "所有待办均已完成。请调用 plan_update(goal_status=achieved) 将本目标标记为 achieved，并简要总结成果。".to_string(),
+        // 待办全部完成：自动将该目标标记为 achieved（计划即达成），并让 AI 收尾总结
+        None => {
+            let _ = crate::goal::update_goal_status(ctx, &gid, "achieved");
+            "所有待办均已完成，本目标已自动标记为 achieved。请简要总结成果。".to_string()
+        }
     };
     Some(format!(
         "继续（自动推进）：目标「{title}」尚未完成（待办 {done}/{}）。{next_step}全部完成后调用 plan_update(goal_status=achieved) 将目标标记为 achieved。若必须等用户决策或输入才能继续，回复以 [WAIT] 开头并说明需要什么。",

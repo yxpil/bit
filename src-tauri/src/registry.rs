@@ -1,5 +1,6 @@
 // yxpil · BIT
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// 工具类型：
@@ -122,6 +123,32 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "plan_update",
         ),
+        // 3.6 写入/重写待办清单（整体替换某目标下的待办；等价于 TodoWrite）
+        mk(
+            "builtin.todo_write",
+            "todo_write",
+            "Write or rewrite the todo list for a goal (or standalone). Replaces the entire todo list under the given goal_id. Pass items as either strings or {content, status} objects.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal_id": { "type": "string", "description": "Goal id returned by the plan tool (optional; omit for a standalone list)" },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                { "type": "string", "description": "Todo content (status defaults to pending)" },
+                                { "type": "object", "properties": {
+                                    "content": { "type": "string" },
+                                    "status": { "type": "string", "description": "pending | in_progress | completed" }
+                                }, "required": ["content"] }
+                            ]
+                        },
+                        "description": "Todo items: strings or {content, status} objects"
+                    }
+                }
+            }),
+            "todo_write",
+        ),
         // 4. edit：增量补丁修改文件
         mk(
             "builtin.edit",
@@ -156,11 +183,11 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "add_tool",
         ),
-        // 5.5 子智能体：派生独立会话执行子任务
+        // 5.5 子智能体：派生独立会话执行子任务（宿主管控：不下发给模型，由宿主调度生命周期）
         mk(
             "builtin.sub_agent",
             "sub_agent",
-            "Spawn a sub-agent: opens an independent session with the full task. The sub-agent has ALL your tools and runs autonomously (multi-turn, including file read/write and shell) until it produces a final answer. Ideal for delegating independent large tasks (research, batch processing, writing large files, parallel branches). This tool blocks and returns the sub-agent's final answer VERBATIM into the current conversation - no file location conventions needed; just continue from the returned content. The task must be self-contained: the sub-agent cannot see the current conversation history, so include background, goal and acceptance criteria",
+            "HOST-SCHEDULED (never exposed to the model): spawn a sub-agent that opens an independent session with the full task. The sub-agent has ALL tools and runs autonomously (multi-turn, including file read/write and shell) until it finishes, then its final answer is returned verbatim to the caller. The task must be self-contained — the sub-agent cannot see the caller's history, so include background, goal and acceptance criteria.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -370,6 +397,47 @@ pub fn set_enabled(ctx: &Arc<crate::state::Ctx>, id: &str, enabled: bool) -> Res
         true,
     );
     Ok(enabled)
+}
+
+/// 在途子代理计数（进程级）：既是嵌套深度，也是「现在有几个子代理在跑」，
+/// 宿主调度据此限流（见 delegation::MAX_CONCURRENT）。
+static SUBAGENT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// 当前在跑的子代理数量（含嵌套层）
+pub fn subagent_depth() -> usize {
+    SUBAGENT_DEPTH.load(Ordering::SeqCst)
+}
+
+/// 子代理生命周期事件（宿主调度模型的对外通知面）。
+/// 模型侧看不到子代理工具、也无法自行派生：只有宿主入口（远程/自动化/宿主逻辑）
+/// 触发 `sub_agent` 时才会依次广播 spawn → start → done|error。
+/// phase: spawn（会话已建） / start（开始跑） / done（拿到结论） / error（失败或超时/中断）
+fn emit_subagent(
+    ctx: &Arc<crate::state::Ctx>,
+    phase: &str,
+    sid: &str,
+    parent: Option<&str>,
+    title: &str,
+    depth: usize,
+    extra: Option<serde_json::Value>,
+) {
+    use tauri::Emitter;
+    let mut payload = serde_json::json!({
+        "phase": phase,
+        "session_id": sid,
+        "parent": parent,
+        "title": title,
+        "depth": depth,
+        "at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    });
+    if let (Some(obj), Some(ext)) =
+        (payload.as_object_mut(), extra.as_ref().and_then(|v| v.as_object()))
+    {
+        for (k, v) in ext {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let _ = ctx.app.emit("subagent-lifecycle", payload);
 }
 
 /// 执行工具：内置实现或转发到 Agent 回调端点
@@ -694,6 +762,17 @@ async fn builtin_invoke(
                 "todos": todo_results,
             }))
         }
+        // ── 3.6 写入/重写待办清单 ──
+        "todo_write" => {
+            let goal_id = params.get("goal_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let items: Vec<serde_json::Value> = params
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let written = crate::goal::rewrite_todos(ctx, goal_id, &items, actor, session)?;
+            Ok(serde_json::json!({ "written": written }))
+        }
         // ── 4. edit：增量补丁 ──
         "edit" => {
             let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
@@ -746,8 +825,6 @@ async fn builtin_invoke(
         }
         // ── 5. 子智能体：开新会话独立完成任务 ──
         "sub_agent" => {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SUBAGENT_DEPTH: AtomicUsize = AtomicUsize::new(0);
             struct DecGuard;
             impl Drop for DecGuard {
                 fn drop(&mut self) {
@@ -765,22 +842,25 @@ async fn builtin_invoke(
                 return Err("task cannot be empty".into());
             }
             let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("子任务").to_string();
+            let parent = session.map(|s| s.to_string());
+            let started = std::time::Instant::now();
             // 新建独立会话（用户可在侧栏看到全过程）
             let sess = crate::session::Session::new(&title);
             let sid = sess.id.clone();
             ctx.sessions.lock().unwrap().sessions.push(sess);
             crate::session::persist(ctx);
+            emit_subagent(ctx, "spawn", &sid, parent.as_deref(), &title, depth, None);
             {
                 use tauri::Emitter;
                 let _ = ctx.app.emit("sessions-updated", &sid);
             }
+            emit_subagent(ctx, "start", &sid, parent.as_deref(), &title, depth, None);
             // 阻塞执行子任务：完整复用 agent 循环（工具、审批、自动续发全部生效）。
             // Box::pin：builtin_invoke → chat_turn → execute_tool_call → builtin_invoke 递归，需手动打断无限大小
             let mut run = Box::pin(crate::agent::chat_turn(ctx, &sid, &task, Vec::new()));
             const SUB_TIMEOUT_SECS: u64 = 15 * 60;
             let mut sleep = tokio::time::sleep(std::time::Duration::from_secs(SUB_TIMEOUT_SECS));
             // 主会话点「停止」时立刻取消子任务，而不是干等子任务跑完
-            let parent = session.map(|s| s.to_string());
             let mut watch = async {
                 loop {
                     if parent
@@ -842,6 +922,29 @@ async fn builtin_invoke(
                     }
                 }
             };
+            // 生命周期收尾事件：宿主/前端据此知道子代理跑完还是失败（含耗时与结论长度）
+            let elapsed_ms = started.elapsed().as_millis();
+            let extra = match &outcome {
+                Ok(v) => serde_json::json!({
+                    "ms": elapsed_ms,
+                    "answer_chars": v
+                        .get("final_answer")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0),
+                    "truncated": v.get("truncated").and_then(|b| b.as_bool()).unwrap_or(false),
+                }),
+                Err(e) => serde_json::json!({ "ms": elapsed_ms, "error": e }),
+            };
+            emit_subagent(
+                ctx,
+                if outcome.is_ok() { "done" } else { "error" },
+                &sid,
+                parent.as_deref(),
+                &title,
+                depth,
+                Some(extra),
+            );
             {
                 use tauri::Emitter;
                 let _ = ctx.app.emit("sessions-updated", &sid);

@@ -353,13 +353,34 @@ pub fn get_remote_status(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value
     }))
 }
 
-/// AI 行为设置（设置页读写）：自动推进 / 审批模式 / 敏感词审核
+/// 宿主调度：显式派生子代理。
+/// 模型侧没有这个工具（宿主管控），只有 UI / 远程 API / 宿主逻辑能触发。
+#[tauri::command]
+pub async fn subagent_spawn(
+    state: State<'_, Arc<Ctx>>,
+    task: String,
+    title: Option<String>,
+    session_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let parent = session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    crate::delegation::spawn(&ctx, parent, &task, title.as_deref()).await
+}
+
+/// 当前在跑的子代理数量（宿主调度面板用）
+#[tauri::command]
+pub fn subagent_running() -> usize {
+    crate::registry::subagent_depth()
+}
+
+/// AI 行为设置（设置页读写）：自动推进 / 子代理自动委派 / 审批模式 / 敏感词审核
 #[tauri::command]
 pub fn get_behavior_settings(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
     let cfg = ctx.config.lock().unwrap();
     json!({
         "auto_drive": cfg.auto_drive,
+        "auto_delegate": cfg.auto_delegate,
         "tool_approval": cfg.tool_approval,
         "moderation_enabled": cfg.moderation_enabled,
     })
@@ -371,6 +392,7 @@ pub fn set_behavior_settings(
     auto_drive: bool,
     tool_approval: String,
     moderation_enabled: bool,
+    auto_delegate: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     {
@@ -378,6 +400,10 @@ pub fn set_behavior_settings(
         cfg.auto_drive = auto_drive;
         cfg.tool_approval = tool_approval;
         cfg.moderation_enabled = moderation_enabled;
+        // 可选参数：老前端不传时保持原值
+        if let Some(v) = auto_delegate {
+            cfg.auto_delegate = v;
+        }
         drop(cfg);
     }
     ctx.save_config();
@@ -1355,10 +1381,26 @@ pub fn active_max_context(ctx: &Arc<Ctx>) -> Option<u64> {
     let ai = ctx.ai_config.lock().unwrap();
     let p = ai.active()?.clone();
     let base = p.base_url.trim().trim_end_matches('/');
-    ai.model_context
-        .get(&ctx_key(base, &p.model))
-        .copied()
-        .or_else(|| claude_context_for(&p.model))
+    // 精确匹配：provider.model 与模型列表中的 id 完全一致
+    if let Some(n) = ai.model_context.get(&ctx_key(base, &p.model)).copied() {
+        return Some(n);
+    }
+    // 兜底：同 base 下已缓存了模型上下文，但 provider 的 model 字段是别名 / 快照未列出的 id
+    // （很多提供方 /v1/models 返回的 id 与配置里填的模型名不一致）。取同 base 下最小的可用
+    // 上下文长度（保守，避免高估导致截断），保证 max_context 能取到。
+    if !p.model.is_empty() {
+        let prefix = format!("{}|", base);
+        if let Some(min) = ai
+            .model_context
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| *v)
+            .min()
+        {
+            return Some(min);
+        }
+    }
+    claude_context_for(&p.model)
 }
 
 /// 从提供方 API 拉取可用模型列表（顺带把上下文长度写入持久缓存）：

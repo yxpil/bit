@@ -75,11 +75,12 @@ function applyLook(look) {
   root.classList.toggle("has-transparency", op < 100);
 }
 
+// 默认即「启用外观定制」：开箱即带主题色、背景色、透明度，不再回退到黑白胶囊风
 const DEFAULT_LOOK = {
-  enabled: false,
+  enabled: true,
   bgColorLight: "#ffffff",
-  bgColorDark: "#0a0a0a",
-  bgOpacity: 100,
+  bgColorDark: "#18181b",
+  bgOpacity: 90,
   bgImage: "",
   borderOn: true,
   borderRadius: 0,
@@ -91,7 +92,8 @@ const DEFAULT_LOOK = {
 export function useTheme() {
   const [mode, setMode] = useState(() => localStorage.getItem(KEY) || "light");
   const [isDark, setIsDark] = useState(() => apply(localStorage.getItem(KEY) || "light"));
-  const [accent, setAccentState] = useState(() => localStorage.getItem(ACCENT_KEY) || "");
+  // 默认主题色：橙色 #ea580c（与外观定制页推荐配置一致，避免开箱是彩虹无主题态）
+  const [accent, setAccentState] = useState(() => localStorage.getItem(ACCENT_KEY) || "#ea580c");
   const [look, setLookState] = useState(() => {
     try {
       const raw = localStorage.getItem(LOOK_KEY);

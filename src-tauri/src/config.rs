@@ -24,6 +24,10 @@ pub struct Config {
     /// 目标自动推进：回合结束后本会话有未完成目标时，自动把规划的下一步发给 AI 续跑直到完成
     #[serde(default = "default_true")]
     pub auto_drive: bool,
+    /// 子代理自动委派：Autopilot 周期里由宿主把「活跃目标下未开始的待办」派生给子代理并行推进。
+    /// 模型侧无该工具（宿主管控），这里只是宿主是否主动派活的开关；默认关闭以免悄悄烧 token
+    #[serde(default)]
+    pub auto_delegate: bool,
     /// 幻觉防护：单个词在一条回复里出现次数达到该值即判定为幻觉循环（0=关闭）
     #[serde(default = "default_word_repeat_max")]
     pub word_repeat_max: u32,
@@ -159,6 +163,7 @@ impl Default for Config {
             revision: 1,
             tool_approval: default_approval(),
             auto_drive: true,
+            auto_delegate: false,
             word_repeat_max: default_word_repeat_max(),
             tool_loop_max: default_tool_loop_max(),
             custom_prompt: String::new(),

@@ -121,6 +121,7 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/tools", get(list_tools).post(register_tool))
         .route("/api/tools/{id}", axum::routing::delete(remove_tool))
         .route("/api/tools/{id}/invoke", post(invoke_tool))
+        .route("/api/subagents", get(list_subagents).post(spawn_subagent))
         .route("/api/chat", post(remote_chat))
         .route("/api/approvals", get(list_approvals))
         .route("/api/approvals/{id}", post(answer_approval))
@@ -907,6 +908,54 @@ async fn invoke_tool(
             Json(json!({ "error": e })),
         )
             .into_response(),
+    }
+}
+
+// ==================== 子代理（宿主调度）====================
+// 模型侧没有 sub_agent 工具，远程宿主通过这里派生 / 查看在途子代理。
+// 均在 /api/* 双重认证（Client Key + 访问密码）之下。
+
+/// 在途子代理数量
+async fn list_subagents() -> Json<serde_json::Value> {
+    Json(json!({
+        "running": crate::registry::subagent_depth(),
+        "max_concurrent": crate::delegation::MAX_CONCURRENT,
+    }))
+}
+
+/// 派生子代理：body { task, title?, session_id? }，阻塞到子代理跑完（内部上限 15 分钟）
+async fn spawn_subagent(
+    State(ctx): State<Arc<Ctx>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let actor = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| actor_of(v.strip_prefix("Bearer ").unwrap_or("")))
+        .unwrap_or_else(|| "agent:unknown".into());
+    let task = body.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if task.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "task is required" }))).into_response();
+    }
+    let title = body.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let parent = body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    crate::audit::record(
+        &ctx,
+        &actor,
+        "subagent.spawn",
+        parent.as_deref().unwrap_or("global"),
+        json!({ "task_chars": task.chars().count(), "title": title }),
+        true,
+    );
+    match crate::delegation::spawn(&ctx, parent.as_deref(), &task, title.as_deref()).await {
+        Ok(result) => Json(json!({ "result": result })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
 

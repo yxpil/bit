@@ -19,6 +19,9 @@ pub async fn run(ctx: Arc<Ctx>) {
         if running {
             // 自主行动：仅在有活跃目标/未完成待办、且到达间隔时执行
             if ticks % AUTONOMOUS_EVERY == 0 {
+                // 宿主调度优先：先把可外派的待办派给子代理（后台跑），
+                // 再让 AI 自己挑一件事做——避免两边抢同一条待办
+                crate::delegation::auto_step(&ctx);
                 if let Err(e) = autonomous_step(&ctx).await {
                     crate::audit::record(&ctx, "autopilot", "autopilot.error", "autonomous", json!({"error": e}), false);
                 }
@@ -53,17 +56,59 @@ async fn autonomous_step(ctx: &Arc<Ctx>) -> Result<(), String> {
         return Ok(());
     }
 
-    // 组织一轮自主提示：让 AI 挑一件当前最该推进的事去做
-    let system = ai::system_prompt(ctx, None);
+    // 组织一轮自主提示：让 AI 挑一件当前最该推进的事去做。
+    // Autopilot 同属宿主侧调度，优先走原生 function calling（与对话主链路同一套工具契约），
+    // 端点不支持 tools 时才退回文本约定——不再让模型手写裸 JSON 数组。
     let user = "现在处于 Autopilot 自主模式。请审视上面的目标与待办，挑选当前最该推进的【一件】事去做：\
         可以调用工具、用 run_script 临时执行代码、用 add_tool 沉淀为常驻工具、用 skill 沉淀技能、\
-        plan_update 标记进度或目标状态。若需要行动就【只输出】工具调用 JSON 数组；若当前无事可做或全部完成，\
-        直接输出一句简短说明（不要输出 JSON）。";
-    let messages = vec![
-        ChatMessage::system(system),
-        ChatMessage::user(user),
-    ];
+        plan_update 标记进度或目标状态。需要行动就直接发起工具调用（互不依赖的调用放在同一轮）；\
+        若当前无事可做或全部完成，直接输出一句简短说明，不要发起任何调用。";
 
+    let native = {
+        let convo = vec![
+            ChatMessage::system(ai::system_prompt_native(ctx, None)),
+            ChatMessage::user(user),
+        ];
+        ai::chat_native_round(ctx, &convo, &[], &[]).await
+    };
+    match native {
+        Ok(round) => {
+            // 无调用 = 模型认为当前无需行动，记为一条自主思考
+            if round.calls.is_empty() {
+                let note = round.content.trim();
+                if !note.is_empty() {
+                    crate::audit::record(ctx, "autopilot", "autonomous.idle", "think", json!({ "note": note.chars().take(200).collect::<String>() }), true);
+                }
+                return Ok(());
+            }
+            let mut done = 0;
+            for c in round.calls.iter().take(4) {
+                if c.name.is_empty() {
+                    continue;
+                }
+                match crate::agent::execute_tool_call(ctx, &c.name, &c.args, None).await {
+                    Ok(_) => done += 1,
+                    Err(e) => {
+                        crate::audit::record(ctx, "autopilot", "autonomous.tool_error", &c.name, json!({ "error": e }), false);
+                    }
+                }
+            }
+            crate::audit::record(ctx, "autopilot", "autonomous.step", "act", json!({ "calls": done, "mode": "native" }), true);
+            return Ok(());
+        }
+        Err(e) => {
+            crate::audit::record(ctx, "autopilot", "autonomous.native_fallback", "native", json!({ "error": format!("{e:?}") }), false);
+        }
+    }
+
+    // 文本约定兜底：端点不支持原生工具参数时走老路径
+    let messages = vec![
+        ChatMessage::system(ai::system_prompt(ctx, None)),
+        ChatMessage::user("现在处于 Autopilot 自主模式。请审视上面的目标与待办，挑选当前最该推进的【一件】事去做：\
+            可以调用工具、用 run_script 临时执行代码、用 add_tool 沉淀为常驻工具、用 skill 沉淀技能、\
+            plan_update 标记进度或目标状态。若需要行动就【只输出】工具调用 JSON 数组；若当前无事可做或全部完成，\
+            直接输出一句简短说明（不要输出 JSON）。"),
+    ];
     let reply = ai::chat(ctx, &messages).await?;
 
     // 解析工具调用；不是工具调用就当作一句思考记录下来即可

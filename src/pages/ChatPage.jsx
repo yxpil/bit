@@ -80,6 +80,14 @@ export default function ChatPage({ onStats, visible }) {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [contextMeta, setContextMeta] = useState({ est_tokens: 0 });
 
+  // 子代理（宿主调度）：模型侧没有这个工具，只有宿主/用户能派生；这里做生命周期可视化
+  const [subs, setSubs] = useState({}); // { session_id: { title, phase, ms, error, at, parent } }
+  const [delegateOpen, setDelegateOpen] = useState(false);
+  const [delegateTask, setDelegateTask] = useState("");
+  const [delegateBusy, setDelegateBusy] = useState(false);
+  const [delegateErr, setDelegateErr] = useState("");
+  const subList = Object.entries(subs).map(([id, v]) => ({ session_id: id, ...v }));
+
   // 审批模式初始化 + 全局审批请求监听 + 非流式对话的用量统计监听
   useEffect(() => {
     api.getToolApproval().then((r) => r?.mode && setApprovalMode(r.mode)).catch(() => {});
@@ -96,6 +104,46 @@ export default function ChatPage({ onStats, visible }) {
       unUsage.then((f) => f());
     };
   }, []);
+
+  // 子代理生命周期：spawn → start → done|error（宿主管控，AI 不能自行派生）
+  useEffect(() => {
+    const un = listen("subagent-lifecycle", (e) => {
+      const p = e.payload || {};
+      if (!p.session_id) return;
+      setSubs((m) => ({ ...m, [p.session_id]: { ...(m[p.session_id] || {}), ...p } }));
+      // 终态短暂停留后移除：让用户看到「完成 / 失败」结果
+      if (p.phase === "done" || p.phase === "error") {
+        setTimeout(() => {
+          setSubs((m) => {
+            const next = { ...m };
+            delete next[p.session_id];
+            return next;
+          });
+        }, 8000);
+      }
+      loadSessions();
+    });
+    return () => un.then((f) => f());
+  }, []);
+
+  // 宿主调度：把一段自包含任务派给子代理（阻塞直到它跑完，结论原样带回本会话）
+  const delegate = async () => {
+    const task = delegateTask.trim();
+    if (!task || !activeId) return;
+    setDelegateBusy(true);
+    setDelegateErr("");
+    try {
+      await api.spawnSubagent(task, "", activeId);
+      setDelegateTask("");
+      setDelegateOpen(false);
+      loadSessions();
+    } catch (e) {
+      const msg = typeof e === "string" ? e : e?.message || String(e);
+      setDelegateErr(`${t("chat.callFailed")}${msg}`);
+    } finally {
+      setDelegateBusy(false);
+    }
+  };
 
   // 拖拽文件 / 文件夹到窗口：插入链接到输入框
   // 注意：拖拽事件由 Tauri 发在 Webview 目标上，用全局 listen（Any 目标）确保能收到，
@@ -1133,6 +1181,41 @@ export default function ChatPage({ onStats, visible }) {
             </div>
           )}
 
+          {/* 子代理状态条：宿主派出的子代理实时进度（点击查看子会话全过程） */}
+          {subList.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 rounded-xl border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-xs dark:border-neutral-800 dark:bg-neutral-900">
+              <IconQueue size={14} className="shrink-0 text-neutral-500" />
+              {subList.map((s) => {
+                const done = s.phase === "done";
+                const failed = s.phase === "error";
+                const secs = s.ms ? Math.max(1, Math.round(s.ms / 1000)) : 0;
+                return (
+                  <button
+                    key={s.session_id}
+                    onClick={() => selectSession(s.session_id)}
+                    title={t("chat.subagentJump")}
+                    className={`min-w-0 max-w-full truncate rounded-lg px-1.5 py-0.5 text-left hover:bg-neutral-900/5 dark:hover:bg-white/10 ${
+                      failed
+                        ? "text-red-500"
+                        : done
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : "text-neutral-600 dark:text-neutral-300"
+                    }`}
+                  >
+                    <span className="mr-1 font-medium">{s.title || t("chat.subagent")}</span>
+                    <span className="text-neutral-400">
+                      {failed
+                        ? `${t("chat.subagentFailed")}${s.error ? `：${s.error}` : ""}`
+                        : done
+                        ? `${t("chat.subagentDone")} · ${secs}s`
+                        : t("chat.thinking")}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           <div className="flex items-center gap-2">
             {/* 上下文预览 */}
             <button
@@ -1305,6 +1388,55 @@ export default function ChatPage({ onStats, visible }) {
                       );
                     })
                   )}
+                </div>
+              )}
+            </div>
+
+            {/* 委派子代理：宿主调度入口（模型侧无该工具，只有宿主/用户能派活） */}
+            <div className="relative shrink-0">
+              <button
+                onClick={() => setDelegateOpen((v) => !v)}
+                disabled={!activeId}
+                title={t("chat.delegate")}
+                className={`shrink-0 rounded-full p-2 transition-colors disabled:opacity-40 ${
+                  delegateOpen
+                    ? "accent-solid"
+                    : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
+                }`}
+              >
+                <IconQueue size={18} />
+              </button>
+              {delegateOpen && (
+                <div className="card absolute bottom-11 left-0 z-20 w-80 p-2.5">
+                  <p className="mb-1.5 text-xs font-medium">{t("chat.delegate")}</p>
+                  <textarea
+                    autoFocus
+                    rows={4}
+                    value={delegateTask}
+                    onChange={(e) => setDelegateTask(e.target.value)}
+                    placeholder={t("chat.delegatePlaceholder")}
+                    className="field w-full resize-none text-xs"
+                  />
+                  <p className="mt-1 text-[11px] leading-relaxed text-neutral-400">{t("chat.delegateHint")}</p>
+                  {delegateErr && <p className="mt-1 text-[11px] text-red-500">{delegateErr}</p>}
+                  <div className="mt-2 flex items-center justify-end gap-2">
+                    <button
+                      onClick={() => {
+                        setDelegateOpen(false);
+                        setDelegateErr("");
+                      }}
+                      className="pill pill-hover"
+                    >
+                      {t("common.close")}
+                    </button>
+                    <button
+                      onClick={delegate}
+                      disabled={!delegateTask.trim() || delegateBusy}
+                      className="accent-solid rounded-full px-3 py-1 text-xs disabled:opacity-40"
+                    >
+                      {delegateBusy ? t("chat.thinking") : t("chat.delegateSubmit")}
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
