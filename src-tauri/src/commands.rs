@@ -353,6 +353,37 @@ pub fn get_remote_status(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value
     }))
 }
 
+/// AI 行为设置（设置页读写）：自动推进 / 审批模式 / 敏感词审核
+#[tauri::command]
+pub fn get_behavior_settings(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let cfg = ctx.config.lock().unwrap();
+    json!({
+        "auto_drive": cfg.auto_drive,
+        "tool_approval": cfg.tool_approval,
+        "moderation_enabled": cfg.moderation_enabled,
+    })
+}
+
+#[tauri::command]
+pub fn set_behavior_settings(
+    state: State<'_, Arc<Ctx>>,
+    auto_drive: bool,
+    tool_approval: String,
+    moderation_enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.auto_drive = auto_drive;
+        cfg.tool_approval = tool_approval;
+        cfg.moderation_enabled = moderation_enabled;
+        drop(cfg);
+    }
+    ctx.save_config();
+    Ok(json!({ "ok": true }))
+}
+
 /// 幻觉防护阈值（设置页读写）：word_repeat_max=单回复词重复上限 / tool_loop_max=单回合工具轮上限，0=关闭
 #[tauri::command]
 pub fn get_guard_limits(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
@@ -382,6 +413,52 @@ pub fn set_guard_limits(
         json!({ "word_repeat_max": word_repeat_max, "tool_loop_max": tool_loop_max }),
         true,
     );
+    Ok(json!({ "ok": true }))
+}
+
+/// 用户自定义提示词/人设：读取
+#[tauri::command]
+pub fn get_custom_prompt(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let cfg = ctx.config.lock().unwrap();
+    json!({ "custom_prompt": cfg.custom_prompt })
+}
+
+/// 用户自定义提示词/人设：保存（空串清除）
+#[tauri::command]
+pub fn set_custom_prompt(state: State<'_, Arc<Ctx>>, custom_prompt: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.custom_prompt = custom_prompt.trim().to_string();
+    }
+    ctx.save_config();
+    Ok(json!({ "ok": true }))
+}
+
+/// 系统提示词模板覆盖：读取（config 为空则返回默认模板，方便用户基于默认修改）
+#[tauri::command]
+pub fn get_system_prompt(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let cfg = ctx.config.lock().unwrap();
+    let stored = cfg.system_prompt.trim();
+    if stored.is_empty() {
+        // 返回默认模板让前端直接显示
+        json!({ "system_prompt": crate::ai::default_system_prompt_for_display(), "is_default": true })
+    } else {
+        json!({ "system_prompt": stored, "is_default": false })
+    }
+}
+
+/// 系统提示词模板覆盖：保存（空串 = 恢复默认）
+#[tauri::command]
+pub fn set_system_prompt(state: State<'_, Arc<Ctx>>, system_prompt: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.system_prompt = system_prompt.to_string(); // 允许空串（恢复默认）
+    }
+    ctx.save_config();
     Ok(json!({ "ok": true }))
 }
 

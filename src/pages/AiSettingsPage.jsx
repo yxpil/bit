@@ -43,6 +43,14 @@ export default function AiSettingsPage({ onStats, stats }) {
   // 幻觉防护阈值：word_repeat_max=单回复词重复上限 / tool_loop_max=单回合工具轮上限（0=关闭）
   const [limits, setLimits] = useState({ word_repeat_max: 20, tool_loop_max: 20 });
   const [limitsSaved, setLimitsSaved] = useState(false);
+  // AI 行为设置：自动推进 / 审批模式 / 敏感词审核
+  const [behavior, setBehavior] = useState({ auto_drive: true, tool_approval: "ask", moderation_enabled: true });
+  // 用户自定义提示词/人设
+  const [customPrompt, setCustomPrompt] = useState("");
+  const [promptSaved, setPromptSaved] = useState(false);
+  // 系统提示词模板覆盖（空=用默认）
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [systemPromptSaved, setSystemPromptSaved] = useState(false);
   // 开机自动启动：null=加载中；开启后登录系统即在后台驻留（托盘）
   const [autostart, setAutostart] = useState(null);
   // 从提供方 API 拉取的模型列表（点击模型名直接填充）
@@ -60,6 +68,9 @@ export default function AiSettingsPage({ onStats, stats }) {
     load();
     api.getAiParams().then((r) => setParams({ temperature: r?.temperature ?? null, reasoning_effort: r?.reasoning_effort || "" })).catch(() => {});
     api.getGuardLimits().then((r) => setLimits({ word_repeat_max: r?.word_repeat_max ?? 20, tool_loop_max: r?.tool_loop_max ?? 20 })).catch(() => {});
+    api.getBehaviorSettings().then((r) => setBehavior({ auto_drive: r?.auto_drive ?? true, tool_approval: r?.tool_approval || "ask", moderation_enabled: r?.moderation_enabled ?? true })).catch(() => {});
+    api.getCustomPrompt().then((r) => setCustomPrompt(r?.custom_prompt || "")).catch(() => {});
+    api.getSystemPrompt().then((r) => setSystemPrompt(r?.system_prompt || "")).catch(() => {});
     api.getAutostart().then((r) => setAutostart(!!r?.enabled)).catch(() => setAutostart(false));
     api.getElevation().then((r) => setElevation({ active: !!r?.active, enabled: !!r?.enabled })).catch(() => setElevation({ active: false, enabled: false }));
   }, []);
@@ -108,6 +119,10 @@ export default function AiSettingsPage({ onStats, stats }) {
         setTimeout(() => setLimitsSaved(false), 1500);
       }).catch(() => {});
     }, 300);
+  };
+  const saveBehavior = (next) => {
+    setBehavior(next);
+    api.setBehaviorSettings(next.auto_drive, next.tool_approval, next.moderation_enabled).catch(() => {});
   };
 
   const editing = form.id !== null;
@@ -446,6 +461,150 @@ export default function AiSettingsPage({ onStats, stats }) {
             />
             <p className="mt-1 px-2 text-[11px] text-neutral-400">{t("ai.guardToolHint")}</p>
           </div>
+        </div>
+      </div>
+
+      {/* AI 行为设置 */}
+      <div className="card flex flex-col gap-4">
+        <p className="text-sm font-medium">AI 行为设置</p>
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm">自动推进（auto-drive）</p>
+            <p className="text-xs text-neutral-500">回合结束后若有未完成目标，自动续跑直到完成</p>
+          </div>
+          <PillSwitch
+            checked={behavior.auto_drive}
+            onChange={(v) => saveBehavior({ ...behavior, auto_drive: v })}
+          />
+        </div>
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm">敏感词审核</p>
+            <p className="text-xs text-neutral-500">HTTP 对话端点输入/输出双向过滤</p>
+          </div>
+          <PillSwitch
+            checked={behavior.moderation_enabled}
+            onChange={(v) => saveBehavior({ ...behavior, moderation_enabled: v })}
+          />
+        </div>
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <p className="text-sm">工具审批模式</p>
+            <p className="text-xs text-neutral-500">危险操作需要你确认</p>
+          </div>
+          <select
+            className="field !rounded-lg w-auto"
+            value={behavior.tool_approval}
+            onChange={(e) => saveBehavior({ ...behavior, tool_approval: e.target.value })}
+          >
+            <option value="ask">每次询问</option>
+            <option value="auto">自动审批（危险操作仍询问）</option>
+            <option value="allow_all">完全放行</option>
+          </select>
+        </div>
+      </div>
+
+      {/* 系统提示词模板覆盖：完全替换内置 prompt；空=恢复默认 */}
+      <div className="card flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">系统提示词模板</p>
+            <p className="mt-0.5 text-xs text-neutral-500">
+              完全替换内置模板（包含 Conduct、工具说明等）。留空恢复默认。
+              运行时信息（目标/todo/解释器/memory/skills）会自动追加到末尾。
+            </p>
+          </div>
+          {systemPromptSaved && (
+            <span className="flex items-center gap-1 text-xs text-neutral-500">
+              <IconCheck size={14} />
+              已保存
+            </span>
+          )}
+        </div>
+        <textarea
+          className="field !rounded-lg min-h-[200px] resize-y font-mono text-xs leading-relaxed"
+          value={systemPrompt}
+          onChange={(e) => setSystemPrompt(e.target.value)}
+          placeholder="留空 = 使用内置模板。输入则完全覆盖，例如：&#10;你是我的专属编程助手。&#10;回答代码要完整可编译，先列出思路再给出实现。"
+        />
+        <div className="flex justify-end gap-2">
+          {systemPrompt && (
+            <button
+              className="pill text-xs"
+              onClick={() => {
+                setSystemPrompt("");
+                api.setSystemPrompt("").then(() => {
+                  setSystemPromptSaved(true);
+                  setTimeout(() => setSystemPromptSaved(false), 1500);
+                });
+              }}
+            >
+              恢复默认
+            </button>
+          )}
+          <button
+            className="pill pill-hover text-xs"
+            onClick={() => {
+              api.setSystemPrompt(systemPrompt).then(() => {
+                setSystemPromptSaved(true);
+                setTimeout(() => setSystemPromptSaved(false), 1500);
+              });
+            }}
+          >
+            保存
+          </button>
+        </div>
+      </div>
+
+      {/* 用户自定义提示词/人设：追加到 system prompt 开头 */}
+      <div className="card flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">自定义提示词 / 人设</p>
+            <p className="mt-0.5 text-xs text-neutral-500">追加到 system prompt 最开头，空则不注入</p>
+          </div>
+          {promptSaved && (
+            <span className="flex items-center gap-1 text-xs text-neutral-500">
+              <IconCheck size={14} />
+              已保存
+            </span>
+          )}
+        </div>
+        <textarea
+          className="field !rounded-lg min-h-[100px] resize-y font-mono text-xs leading-relaxed"
+          value={customPrompt}
+          onChange={(e) => setCustomPrompt(e.target.value)}
+          placeholder={`例如：\n你是一位严谨的 Rust 系统编程专家，回答时优先给出可编译的代码。\n你偏爱极简主义设计，讨厌冗余抽象。`}
+        />
+        <div className="flex justify-end gap-2">
+          {customPrompt && (
+            <button
+              className="pill text-xs"
+              onClick={() => {
+                setCustomPrompt("");
+                api.setCustomPrompt("").then(() => {
+                  setPromptSaved(true);
+                  setTimeout(() => setPromptSaved(false), 1500);
+                });
+              }}
+            >
+              清空
+            </button>
+          )}
+          <button
+            className="pill pill-hover text-xs"
+            onClick={() => {
+              api.setCustomPrompt(customPrompt).then(() => {
+                setPromptSaved(true);
+                setTimeout(() => setPromptSaved(false), 1500);
+              });
+            }}
+          >
+            保存
+          </button>
         </div>
       </div>
 

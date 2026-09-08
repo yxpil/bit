@@ -30,6 +30,12 @@ pub struct Config {
     /// 幻觉防护：单个回合内工具调用轮次达到该值即强制终止回合（0=不设限）
     #[serde(default = "default_tool_loop_max")]
     pub tool_loop_max: u32,
+    /// 用户自定义提示词/人设：追加到 system prompt 开头，空则不追加
+    #[serde(default)]
+    pub custom_prompt: String,
+    /// 系统提示词模板覆盖：非空时完全替换内置 system prompt；空则用默认模板
+    #[serde(default)]
+    pub system_prompt: String,
     /// 云中继地址（手机远程 App 用）：对称 NAT 无法直连时改连该地址，如 Cloudflare Tunnel 域名
     #[serde(default)]
     pub cloud_relay_url: Option<String>,
@@ -155,6 +161,8 @@ impl Default for Config {
             auto_drive: true,
             word_repeat_max: default_word_repeat_max(),
             tool_loop_max: default_tool_loop_max(),
+            custom_prompt: String::new(),
+            system_prompt: String::new(),
             cloud_relay_url: None,
             relay_id: String::new(),
             stun_servers: None,

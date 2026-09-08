@@ -33,6 +33,13 @@ export const api = {
   getGuardLimits: () => invoke("get_guard_limits"),
   setGuardLimits: (word_repeat_max, tool_loop_max) =>
     invoke("set_guard_limits", { wordRepeatMax: word_repeat_max, toolLoopMax: tool_loop_max }),
+  // 用户自定义提示词/人设
+  getCustomPrompt: () => invoke("get_custom_prompt"),
+  setCustomPrompt: (custom_prompt) => invoke("set_custom_prompt", { customPrompt: custom_prompt }),
+  getSystemPrompt: () => invoke("get_system_prompt"),
+  setSystemPrompt: (system_prompt) => invoke("set_system_prompt", { systemPrompt: system_prompt }),
+  getBehaviorSettings: () => invoke("get_behavior_settings"),
+  setBehaviorSettings: (auto_drive, tool_approval, moderation_enabled) => invoke("set_behavior_settings", { autoDrive: auto_drive, toolApproval: tool_approval, moderationEnabled: moderation_enabled }),
   // 远程二维码：网络探测（LAN/公网候选 + NAT 粗判）→ 返回 { payload, svg }
   getRemoteQr: () => invoke("get_remote_qr"),
   getLanInfo: () => invoke("get_lan_info"),

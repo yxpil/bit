@@ -400,11 +400,17 @@ pub async fn execute_tool_call(
         other => {
             let tool = {
                 let tools = ctx.tools.lock().unwrap();
-                tools
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(other))
-                    .cloned()
-                    .ok_or_else(|| format!("工具 `{other}` 不存在"))?
+                match tools.iter().find(|t| t.name.eq_ignore_ascii_case(other)).cloned() {
+                    Some(t) => t,
+                    None => {
+                        // 未知工具 → 不报错，而是返回可用工具列表让模型自动纠正
+                        let available: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+                        return Ok(json!({
+                            "error": format!("Unknown tool '{other}'. Available: {}", available.join(", ")),
+                            "hint": "Call one of the available tools above instead."
+                        }));
+                    }
+                }
             };
             crate::registry::invoke(ctx, &tool.id, params.clone(), "ai-self", session_id).await
         }
@@ -475,10 +481,10 @@ fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> 
     let next_step = match pending.first() {
         Some(t) => format!("下一步：「{}」。请执行这一步。", t.content),
         // 待办全部完成但目标还挂着：让 AI 收尾（标记 achieved 并总结）
-        None => "所有待办均已完成。请调用 goal_update 将本目标标记为 achieved，并简要总结成果。".to_string(),
+        None => "所有待办均已完成。请调用 plan_update(goal_status=achieved) 将本目标标记为 achieved，并简要总结成果。".to_string(),
     };
     Some(format!(
-        "继续（自动推进）：目标「{title}」尚未完成（待办 {done}/{}）。{next_step}全部完成后调用 goal_update 将目标标记为 achieved。若必须等用户决策或输入才能继续，回复以 [WAIT] 开头并说明需要什么。",
+        "继续（自动推进）：目标「{title}」尚未完成（待办 {done}/{}）。{next_step}全部完成后调用 plan_update(goal_status=achieved) 将目标标记为 achieved。若必须等用户决策或输入才能继续，回复以 [WAIT] 开头并说明需要什么。",
         all.len()
     ))
 }

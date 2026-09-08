@@ -73,6 +73,7 @@ export default function ChatPage({ onStats, visible }) {
   const [approvals, setApprovals] = useState([]); // 待审批 [{id, tool, params}]
   const [approvalMode, setApprovalMode] = useState("allow_all");
   const [approvalMenu, setApprovalMenu] = useState(false);
+  const [planMenu, setPlanMenu] = useState(false); // 计划/待办 popover（无进行中内容时不显示按钮）
   // AI 接收内容预览（system / 消息 / 工具清单）
   const [preview, setPreview] = useState(null);
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -1103,94 +1104,6 @@ export default function ChatPage({ onStats, visible }) {
             </div>
           )}
 
-          {/* 计划栏：完成=绿色，未完成=白色；小箭头折叠/展开；无进行中内容时隐藏 */}
-          {planHasActive && (
-            <div className="card px-3 py-2">
-              <button onClick={togglePlanOpen} className="flex w-full items-center gap-2 text-left">
-                <IconTarget
-                  size={14}
-                  className={`shrink-0 ${planAllDone ? "text-emerald-500" : "text-neutral-400"}`}
-                />
-                <span
-                  className={`text-sm font-medium ${
-                    planAllDone ? "text-emerald-600 dark:text-emerald-400" : "text-neutral-900 dark:text-neutral-100"
-                  }`}
-                >
-                  {t("chat.plan")}
-                </span>
-                {planVisibleTodos.length > 0 && (
-                  <span
-                    className={`font-mono text-xs ${
-                      planAllDone ? "text-emerald-500/80" : "text-neutral-400"
-                    }`}
-                  >
-                    {planTodoDone}/{planVisibleTodos.length}
-                  </span>
-                )}
-                <span className="ml-auto text-neutral-400">
-                  {planOpen ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
-                </span>
-              </button>
-              {planOpen && (
-                <div className="mt-2 space-y-2">
-                  {planGroups.map((grp, gi) => {
-                    const goalDone = grp.goal && grp.goal.status === "achieved";
-                    return (
-                      <div key={grp.goal ? grp.goal.id : `loose-${gi}`}>
-                        {grp.goal && (
-                          <div
-                            className={`flex items-center gap-2 text-[13px] ${
-                              goalDone
-                                ? "text-emerald-600 dark:text-emerald-400"
-                                : "text-neutral-900 dark:text-neutral-100"
-                            }`}
-                          >
-                            <span
-                              className={`h-2 w-2 shrink-0 rounded-full ${
-                                goalDone
-                                  ? "bg-emerald-500"
-                                  : "border border-neutral-400 bg-white dark:border-neutral-400"
-                              }`}
-                            />
-                            <span className="min-w-0 truncate font-medium" title={grp.goal.title}>
-                              {grp.goal.title}
-                            </span>
-                          </div>
-                        )}
-                        <div className={`space-y-1 ${grp.goal ? "mt-1 pl-4" : ""}`}>
-                          {grp.todos.map((td) => {
-                            const done = td.status === "completed";
-                            return (
-                              <div
-                                key={td.id}
-                                className={`flex items-center gap-2 text-xs ${
-                                  done
-                                    ? "text-emerald-600/80 dark:text-emerald-400/80"
-                                    : "text-neutral-600 dark:text-neutral-300"
-                                }`}
-                              >
-                                <span
-                                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                                    done
-                                      ? "bg-emerald-500"
-                                      : "border border-neutral-400 bg-white dark:border-neutral-400"
-                                  }`}
-                                />
-                                <span className="min-w-0 truncate" title={td.content}>
-                                  {td.content}
-                                </span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-
           <div className="flex items-center gap-2">
             {/* 上下文预览 */}
             <button
@@ -1215,7 +1128,7 @@ export default function ChatPage({ onStats, visible }) {
                 <IconShield size={18} />
               </button>
               {approvalMenu && (
-                <div className="card absolute bottom-11 left-0 z-20 w-44 p-1">
+                <div className="card absolute bottom-11 right-0 z-20 w-60 p-1">
                   {[
                     ["ask", "chat.approvalAsk"],
                     ["auto", "chat.approvalAuto"],
@@ -1277,6 +1190,92 @@ export default function ChatPage({ onStats, visible }) {
                   >
                     {t("chat.addUrl")}
                   </button>
+                </div>
+              )}
+            </div>
+
+            {/* 计划/待办：始终显示靶标按钮，点开 popover 查看/管理 */}
+            <div className="relative shrink-0">
+              <button
+                onClick={() => setPlanMenu((v) => !v)}
+                title={planVisibleTodos.length > 0 ? `${t("chat.plan")} ${planTodoDone}/${planVisibleTodos.length}` : t("chat.plan")}
+                className={`shrink-0 rounded-full p-2 transition-colors ${
+                  planMenu
+                    ? "accent-solid"
+                    : planAllDone && planVisibleTodos.length > 0
+                    ? "text-emerald-500 hover:bg-neutral-900/5 dark:hover:bg-white/10"
+                    : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
+                }`}
+              >
+                <IconTarget size={18} />
+              </button>
+              {planMenu && (
+                <div className="card absolute bottom-11 left-0 z-20 max-h-64 w-72 overflow-y-auto p-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="text-xs font-medium">{t("chat.plan")}</span>
+                    {planVisibleTodos.length > 0 && (
+                      <span className={`font-mono text-xs ${planAllDone ? "text-emerald-500" : "text-neutral-400"}`}>
+                        {planTodoDone}/{planVisibleTodos.length}
+                      </span>
+                    )}
+                  </div>
+                  {planVisibleTodos.length === 0 && planVisibleGoals.length === 0 ? (
+                    <p className="py-4 text-center text-xs text-neutral-400">(暂无目标与待办)</p>
+                  ) : (
+                    planGroups.map((grp, gi) => {
+                      const goalDone = grp.goal && grp.goal.status === "achieved";
+                      return (
+                        <div key={grp.goal ? grp.goal.id : `loose-${gi}`} className="mb-2 last:mb-0">
+                          {grp.goal && (
+                            <div
+                              className={`flex items-center gap-2 text-[13px] ${
+                                goalDone
+                                  ? "text-emerald-600 dark:text-emerald-400"
+                                  : "text-neutral-900 dark:text-neutral-100"
+                              }`}
+                            >
+                              <span
+                                className={`h-2 w-2 shrink-0 rounded-full ${
+                                  goalDone
+                                    ? "bg-emerald-500"
+                                    : "border border-neutral-400 bg-white dark:border-neutral-400"
+                                }`}
+                              />
+                              <span className="min-w-0 truncate font-medium" title={grp.goal.title}>
+                                {grp.goal.title}
+                              </span>
+                            </div>
+                          )}
+                          <div className={`space-y-1 ${grp.goal ? "mt-1 pl-4" : ""}`}>
+                            {grp.todos.map((td) => {
+                              const done = td.status === "completed";
+                              return (
+                                <div
+                                  key={td.id}
+                                  className={`flex items-center gap-2 text-xs ${
+                                    done
+                                      ? "text-emerald-600/80 dark:text-emerald-400/80"
+                                      : "text-neutral-600 dark:text-neutral-300"
+                                  }`}
+                                >
+                                  <span
+                                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                                      done
+                                        ? "bg-emerald-500"
+                                        : "border border-neutral-400 bg-white dark:border-neutral-400"
+                                    }`}
+                                  />
+                                  <span className="min-w-0 truncate" title={td.content}>
+                                    {td.content}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
               )}
             </div>
