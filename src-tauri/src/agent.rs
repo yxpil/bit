@@ -91,6 +91,17 @@ fn opt_thinking(t: &std::sync::Mutex<String>) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// 给 `round_tools_starting` 事件生成工具的简短描述（前端 spinner 卡片显示）
+fn tool_summary(name: &str, args: &serde_json::Value) -> String {
+    let p = args.as_object();
+    match name {
+        "shell" => p.and_then(|o| o.get("command")).and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default(),
+        "write_file" | "edit" | "send_file" | "view_image" => p.and_then(|o| o.get("path")).and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default(),
+        "plan" => p.and_then(|o| o.get("goal")).and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// 把已流出的部分回复落库（中断 / 上游中途断流时调用），返回清洗后的可见文本。
 /// 空文本不落库返回空串；可见文本为空时保留原文，避免什么都不剩
 fn persist_partial(
@@ -729,6 +740,7 @@ pub async fn chat_turn(
             tool_rounds += 1;
             // 全量执行全部工具调用（不静默丢弃超限调用），并发上限 16，结果仍按调用顺序回喂
             let calls: Vec<ai::NativeToolCall> = native_calls.clone();
+
             let outcomes: Vec<Result<serde_json::Value, String>> = futures_util::stream::iter(calls.iter().cloned())
                 .map(|call| {
                     let target = target.clone();
@@ -1144,6 +1156,13 @@ pub async fn chat_turn_stream(
             tool_rounds += 1;
             // 全量执行全部工具调用（不静默丢弃超限调用），并发上限 16，结果仍按调用顺序回喂
             let calls: Vec<ai::NativeToolCall> = native_calls.clone();
+            // 通知前端：本轮有 N 个工具要执行 → 显示灰色 spinner 占位
+            let pending_list: Vec<serde_json::Value> = calls
+                .iter()
+                .map(|c| json!({ "tool": c.name, "summary": tool_summary(&c.name, &c.args) }))
+                .collect();
+            emit(json!({ "type": "round_tools_starting", "count": pending_list.len(), "pending": pending_list }));
+
             let outcomes: Vec<Result<serde_json::Value, String>> = futures_util::stream::iter(calls.iter().cloned())
                 .map(|call| {
                     let target = target.clone();

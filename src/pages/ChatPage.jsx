@@ -22,6 +22,7 @@ import {
   IconChevronRight,
 } from "../components/Icons.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
+import PendingToolCard from "../components/PendingToolCard.jsx";
 import FileCard from "../components/FileCard.jsx";
 import Markdown from "../components/Markdown.jsx";
 
@@ -495,17 +496,37 @@ export default function ChatPage({ onStats, visible }) {
               [sid]: { text: (m[sid]?.text || "") + (ev.text || ""), think: m[sid]?.think || "", cards: m[sid]?.cards || [] },
             }));
             break;
-          case "tools":
-            // 本轮是工具调用：丢弃流式文本，沉淀为卡片（含可选的说明文字）；
-            // 思考跨轮保留（落库的是整个回合的思考，实时面板保持一致，调工具不清空）
+          case "round_tools_starting":
+            // 工具轮开始：先渲染灰色 spinner 占位（tools 事件到达后会覆盖同一张卡）
             setLiveMap((m) => ({
               ...m,
               [sid]: {
                 text: "",
                 think: m[sid]?.think || "",
-                cards: [...(m[sid]?.cards || []), { visible: ev.visible || "", calls: ev.calls || [] }],
+                cards: [...(m[sid]?.cards || []), { pending: ev.pending || [], visible: "", calls: [] }],
               },
             }));
+            break;
+          case "tools":
+            // 本轮是工具调用：丢弃流式文本，沉淀为卡片（含可选的说明文字）；
+            // 思考跨轮保留（落库的是整个回合的思考，实时面板保持一致，调工具不清空）
+            // 同时把前面的 pending spinner 卡替换成完整结果卡
+            setLiveMap((m) => {
+              const oldCards = m[sid]?.cards || [];
+              // 找到最后一张 pending 卡（没有 calls 只有 pending），替换成结果卡
+              const newCards = oldCards.slice();
+              const pendingIdx = newCards.findLastIndex((c) => c.pending && (!c.calls || c.calls.length === 0));
+              const resultCard = { visible: ev.visible || "", calls: ev.calls || [] };
+              if (pendingIdx >= 0) {
+                newCards[pendingIdx] = resultCard;
+              } else {
+                newCards.push(resultCard);
+              }
+              return {
+                ...m,
+                [sid]: { text: "", think: m[sid]?.think || "", cards: newCards },
+              };
+            });
             break;
           case "continue":
             // 后端检测到回复被截断，自动续发「继续」：用清洗后的片段替换原始流式文本
@@ -805,6 +826,14 @@ export default function ChatPage({ onStats, visible }) {
                   const toolCalls = (c.calls || []).filter((x) => !(x.tool === "send_file" && x.ok));
                   return (
                     <div key={i} className="flex flex-col gap-2">
+                      {/* 执行中占位卡（round_tools_starting 事件先渲染，tools 事件替换） */}
+                      {c.pending && (!c.calls || c.calls.length === 0) && (
+                        <div className="flex flex-col gap-1.5">
+                          {c.pending.map((p, j) => (
+                            <PendingToolCard key={j} tool={p.tool} summary={p.summary} />
+                          ))}
+                        </div>
+                      )}
                       {toolCalls.length > 0 && (
                         <div className="flex flex-col gap-1.5">
                           {toolCalls.map((call, j) => (
