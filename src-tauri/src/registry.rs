@@ -95,6 +95,33 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "plan",
         ),
+        // 3.5 更新计划状态（目标状态 + 待办状态）——唯一的更新入口
+        mk(
+            "builtin.plan_update",
+            "plan_update",
+            "Update a plan: change goal status and/or todo statuses. This is the ONLY tool for updating plan/todo states.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal_id": { "type": "string", "description": "Goal id (returned by plan tool)" },
+                    "goal_status": { "type": "string", "description": "Goal status: active | achieved | abandoned (optional)" },
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "Todo id" },
+                                "status": { "type": "string", "description": "Todo status: pending | in_progress | completed" }
+                            },
+                            "required": ["id", "status"]
+                        },
+                        "description": "Todo status updates (optional, batch all you need in one call)"
+                    }
+                },
+                "required": ["goal_id"]
+            }),
+            "plan_update",
+        ),
         // 4. edit：增量补丁修改文件
         mk(
             "builtin.edit",
@@ -628,6 +655,44 @@ async fn builtin_invoke(
                 }
             }
             Ok(serde_json::json!({ "goal_id": g.id, "goal": g.title, "todos": ids.len() }))
+        }
+        // ── 3.5 更新计划状态（唯一更新入口）──
+        "plan_update" => {
+            let goal_id = params.get("goal_id").and_then(|v| v.as_str()).ok_or("Missing parameter: goal_id")?.to_string();
+            // 目标状态更新（可选）
+            let goal_status = params.get("goal_status").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let mut goal_result = None;
+            if let Some(status) = goal_status.as_deref() {
+                let g = crate::goal::update_goal_status(ctx, &goal_id, status)?;
+                goal_result = Some(serde_json::json!({ "id": g.id, "title": g.title, "status": g.status }));
+            }
+            // 待办状态批量更新（可选）
+            let todos: Vec<serde_json::Value> = params
+                .get("todos")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut todo_results = Vec::with_capacity(todos.len());
+            for t in &todos {
+                let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                let tstatus = t.get("status").and_then(|v| v.as_str()).unwrap_or_default();
+                if tid.is_empty() || tstatus.is_empty() {
+                    continue;
+                }
+                match crate::goal::update_todo_status(ctx, tid, tstatus) {
+                    Ok(updated) => {
+                        todo_results.push(serde_json::json!({ "id": updated.id, "content": updated.content, "status": updated.status }));
+                    }
+                    Err(e) => {
+                        todo_results.push(serde_json::json!({ "id": tid, "error": e }));
+                    }
+                }
+            }
+            Ok(serde_json::json!({
+                "goal": goal_result,
+                "todos_updated": todo_results.len(),
+                "todos": todo_results,
+            }))
         }
         // ── 4. edit：增量补丁 ──
         "edit" => {

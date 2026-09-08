@@ -265,8 +265,7 @@ fn is_safe_tool(tool: &str) -> bool {
     const SAFE: &[&str] = &[
         "add_memory",
         "add_skill",
-        "goal_update",
-        "todo_update",
+        "plan_update",
         "write_plugin",
         "write_tool",
     ];
@@ -396,21 +395,6 @@ pub async fn execute_tool_call(
             }
             crate::memory::add_skill(ctx, name, summary, "ai");
             Ok(json!({ "skill": name }))
-        }
-        // ---- 目标/待办状态更新（创建入口已统一到 plan 工具，不再提供 goal_create/todo_add/todo_write） ----
-        "goal_update" => {
-            let id = params.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let status = params.get("status").and_then(|v| v.as_str()).unwrap_or_default();
-            let g = crate::goal::update_goal_status(ctx, id, status)?;
-            crate::audit::record(ctx, "ai-self", "goal.update", &g.title, json!({ "status": status }), true);
-            Ok(json!({ "goal": g.title, "status": g.status }))
-        }
-        "todo_update" => {
-            let id = params.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let status = params.get("status").and_then(|v| v.as_str()).unwrap_or_default();
-            let t = crate::goal::update_todo_status(ctx, id, status)?;
-            crate::audit::record(ctx, "ai-self", "todo.update", &t.content, json!({ "status": status }), true);
-            Ok(json!({ "todo": t.content, "status": t.status }))
         }
         // ---- 已注册工具（内置 / 远程 / AI 自写脚本插件） ----
         other => {

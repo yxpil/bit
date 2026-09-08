@@ -1369,6 +1369,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         - Tool 1 · shell: {shell_syntax}. Params {{\"command\":string,\"cwd\":string(optional)}}\n\
         - Tool 2 · write_file: create/overwrite a file (document editing). Params {{\"path\":string,\"content\":string}}\n\
         - Tool 3 · plan: make a plan; register a goal with step todos. Params {{\"goal\":string,\"steps\":[string]}}\n\
+        - Tool 3b · plan_update: update plan/todo states (the ONLY update tool). Params {{\"goal_id\":string,\"goal_status\":string(optional, active|achieved|abandoned),\"todos\":[{{\"id\":string,\"status\":string}}]}}\n\
         - Tool 4 · edit: patch a file with exact string replacement. Params {{\"path\":string,\"old_string\":string,\"new_string\":string,\"replace_all\":bool(optional)}}\n\
         - Tool 5 · add_tool: add a tool for yourself — persist a piece of code with a local interpreter as a resident tool. Params {{\"name\":string,\"description\":string,\"runtime\":string,\"code\":string}}. Re-registering the same name overwrites your own interpreter/script tool in place (you may rewrite the same-name tool to fix your earlier mistakes); system/remote tools cannot be overwritten\n\
         - Tool 6 · skill: read/write the skill library. Save a skill {{\"action\":\"save\",\"name\":string,\"summary\":string}} (same name overwrites); search skills {{\"action\":\"search\",\"query\":string}} (empty query returns all)\n\
@@ -1384,9 +1385,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         - run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {{\"runtime\":string,\"code\":string,\"params\":object}}\n\
         - add_memory {{\"content\":string,\"kind\":string}} (store a memory)\n\
         - add_skill {{\"name\":string,\"summary\":string}} (save a reusable skill)\n\
-        - goal_update {{\"id\":string,\"status\":string}} (update goal status: active/achieved/abandoned)\n\
-        - todo_update {{\"id\":string,\"status\":string}} (update todo status: pending/in_progress/completed)\n\
-        NOTE: To CREATE a goal with todos, use Tool 3 · plan (params: goal, steps). Do NOT invent goal_create/todo_add/todo_write — they don't exist.\n\
+        NOTE: Plan/todo management uses ONLY two tools — plan (create) and plan_update (update). Do NOT invent goal_create/goal_update/todo_add/todo_write/todo_update — none of them exist.\n\
         \n\
         ## Proactive knowledge capture (no automatic buttons — call the tools yourself)\n\
         When the conversation reveals a fact or preference worth remembering long-term → call add_memory proactively;\n\
@@ -1569,16 +1568,6 @@ pub fn native_tool_defs(ctx: &Arc<crate::state::Ctx>) -> Vec<serde_json::Value> 
             "add_skill",
             "沉淀一条可复用技能",
             serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"summary":{"type":"string"}},"required":["name","summary"]}),
-        ),
-        (
-            "goal_update",
-            "更新目标状态（active/achieved/abandoned）。创建目标请用 plan 工具（一步创建目标+待办）",
-            serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}},"required":["id","status"]}),
-        ),
-        (
-            "todo_update",
-            "更新待办状态（pending/in_progress/completed）",
-            serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}},"required":["id","status"]}),
         ),
     ];
     for (name, desc, params) in extra {
