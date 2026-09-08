@@ -1383,7 +1383,10 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         ## Extension actions (also issued as tool calls)\n\
         - run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {{\"runtime\":string,\"code\":string,\"params\":object}}\n\
         - add_memory {{\"content\":string,\"kind\":string}} (store a memory)\n\
-        - goal_create / goal_update / todo_add / todo_update / todo_write (manage goals and todos)\n\
+        - add_skill {{\"name\":string,\"summary\":string}} (save a reusable skill)\n\
+        - goal_update {{\"id\":string,\"status\":string}} (update goal status: active/achieved/abandoned)\n\
+        - todo_update {{\"id\":string,\"status\":string}} (update todo status: pending/in_progress/completed)\n\
+        NOTE: To CREATE a goal with todos, use Tool 3 · plan (params: goal, steps). Do NOT invent goal_create/todo_add/todo_write — they don't exist.\n\
         \n\
         ## Proactive knowledge capture (no automatic buttons — call the tools yourself)\n\
         When the conversation reveals a fact or preference worth remembering long-term → call add_memory proactively;\n\
@@ -1568,29 +1571,14 @@ pub fn native_tool_defs(ctx: &Arc<crate::state::Ctx>) -> Vec<serde_json::Value> 
             serde_json::json!({"type":"object","properties":{"name":{"type":"string"},"summary":{"type":"string"}},"required":["name","summary"]}),
         ),
         (
-            "goal_create",
-            "创建目标",
-            serde_json::json!({"type":"object","properties":{"title":{"type":"string"},"detail":{"type":"string"}},"required":["title"]}),
-        ),
-        (
             "goal_update",
-            "更新目标状态（active/done/archived 等）",
+            "更新目标状态（active/achieved/abandoned）。创建目标请用 plan 工具（一步创建目标+待办）",
             serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}},"required":["id","status"]}),
-        ),
-        (
-            "todo_add",
-            "添加待办",
-            serde_json::json!({"type":"object","properties":{"content":{"type":"string"},"goal_id":{"type":"string"}},"required":["content"]}),
         ),
         (
             "todo_update",
-            "更新待办状态（pending/doing/completed）",
+            "更新待办状态（pending/in_progress/completed）",
             serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}},"required":["id","status"]}),
-        ),
-        (
-            "todo_write",
-            "整体重写待办清单",
-            serde_json::json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"string"}},"goal_id":{"type":"string"}},"required":["items"]}),
         ),
     ];
     for (name, desc, params) in extra {
