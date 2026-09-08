@@ -76,12 +76,21 @@ fn main() {
         }
     }
 
-    // Windows：WebView2 透明窗口需要显式设置 BackgroundColor 为透明。
-    // 仅靠 tauri.conf.json 的 transparent: true + CSS background: transparent 不够——
-    // WebView2 默认会渲染不透明黑底（见 tauri-apps/tauri#1739 / termora#98）。
-    // 这里在 Rust Builder 之前先写入 WEBVIEW2 启动参数（追加而非覆盖）。
+    // Windows：WebView2 透明窗口多层保险。
+    // wry 0.55+ 在窗口构建时已通过 COM API（ICoreWebView2ControllerOptions3 /
+    // ICoreWebView2Controller2）设 DefaultBackgroundColor 为全透明，Tauri 只要读到
+    // transparent:true 就会触发。但某些 WebView2 Runtime 版本或 wry 分支可能不走
+    // 这条路径，这里额外设置两个 WebView2 环境变量兜底：
+    //   - WEBVIEW2_DEFAULT_BACKGROUND_COLOR：微软官方指定的早期背景色环境变量
+    //   - WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS += --default-background-color：Chromium 命令行
+    // 都必须在 Builder 创建前设置（wry 构建窗口时读取）。
     #[cfg(target_os = "windows")]
     {
+        // 微软官方文档推荐：这个环境变量比 COM API 还早生效，能彻底消除启动白闪
+        if std::env::var("WEBVIEW2_DEFAULT_BACKGROUND_COLOR").is_err() {
+            std::env::set_var("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", "00000000");
+        }
+        // Chromium 命令行参数兜底
         let mut args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
         let need_bg = !args.contains("--default-background-color");
         if need_bg {

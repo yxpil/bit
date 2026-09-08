@@ -3,6 +3,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "BIT",
         "width": 1120,
         "height": 740,
@@ -12,11 +13,7 @@
         "decorations": false,
         "transparent": true,
         "shadow": true,
-        "visible": true,
-        "windowEffects": {
-          "effects": ["mica", "acrylic", "blur"],
-          "radius": 12
-        }
+        "visible": true
       }
     ]
   }
