@@ -20,7 +20,7 @@ rustc --version
 #       Cargo.toml 包含 macos-private-api（macOS 专用），Linux 平台不识别会直接 exit 1。
 #       只启用 Linux 必需的 tray-icon，跳过 macos 专属 features。
 cargo build --release --manifest-path src-tauri/Cargo.toml \
-  --no-default-features --features tray-icon
+  --no-default-features --features tauri/tray-icon
 BIN=src-tauri/target/release/bit
 ls -lh "$BIN"
 
