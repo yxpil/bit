@@ -196,7 +196,9 @@ export default function ChatPage({ onStats, visible }) {
         next.subagent_max,
       );
       setAutoDelegate(next.auto_delegate);
-    } catch {}
+    } catch (e) {
+      console.warn('[delegate] 保存失败', e);
+    }
   };
 
   // 观察态：popover 打开时拉活跃目标 + 未开始待办；自动模式下每 5s 刷新一次
