@@ -54,6 +54,9 @@ export const api = {
   spawnSubagent: (task, title, session_id) =>
     invoke("subagent_spawn", { task, title: title || null, sessionId: session_id || null }),
   subagentRunning: () => invoke("subagent_running"),
+  stopSubagent: (session_id) => invoke("stop_subagent", { sessionId: session_id }),
+  cancelShell: (job_id) => invoke("cancel_shell", { jobId: job_id }),
+  listRunningShells: () => invoke("list_running_shells"),
   // 远程二维码：网络探测（LAN/公网候选 + NAT 粗判）→ 返回 { payload, svg }
   getRemoteQr: () => invoke("get_remote_qr"),
   getLanInfo: () => invoke("get_lan_info"),
@@ -138,6 +141,10 @@ export const api = {
   setActiveSession: (session_id) => invoke("set_active_session", { sessionId: session_id }),
   renameSession: (session_id, title) => invoke("rename_session", { sessionId: session_id, title }),
   deleteSession: (session_id) => invoke("delete_session", { sessionId: session_id }),
+  deleteSessions: (session_ids) => invoke("delete_sessions", { sessionIds: session_ids }),
+  setSessionFavorite: (session_id, favorite) =>
+    invoke("set_session_favorite", { sessionId: session_id, favorite }),
+  setSessionColor: (session_id, color) => invoke("set_session_color", { sessionId: session_id, color }),
   clearSession: (session_id) => invoke("clear_session", { sessionId: session_id || "" }),
   listMemories: () => invoke("list_memories"),
   addMemory: (content) => invoke("add_memory", { content }),

@@ -1357,7 +1357,8 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             4. No calls in prose: never emit bare JSON, code fences, <xxx_function_call> markers or restated arguments in the reply body — the body holds only words addressed to the user.\n\
             5. Continue from tool messages: each result returns as a tool message; call again or answer. If a call fails, fix the arguments (or pick another tool) and retry instead of apologising.\n\
             6. Ask only when truly blocked: if a required detail is genuinely missing, ask the user; otherwise proceed with the best available default.\n\
-            Sub-agents are host-scheduled: you have NO sub-agent tool and must never invent one or ask to delegate — finish the work in this session.",
+            7. Long work never blocks the chat: commands still running after ~2s are auto-moved to a background job; for known long tasks (builds, installs, batch jobs) pass background=true to shell and keep working. The job result is delivered back to you when it finishes — never re-run it to poll.\n\
+            8. Delegate with care: for a long, self-contained subtask call sub_agent {\"task\": string, \"title\": string} — a fresh sub-session agent runs it with all tools and returns its final answer. Make the task self-contained (background + goal + acceptance criteria); sub-agents cannot spawn sub-agents. Do the work yourself when it is quick or needs this conversation's context.",
             "The SKILL list in this prompt shows names only. When a skill name looks relevant to the current task, fetch its full content first via Tool 6 · skill with action=search and query=that name, then follow it. action=save writes a skill (same name overwrites), action=search finds existing skills.",
             "When no more tool calls are needed, just output the final answer in natural language.",
         )
@@ -1369,7 +1370,8 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             Never invent marker syntax (like <xxx_function_call>), never output a bare object without the square brackets, never split multiple calls into multiple lines — \
             multiple calls must stay in ONE array: [{{...}},{{...}}]. When no action is needed, just answer in natural language.\n\
             Single call example: [{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]\n\
-            Sub-agents are host-scheduled: you have NO sub-agent tool and must never invent one or ask to delegate — finish the work in this session.",
+            Long work never blocks the chat: for known long tasks pass background=true to shell and keep going; the job result returns to you when it finishes — never re-run it to poll.\n\
+            Delegate with care: for a long, self-contained subtask call sub_agent {{\"task\": string, \"title\": string}} — a fresh sub-session agent runs it with all tools and returns its final answer; make the task self-contained and never delegate quick or context-heavy work (sub-agents cannot nest).",
             "The SKILL list in this prompt shows names only. When a skill name looks relevant to the current task, fetch its full content first via Tool 6 · skill with action=search and query=that name, then follow it. save writes a skill, search finds existing skills. Examples:\n\
             - save a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"batch-rename\",\"summary\":\"use shell to walk the directory and mv-rename files…\"}}}}]\n\
             - search a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"rename\"}}}}]",
@@ -1558,7 +1560,7 @@ if asked about your nature, answer honestly: a local agent running on this devic
              - Only call tools listed in the tools parameter or the Tools at a glance section below. Do NOT invent names — unknown calls will be returned with an available list.\n\
              - Only use runtime ids listed under Local interpreters below.\n\
              - Skill list shows names only; search with skill(action=search) to get full content.\n\
-             - Sub-agents are host-scheduled: your toolset has no sub-agent tool; never invent one or ask to delegate.",
+             - sub_agent(task, title): delegate a long, self-contained subtask to a fresh sub-session agent; its final answer returns to you. Never delegate quick or context-heavy work; sub-agents cannot nest.",
         )
     } else {
         (
@@ -1573,7 +1575,7 @@ if asked about your nature, answer honestly: a local agent running on this devic
                Compiled langs: same stdin/stdout contract, BIT compiles then runs.\n\
              - Only use runtime ids listed under Local interpreters below.\n\
              - Skill list shows names only; search with skill(action=search) to get full content.\n\
-             - Sub-agents are host-scheduled: your toolset has no sub-agent tool; never invent one or ask to delegate.",
+             - sub_agent(task, title): delegate a long, self-contained subtask to a fresh sub-session agent; its final answer returns to you. Never delegate quick or context-heavy work; sub-agents cannot nest.",
         )
     };
 
@@ -1697,7 +1699,9 @@ pub enum NativeErr {
 
 /// 宿主管控的工具：生命周期完全由宿主调度（自动化/远程入口内部调用），
 /// 不下发给模型。模型看到却被告知"别调"只会诱发违规调用与幻觉参数。
-const HOST_ONLY_TOOLS: [&str; 1] = ["sub_agent"];
+/// 曾含 sub_agent；现 sub_agent 已下发给模型（AI 自主决定派生，
+/// 递归/并行防护移到 registry 的 sub_agent 处理器内）。保留机制供未来使用。
+const HOST_ONLY_TOOLS: [&str; 0] = [];
 
 /// 是否属于「仅宿主可调度」的工具（不进入函数清单，也不进入提示词工具一览）
 pub fn is_host_only_tool(name: &str) -> bool {
@@ -3576,11 +3580,11 @@ mod sse_tests {
 mod host_only_tests {
     use super::is_host_only_tool;
 
-    /// 宿主管控工具绝不能出现在模型可见面（函数清单 / 提示词一览 / 纠正列表）
+    /// sub_agent 已下发给模型：AI 可自主派生（递归/并行防护在 registry 处理器内）
     #[test]
-    fn sub_agent_is_host_only() {
-        assert!(is_host_only_tool("sub_agent"));
-        assert!(is_host_only_tool("SUB_AGENT"), "名称匹配需大小写不敏感");
+    fn sub_agent_is_model_visible() {
+        assert!(!is_host_only_tool("sub_agent"));
+        assert!(!is_host_only_tool("SUB_AGENT"));
     }
 
     #[test]

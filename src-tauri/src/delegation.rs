@@ -1,12 +1,12 @@
 // yxpil · BIT
-//! 子代理调度（宿主管控）。
+//! 子代理调度。
 //!
-//! 模型侧看不到 sub_agent 工具、也无法自行派生（见 ai::is_host_only_tool）。
-//! 本模块是唯一的宿主入口：
+//! sub_agent 已下发给模型（AI 自主决定派生，递归/并行防护在 registry 处理器内）。
+//! 本模块提供宿主入口：
 //! - `spawn`：显式派生（UI 按钮 / 远程 API / 命令行）
 //! - `auto_step`：Autopilot 周期里的自动委派策略（受 config.auto_delegate 开关控制）
 //!
-//! 生命周期由宿主掌握：派生 → subagent-lifecycle 事件广播 → 结束回写待办状态。
+//! 生命周期广播：派生 → subagent-lifecycle 事件 → 结束回写待办状态。
 
 use serde_json::json;
 use std::sync::Arc;

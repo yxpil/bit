@@ -20,6 +20,7 @@ mod netinfo;
 mod registry;
 mod relay;
 mod repetition;
+mod shellbg;
 mod runtime;
 mod script;
 mod script_runtime;
@@ -171,6 +172,8 @@ fn main() {
             let (actor, target) = if tui_mode { ("local-cli", "tui") } else { ("local-app", "BIT") };
             audit::record(&ctx, actor, "app.start", target, serde_json::json!({}), true);
             app.manage(ctx.clone());
+            // 后台 shell 的顶层续跑 worker：长命令自然结束时自动把结果唤回所属会话的 AI
+            crate::shellbg::init(&ctx);
 
             if tui_mode {
                 // TUI：无窗口、无托盘、无 HTTP 服务、无 Autopilot（与桌面端零冲突）。
@@ -329,6 +332,9 @@ fn main() {
             commands::chat_stream,
             commands::subagent_spawn,
             commands::subagent_running,
+            commands::stop_subagent,
+            commands::cancel_shell,
+            commands::list_running_shells,
             commands::extract_file,
             commands::fetch_webpage,
             commands::check_port,
@@ -360,6 +366,9 @@ fn main() {
             commands::set_active_session,
             commands::rename_session,
             commands::delete_session,
+            commands::delete_sessions,
+            commands::set_session_favorite,
+            commands::set_session_color,
             commands::clear_session,
             commands::list_memories,
             commands::add_memory,

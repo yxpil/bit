@@ -22,8 +22,14 @@ function subscribe(cb) {
   return () => listeners.delete(cb);
 }
 
-export function t(key) {
-  return dict[current]?.[key] ?? dict.zh[key] ?? key;
+export function t(key, params) {
+  let str = dict[current]?.[key] ?? dict.zh[key] ?? key;
+  if (params && typeof str === "string") {
+    for (const k in params) {
+      str = str.replace(new RegExp("\\{" + k + "\\}", "g"), params[k]);
+    }
+  }
+  return str;
 }
 
 /** 语言 hook：返回 { lang, setLang, toggleLang, t }，切换时全应用重渲染 */
@@ -150,6 +156,20 @@ const dict = {
     "theme.custom": "自定义颜色",
     "chat.newChat": "新对话",
     "chat.noSessions": "暂无对话",
+    // 会话收藏 / 多选 / 彩色标签
+    "chat.favAdd": "收藏对话",
+    "chat.favRemove": "取消收藏",
+    "chat.favProtected": "收藏的对话已保护，未删除",
+    "chat.favOnly": "所选对话都是收藏，无法删除",
+    "chat.multi": "多选",
+    "chat.multiDone": "完成",
+    "chat.multiHint": "点击勾选要删除的对话，收藏与执行中的自动跳过",
+    "chat.unselectAll": "取消全选",
+    "chat.selCount": "已选",
+    "chat.skipBusy": "执行中的对话不可删除",
+    "chat.colorTitle": "标签颜色",
+    "chat.colorClear": "清除颜色",
+    "chat.colorSwipeHint": "在对话上按住向右拖动可弹出调色板，为对话添加彩色标签",
     "chat.running": "执行中",
     "chat.rename": "重命名",
     "chat.defaultTitle": "AI 对话",
@@ -190,14 +210,29 @@ const dict = {
     "chat.subagentDone": "子代理完成",
     "chat.subagentFailed": "子代理失败",
     "chat.subagentJump": "查看子会话全过程",
+    "chat.bgShells": "后台长命令",
+    "chat.bgShellHint": "这里正在运行需要长时间执行的计算机指令，完成后会自动通知 AI，对话可以继续。",
+    "chat.bgJobs": "后台运行任务状态",
+    "chat.bgJobsHint": "长命令自动转后台运行，可在此逐条停止",
+    "chat.bgJobsEmpty": "（暂无后台任务）",
+    "chat.bgJobsCount": "运行中 {n}",
+    "chat.sessionDetails": "会话详情",
+    "chat.sessionId": "会话 ID",
+    "chat.createdAt": "创建时间",
+    "chat.updatedAt": "最近更新",
+    "chat.messageCount": "消息条数",
+    "chat.toolCalls": "工具调用",
+    "chat.favoriteStatus": "收藏",
+    "chat.colorTag": "彩色标签",
     "chat.delegate": "委派子代理",
-    "chat.delegatePlaceholder": "交给子代理独立完成的任务（自包含：背景 + 目标 + 验收标准）",
-    "chat.delegateSubmit": "派出",
-    "chat.delegateHint": "子代理在独立会话里自主跑完全部步骤（可用全部工具），结论原样带回；生命周期由宿主调度，AI 不能自行派生",
     // 自动委派观察态（设置里开启后，模态只展示状态；UI 不可手动派出）
     "chat.delegateAutoTitle": "子代理自动委派",
-    "chat.delegateAutoHint": "已开启：宿主每个周期挑选「活跃目标下未开始」的待办派给子代理，多个可并行推进（并行上限在设置里调整）；你只观察进度即可。AI 侧没有该工具，生命周期由宿主掌控。",
+    "chat.delegateAutoHint": "已开启：宿主每个周期挑选「活跃目标下未开始」的待办派给子代理，多个可并行推进（并行上限在设置里调整）；你只观察进度即可。AI 在对话中也可自主调用 sub_agent 派生（共用并行上限）。",
     "chat.delegateAutoOn": "已开启",
+    "chat.delegateAutoOff": "未开启",
+    "chat.delegateAutoOffHint": "未开启：在对话页或设置里开启后，Autopilot 运行时会自动把待办派给子代理并行推进。模型侧无该工具，由宿主调度。",
+    "chat.delegateAutoStart": "开始",
+    "chat.delegateAutoPause": "暂停",
     "chat.delegateAutoGoals": "活跃目标",
     "chat.delegateAutoTodos": "待办",
     "chat.delegateAutoRunning": "在跑子代理",
@@ -466,7 +501,7 @@ const dict = {
     "ai.noModels": "未获取到模型，请检查 Key 与 Base URL",
     "ai.saveChanges": "保存修改",
     "ai.autoDelegate": "子代理自动委派",
-    "ai.autoDelegateHint": "开启后，Autopilot 会把活跃目标下未开始的待办派给子代理独立推进（可同时并行多个，默认 3，可在下方调整上限）；模型侧没有该工具，只有宿主能派活",
+    "ai.autoDelegateHint": "开启后，当 Autopilot 在运行（顶部圆钮）时，宿主每周期会把「活跃目标下未开始的待办」派给子代理并行推进；并行上限在下方调整。AI 在对话中也可自主调用 sub_agent 派生子代理，与宿主共用并行上限。",
     "ai.subagentMax": "最大并行子代理数",
     "ai.subagentMaxHint": "Autopilot 每个周期派出待办，直到并行子代理数达到该上限（1–8）",
     "ai.guardTitle": "幻觉防护",
@@ -606,6 +641,20 @@ const dict = {
     "theme.custom": "Custom color",
     "chat.newChat": "New chat",
     "chat.noSessions": "No conversations yet",
+    // Conversation favorites / multi-select / color tags
+    "chat.favAdd": "Favorite conversation",
+    "chat.favRemove": "Unfavorite",
+    "chat.favProtected": "Favorite conversations were kept",
+    "chat.favOnly": "All selected conversations are favorites — nothing to delete",
+    "chat.multi": "Multi-select",
+    "chat.multiDone": "Done",
+    "chat.multiHint": "Click to tick conversations to delete — favorites and running ones are skipped",
+    "chat.unselectAll": "Deselect all",
+    "chat.selCount": "Selected",
+    "chat.skipBusy": "Running conversations can't be deleted",
+    "chat.colorTitle": "Tag color",
+    "chat.colorClear": "Clear color",
+    "chat.colorSwipeHint": "Press and drag a conversation right to open the palette and tag it with a color",
     "chat.running": "Running",
     "chat.rename": "Rename",
     "chat.defaultTitle": "AI Chat",
@@ -646,10 +695,21 @@ const dict = {
     "chat.subagentDone": "Sub-agent done",
     "chat.subagentFailed": "Sub-agent failed",
     "chat.subagentJump": "Open the sub-session",
+    "chat.bgShells": "Long-running commands",
+    "chat.bgShellHint": "Long-running shell commands run here. When one finishes, the AI is notified automatically — you can keep chatting meanwhile.",
+    "chat.bgJobs": "Background running tasks",
+    "chat.bgJobsHint": "Long-running commands are auto-promoted to the background; stop them individually here",
+    "chat.bgJobsEmpty": "(No background tasks)",
+    "chat.bgJobsCount": "{n} running",
+    "chat.sessionDetails": "Session details",
+    "chat.sessionId": "Session ID",
+    "chat.createdAt": "Created at",
+    "chat.updatedAt": "Last update",
+    "chat.messageCount": "Messages",
+    "chat.toolCalls": "Tool calls",
+    "chat.favoriteStatus": "Favorite",
+    "chat.colorTag": "Color tag",
     "chat.delegate": "Delegate to sub-agent",
-    "chat.delegatePlaceholder": "Task the sub-agent should complete on its own (self-contained: background + goal + acceptance criteria)",
-    "chat.delegateSubmit": "Dispatch",
-    "chat.delegateHint": "The sub-agent runs every step autonomously in its own session (all tools available) and returns the result verbatim. Its lifecycle is host-scheduled — the AI cannot spawn one itself",
     // Auto-delegate observation mode
     "chat.delegateAutoTitle": "Auto-delegate to sub-agents",
     "chat.delegateAutoHint": "On. Each tick the host picks pending todos under an active goal and dispatches them to sub-agents — several may run in parallel (cap set in Settings). You just watch the progress — the AI has no such tool and the lifecycle stays host-scheduled.",
@@ -887,7 +947,7 @@ const dict = {
     "ai.tempCustom": "Custom",
     "ai.temperatureDefaultHint": "Use the provider's default temperature (range 0-2, higher = more random)",
     "ai.autoDelegate": "Auto-delegate to sub-agents",
-    "ai.autoDelegateHint": "When on, Autopilot dispatches pending todos under an active goal to sub-agents — several may run in parallel (default 3, adjustable below). The model has no such tool — only the host can delegate",
+    "ai.autoDelegateHint": "When on, while Autopilot is running (top toggle), the host dispatches pending todos under an active goal to sub-agents each cycle — several run in parallel; the cap is set below. The AI can also call sub_agent itself during a chat, sharing the same parallel cap.",
     "ai.subagentMax": "Max parallel sub-agents",
     "ai.subagentMaxHint": "Autopilot keeps dispatching each tick until this many sub-agents run in parallel (1–8)",
     "ai.guardTitle": "Hallucination Guard",

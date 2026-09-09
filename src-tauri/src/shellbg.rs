@@ -1,0 +1,407 @@
+// yxpil · BIT
+// 后台 shell（长命令异步化）：
+//   - shell 工具调用若在「前台窗口」内未结束，自动转入后台作业（job）；
+//   - 转后台立即返回 { status:"background", job_id }，AI 回合不再干等；
+//   - 命令生命周期全程广播 `shell-job` 事件（started / done / killed），供 UI 面板展示；
+//   - 命令自然结束时，若所属会话空闲，把结果作为新消息自动唤回该会话的 AI 继续处理；
+//     会话忙则先把结果注入会话历史，等下一次上下文自然读到。
+//   - 提供 cancel / list / find_running：用户可手动停止，重复命令会被拦截。
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::io::AsyncReadExt;
+use tokio::process::Child;
+use tokio::sync::Notify;
+
+/// 前台判定窗口：命令在窗口内结束走原有「快命令」路径；否则转后台。
+const FRONT_WINDOW_MS: u128 = 2000;
+/// 后台命令硬上限（小时）：防止程序失控后作业永久挂起泄漏。正常作业由用户/结果终止。
+const BG_TIMEOUT_SECS: u64 = 6 * 3600;
+
+/// 一条自然结束的后台命令：交给顶层续跑 worker，把结果唤回所属会话的 AI。
+/// 之所以走 channel 而不是在 run/finish 链里直接 await agent 回合：
+/// agent 回合最终又会经过 builtin_invoke 的 shell 分支（spawn(run)），若在 run 链内 await 会形成
+/// 类型级的无限递归（E0391: opaque future not Send）。顶层 worker 是进程启动时单独 spawn 的，
+/// 与 run 链无类型依赖，彻底断开递归。
+pub struct JobDone {
+    pub session: String,
+    pub command: String,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+static DONE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<JobDone>> = OnceLock::new();
+
+pub struct ShellJob {
+    pub id: String,
+    /// 发起命令的会话 id：完成后要唤回这个会话
+    pub session: Option<String>,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub started: std::time::Instant,
+    /// cancel() 时 notify 一次，后台等待任务随即 kill 进程
+    pub cancel: Arc<Notify>,
+    /// 后台进程句柄（仅 finish 任务取走）
+    pub child: Mutex<Option<Child>>,
+}
+
+fn jobs() -> &'static Mutex<HashMap<String, Arc<ShellJob>>> {
+    static J: OnceLock<Mutex<HashMap<String, Arc<ShellJob>>>> = OnceLock::new();
+    J.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!("sh{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// 构造 shell 命令（Windows 用 PowerShell 强制 UTF-8，其他平台 sh -c），与旧 shell 工具一致
+fn shell_command(command: &str, cwd: Option<&str>) -> tokio::process::Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("powershell");
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}"),
+        ]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    crate::registry::no_window_tokio(&mut cmd);
+    cmd
+}
+
+fn emit(ctx: &Arc<crate::state::Ctx>, phase: &str, job: &ShellJob, extra: Option<serde_json::Value>) {
+    use tauri::Emitter;
+    let mut payload = json!({
+        "phase": phase,
+        "job_id": job.id,
+        "command": job.command,
+        "cwd": job.cwd,
+        "session_id": job.session,
+        "at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    });
+    if let (Some(obj), Some(ext)) =
+        (payload.as_object_mut(), extra.as_ref().and_then(|v| v.as_object()))
+    {
+        for (k, v) in ext {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let _ = ctx.app.emit("shell-job", payload);
+}
+
+/// shell 工具入口：短命令照旧秒回；超过前台窗口的命令转后台（含登记 + 事件 + 自动唤回）。
+/// force_background=true（AI 显式标记长任务）时跳过前台窗口，spawn 后直接转后台。
+pub async fn run(
+    ctx: &Arc<crate::state::Ctx>,
+    command: &str,
+    cwd: Option<&str>,
+    session: Option<&str>,
+    force_background: bool,
+) -> Result<serde_json::Value, String> {
+    // 重复命令拦截：同一会话同一命令正在后台跑时，不重复执行，提示等待或停止
+    if let Some(jid) = find_running(session, command) {
+        return Err(format!(
+            "命令已在后台运行（job {jid}）：`{}`。请等它结束，或发送「停止 {jid}」取消它，不要重复执行同一命令。",
+            crate::registry::safe_trunc(command, 120)
+        ));
+    }
+    let mut cmd = shell_command(command, cwd);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn command: {e}"))?;
+
+    // 前台判定：显式标记后台 → 跳过窗口直接转后台；否则窗口内轮询是否已退出
+    let mut exited: Option<std::process::ExitStatus> = None;
+    if !force_background {
+        let t0 = std::time::Instant::now();
+        loop {
+            if t0.elapsed().as_millis() >= FRONT_WINDOW_MS {
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    exited = Some(st);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("Failed to wait for command: {e}")),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+
+    // 快命令：与旧行为一致——收集输出后直接返回
+    if exited.is_some() {
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("Failed to collect command output: {e}"))?;
+        return Ok(json!({
+            "code": out.status.code(),
+            "stdout": crate::registry::safe_trunc(&String::from_utf8_lossy(&out.stdout), 60000),
+            "stderr": crate::registry::safe_trunc(&String::from_utf8_lossy(&out.stderr), 60000),
+        }));
+    }
+
+    // 长命令：转后台
+    let job = Arc::new(ShellJob {
+        id: next_id(),
+        session: session.map(|s| s.to_string()),
+        command: command.to_string(),
+        cwd: cwd.map(|s| s.to_string()),
+        started: std::time::Instant::now(),
+        cancel: Arc::new(Notify::new()),
+        child: Mutex::new(Some(child)),
+    });
+    jobs().lock().unwrap().insert(job.id.clone(), job.clone());
+    emit(ctx, "started", &job, None);
+    crate::audit::record(
+        ctx,
+        "host",
+        "shell.background",
+        &job.id,
+        json!({ "command": job.command, "session": job.session }),
+        true,
+    );
+    let c2 = ctx.clone();
+    let j2 = job.clone();
+    tauri::async_runtime::spawn(async move {
+        finish(c2, j2).await;
+    });
+    Ok(json!({
+        "status": "background",
+        "job_id": job.id,
+        "note": if force_background {
+            format!(
+                "Started in background as job {}. The chat continues; the result will be delivered to this session when the command finishes — do not run this command again.",
+                job.id
+            )
+        } else {
+            format!(
+                "Command was still running after {}ms; it has been moved to background job {}. The result will be delivered to the session when it finishes — do not run this command again.",
+                FRONT_WINDOW_MS, job.id
+            )
+        },
+    }))
+}
+
+/// 后台作业收尾：等待进程结束（或用户取消/硬超时）→ 广播 done/killed → 移除登记 → 自然结束时唤回 AI
+async fn finish(ctx: Arc<crate::state::Ctx>, job: Arc<ShellJob>) {
+    let child = { job.child.lock().unwrap().take() };
+    let Some(mut child) = child else {
+        jobs().lock().unwrap().remove(&job.id);
+        return;
+    };
+    // 并发读 stdout / stderr（管道必须先被读，否则输出大的进程会写满管道被卡死）
+    let so_pipe = child.stdout.take();
+    let se_pipe = child.stderr.take();
+    let so_task = tauri::async_runtime::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        if let Some(mut p) = so_pipe {
+            let _ = p.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let se_task = tauri::async_runtime::spawn(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        if let Some(mut p) = se_pipe {
+            let _ = p.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let timeout_sleep = tokio::time::sleep(std::time::Duration::from_secs(BG_TIMEOUT_SECS));
+    tokio::pin!(timeout_sleep);
+    let mut cancelled = false;
+    let status: Option<std::process::ExitStatus> = tokio::select! {
+        st = child.wait() => st.ok(),
+        _ = job.cancel.notified() => {
+            cancelled = true;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            None
+        }
+        _ = &mut timeout_sleep => {
+            cancelled = true;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            None
+        }
+    };
+    let stdout = String::from_utf8_lossy(&so_task.await.unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&se_task.await.unwrap_or_default()).into_owned();
+    jobs().lock().unwrap().remove(&job.id);
+    let ms = job.started.elapsed().as_millis() as u64;
+
+    match status {
+        Some(st) => {
+            let code = st.code();
+            emit(
+                &ctx,
+                "done",
+                &job,
+                Some(json!({ "code": code, "ms": ms })),
+            );
+            crate::audit::record(
+                &ctx,
+                "host",
+                "shell.done",
+                &job.id,
+                json!({ "command": job.command, "code": code }),
+                true,
+            );
+            // 自然结束：广播 done 后把结果投递给顶层续跑 worker（自动唤回所属会话的 AI 处理）
+            if let Some(tx) = DONE_TX.get() {
+                if let Some(sid) = job.session.clone() {
+                    let _ = tx.send(JobDone {
+                        session: sid,
+                        command: job.command.clone(),
+                        code,
+                        stdout,
+                        stderr,
+                    });
+                }
+            }
+        }
+        None => {
+            emit(
+                &ctx,
+                "killed",
+                &job,
+                Some(json!({ "ms": ms, "reason": if cancelled { "cancelled" } else { "timeout" } })),
+            );
+            crate::audit::record(
+                &ctx,
+                "host",
+                "shell.cancelled",
+                &job.id,
+                json!({ "command": job.command }),
+                true,
+            );
+        }
+    }
+}
+
+/// 后台命令结束 → 唤回所属会话的 AI：
+/// 会话空闲则自动开一个新回合处理结果；会话忙则先把结果注入历史，等下一次上下文自然读到。
+async fn resume(ctx: &Arc<crate::state::Ctx>, msg: &JobDone) {
+    use tauri::Emitter;
+    let sid = &msg.session;
+    if crate::agent::interrupted(ctx, sid) {
+        return; // 会话已被中断，不自动续跑
+    }
+    {
+        let store = ctx.sessions.lock().unwrap();
+        if !store.sessions.iter().any(|s| &s.id == sid) {
+            return; // 会话已删除
+        }
+    }
+    let so = crate::registry::safe_trunc(msg.stdout.trim_end(), 16000);
+    let se = crate::registry::safe_trunc(msg.stderr.trim_end(), 6000);
+    let code_txt = msg
+        .code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let body = format!(
+        "[后台任务完成] 命令 `{}` 已结束，退出码 {code_txt}。请基于上面的结果继续推进任务；若任务已全部完成，直接给出结论即可，不要重复执行该命令。\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        msg.command,
+        if so.is_empty() { "(空)".to_string() } else { so },
+        if se.is_empty() { "(空)".to_string() } else { se },
+    );
+
+    // 会话忙（用户正在发的回合 / 其他回合在跑）：只注入历史，不强开回合抢锁
+    let busy = ctx.turn_locks.lock().unwrap().contains_key(sid);
+    if busy {
+        push_system_user(ctx, sid, &body);
+        return;
+    }
+    // 会话空闲：稍作让渡避免与刚结束的回合抢锁，随后自动唤回 AI 处理
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    if ctx.turn_locks.lock().unwrap().contains_key(sid) {
+        push_system_user(ctx, sid, &body);
+        return;
+    }
+    let _ = crate::agent::chat_turn_auto(ctx, sid, &body, Vec::new()).await;
+    let _ = ctx.app.emit("sessions-updated", sid);
+}
+
+/// 启动后台 shell 的顶层续跑 worker（进程 setup 时调用一次）：
+/// 常驻消费 JobDone，把命令结果逐个唤回所属会话的 AI。
+pub fn init(ctx: &Arc<crate::state::Ctx>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<JobDone>();
+    let _ = DONE_TX.set(tx);
+    let c = ctx.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            resume(&c, &msg).await;
+        }
+    });
+}
+
+/// 把后台任务结果作为一条 role=user 的系统说明消息注入会话历史（前端会特殊渲染 [后台任务] 前缀）
+fn push_system_user(ctx: &Arc<crate::state::Ctx>, sid: &str, body: &str) {
+    use tauri::Emitter;
+    {
+        let mut store = ctx.sessions.lock().unwrap();
+        if let Some(sess) = store.get_mut(sid) {
+            sess.messages.push(crate::ai::ChatMessage::user(body));
+            sess.touch();
+            if sess.messages.len() > crate::state::CHAT_MAX {
+                let drop_n = sess.messages.len() - crate::state::CHAT_MAX;
+                sess.messages.drain(0..drop_n);
+            }
+        }
+    }
+    crate::session::persist(ctx);
+    let _ = ctx.app.emit("sessions-updated", sid);
+}
+
+/// 用户 / UI 停止一个后台命令：通知其等待任务 kill 进程，事件 killed 会在片刻后广播
+pub fn cancel(id: &str) -> bool {
+    let job = jobs().lock().unwrap().get(id).cloned();
+    match job {
+        Some(j) => {
+            j.cancel.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
+/// 所有在跑的后台命令（面板初始拉取用）
+pub fn list() -> serde_json::Value {
+    let m = jobs().lock().unwrap();
+    let arr: Vec<serde_json::Value> = m
+        .iter()
+        .map(|(id, j)| {
+            json!({
+                "job_id": id,
+                "command": j.command,
+                "cwd": j.cwd,
+                "session_id": j.session,
+                "elapsed_ms": j.started.elapsed().as_millis() as u64,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
+/// 重复命令检测：同一会话里是否已有同一条命令在后台跑。返回其 job_id
+pub fn find_running(session: Option<&str>, command: &str) -> Option<String> {
+    let m = jobs().lock().unwrap();
+    m.values()
+        .find(|j| j.session.as_deref() == session && j.command == command)
+        .map(|j| j.id.clone())
+}

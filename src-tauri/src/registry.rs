@@ -55,12 +55,13 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.shell",
             "shell",
-            "Execute a shell command (system shell) and return stdout/stderr with exit code",
+            "Execute a shell command (system shell) and return stdout/stderr with exit code. Commands still running after ~2s are automatically moved to a background job (the result is delivered back to the session when it finishes). For known long tasks set background=true to start in the background immediately",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The command to execute" },
-                    "cwd": { "type": "string", "description": "Working directory (optional)" }
+                    "cwd": { "type": "string", "description": "Working directory (optional)" },
+                    "background": { "type": "boolean", "description": "Set true for known long tasks (builds, installs, batch jobs): returns a job_id immediately, the chat continues, and the command result is automatically reported back to this session when it finishes. The job is visible and stoppable in the background-tasks panel" }
                 },
                 "required": ["command"]
             }),
@@ -183,11 +184,11 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "add_tool",
         ),
-        // 5.5 子智能体：派生独立会话执行子任务（宿主管控：不下发给模型，由宿主调度生命周期）
+        // 5.5 子智能体：派生独立会话执行子任务（模型可自主调用；子代理会话内被宿主拦截，禁止嵌套）
         mk(
             "builtin.sub_agent",
             "sub_agent",
-            "HOST-SCHEDULED (never exposed to the model): spawn a sub-agent that opens an independent session with the full task. The sub-agent has ALL tools and runs autonomously (multi-turn, including file read/write and shell) until it finishes, then its final answer is returned verbatim to the caller. The task must be self-contained — the sub-agent cannot see the caller's history, so include background, goal and acceptance criteria.",
+            "Spawn a sub-agent: it opens an independent session, has all tools, and runs autonomously until done — then its final answer returns verbatim to you. The sub-agent cannot see your history, so the task must be self-contained (background + goal + acceptance criteria). Use it only for long subtasks that benefit from parallelism; do quick or context-heavy work yourself. Sub-agents cannot spawn further sub-agents.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -408,9 +409,31 @@ pub fn subagent_depth() -> usize {
     SUBAGENT_DEPTH.load(Ordering::SeqCst)
 }
 
+/// 在跑的子代理会话 id 集合：标记「哪些会话本身是子代理」。
+/// sub_agent 工具已下发给模型（AI 自主决定派生），靠它显式禁止子代理再派生子代理（防递归）。
+static SUB_SESSIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn sub_sessions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    SUB_SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 该会话是否本身是一个子代理会话
+pub fn is_sub_session(sid: &str) -> bool {
+    sub_sessions().lock().unwrap().contains(sid)
+}
+
+fn register_sub_session(sid: &str) {
+    sub_sessions().lock().unwrap().insert(sid.to_string());
+}
+
+fn unregister_sub_session(sid: &str) {
+    sub_sessions().lock().unwrap().remove(sid);
+}
+
 /// 子代理生命周期事件（宿主调度模型的对外通知面）。
-/// 模型侧看不到子代理工具、也无法自行派生：只有宿主入口（远程/自动化/宿主逻辑）
-/// 触发 `sub_agent` 时才会依次广播 spawn → start → done|error。
+/// 模型侧可自主调用 sub_agent 派生（也受宿主开关/上限约束）；
+/// 无论宿主入口还是模型调用，都会依次广播 spawn → start → done|error。
 /// phase: spawn（会话已建） / start（开始跑） / done（拿到结论） / error（失败或超时/中断）
 fn emit_subagent(
     ctx: &Arc<crate::state::Ctx>,
@@ -438,6 +461,21 @@ fn emit_subagent(
         }
     }
     let _ = ctx.app.emit("subagent-lifecycle", payload);
+}
+
+/// 停止一个在跑的子代理：对子会话的中断标志置位，其 agent 回合在下一个检查点停止。
+/// 子会话保留中途进度（与主会话中断行为一致），stop 只影响该子代理自身。
+/// 返回 false 表示该会话当前没有在跑回合（可能已结束/从未开始）。
+pub fn stop_subagent(ctx: &Arc<crate::state::Ctx>, sid: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    let map = ctx.interrupts.lock().unwrap();
+    match map.get(sid) {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
 }
 
 /// 执行工具：内置实现或转发到 Agent 回调端点
@@ -595,40 +633,10 @@ async fn builtin_invoke(
                 .ok_or("Missing parameter: command")?
                 .to_string();
             let cwd = params.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let handle = tauri::async_runtime::spawn(async move {
-                let mut cmd = if cfg!(windows) {
-                    // 强制 PowerShell 以 UTF-8 输出，避免中文被 GBK 编码成乱码
-                    let mut c = tokio::process::Command::new("powershell");
-                    c.args([
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-Command",
-                        &format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}"),
-                    ]);
-                    c
-                } else {
-                    let mut c = tokio::process::Command::new("sh");
-                    c.args(["-c", &command]);
-                    c
-                };
-                if let Some(dir) = &cwd {
-                    cmd.current_dir(dir);
-                }
-                no_window_tokio(&mut cmd);
-                // 超时后 future 被 drop，kill_on_drop 确保子进程被终止而不是变孤儿继续跑
-                cmd.kill_on_drop(true);
-                cmd.output().await
-            });
-            let out = match tokio::time::timeout(std::time::Duration::from_secs(600), handle).await {
-                Ok(res) => res.map_err(|e| format!("Command task failed: {e}"))?,
-                Err(_) => return Err("Command execution timed out (600s)".into()),
-            };
-            let out = out.map_err(|e| format!("Failed to spawn command: {e}"))?;
-            Ok(serde_json::json!({
-                "code": out.status.code(),
-                "stdout": safe_trunc(&String::from_utf8_lossy(&out.stdout), 60000),
-                "stderr": safe_trunc(&String::from_utf8_lossy(&out.stderr), 60000),
-            }))
+            // AI 显式标记长任务：跳过前台窗口直接转后台（对话继续，完成后自动唤回本会话 AI）
+            let force_bg = params.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+            // 后台 shell：短命令秒回；长命令自动转后台（shell-job 事件 + 可停止 + 完成时顶层 worker 自动唤回会话 AI）
+            crate::shellbg::run(ctx, &command, cwd.as_deref(), session, force_bg).await
         }
         // ── 2. 文档编辑（写 / 覆盖）──
         "write_file" => {
@@ -831,9 +839,28 @@ async fn builtin_invoke(
                     SUBAGENT_DEPTH.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            // 子代理会话内模型没有 sub_agent 工具（is_host_only_tool），宿主也只在顶层派发，
-            // 不会发生递归嵌套；计数只用于「在跑数」限流（delegation 按 config.subagent_max）
-            // 与 UI 展示。保留一个防御性硬顶，防止宿主逻辑 bug 导致计数失控自增
+            // sub_agent 已下发给模型（AI 自主决定派生），递归防护从「模型看不到工具」
+            // 改为显式拦截：子代理会话再调用 sub_agent 直接拒绝。
+            if session.map(is_sub_session).unwrap_or(false) {
+                return Err(
+                    "Sub-agents cannot spawn further sub-agents — finish the work in this session"
+                        .into(),
+                );
+            }
+            // 并行上限与宿主委派共用 config.subagent_max（1..=8，设置页可调）
+            let (running, limit) = {
+                let cfg = ctx.config.lock().unwrap();
+                (
+                    subagent_depth(),
+                    cfg.subagent_max.clamp(1, crate::delegation::MAX_CFG_SUBAGENTS as u32) as usize,
+                )
+            };
+            if running >= limit {
+                return Err(format!(
+                    "已有 {running} 个子代理在跑（并行上限 {limit}，可在设置里调整），等有位置再派生"
+                ));
+            }
+            // 防御性硬顶：正常由上面的并行上限拦住，这里防计数失控自增
             const SANITY_MAX: usize = 32;
             let depth = SUBAGENT_DEPTH.fetch_add(1, Ordering::SeqCst);
             let _guard = DecGuard;
@@ -852,12 +879,17 @@ async fn builtin_invoke(
             let sid = sess.id.clone();
             ctx.sessions.lock().unwrap().sessions.push(sess);
             crate::session::persist(ctx);
-            emit_subagent(ctx, "spawn", &sid, parent.as_deref(), &title, depth, None);
+            // 登记「该会话是子代理」：子代理回合内再调 sub_agent 会被上面的检查拒绝
+            register_sub_session(&sid);
+            // spawn/start 都携带任务预览（task 截断），供委派面板「看它派了什么出去」
+            let task_preview = safe_trunc(&task, 240);
+            let spawn_extra = Some(serde_json::json!({ "task": task_preview }));
+            emit_subagent(ctx, "spawn", &sid, parent.as_deref(), &title, depth, spawn_extra.clone());
             {
                 use tauri::Emitter;
                 let _ = ctx.app.emit("sessions-updated", &sid);
             }
-            emit_subagent(ctx, "start", &sid, parent.as_deref(), &title, depth, None);
+            emit_subagent(ctx, "start", &sid, parent.as_deref(), &title, depth, spawn_extra);
             // 阻塞执行子任务：完整复用 agent 循环（工具、审批、自动续发全部生效）。
             // Box::pin：builtin_invoke → chat_turn → execute_tool_call → builtin_invoke 递归，需手动打断无限大小
             let mut run = Box::pin(crate::agent::chat_turn(ctx, &sid, &task, Vec::new()));
@@ -952,6 +984,7 @@ async fn builtin_invoke(
                 use tauri::Emitter;
                 let _ = ctx.app.emit("sessions-updated", &sid);
             }
+            unregister_sub_session(&sid);
             outcome
         }
         // ── 6. 给自己增加工具 ──

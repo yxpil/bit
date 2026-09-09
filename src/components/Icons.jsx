@@ -288,3 +288,21 @@ export const IconLink = (p) => (
     <path d="M14 11a5 5 0 0 0-7.07 0l-2 2a5 5 0 0 0 7.07 7.07l1.5-1.5" />
   </I>
 );
+
+/* ---- 会话收藏 / 多选 ---- */
+
+export const IconStar = (p) => (
+  <I {...p}>
+    <polygon points="12,3.6 14.7,9 20.4,9.8 16.2,13.8 17.3,19.6 12,16.5 6.7,19.6 7.8,13.8 3.6,9.8 9.3,9" />
+  </I>
+);
+
+export const IconStarSolid = (p) => (
+  <I {...p}>
+    <polygon
+      points="12,3.6 14.7,9 20.4,9.8 16.2,13.8 17.3,19.6 12,16.5 6.7,19.6 7.8,13.8 3.6,9.8 9.3,9"
+      fill="currentColor"
+      stroke="none"
+    />
+  </I>
+);

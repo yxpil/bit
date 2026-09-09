@@ -367,6 +367,35 @@ pub fn subagent_running() -> usize {
     crate::registry::subagent_depth()
 }
 
+/// 停止一个在跑的子代理（委派面板的「停止」按钮触发；只停该子会话，保留其进度）
+#[tauri::command]
+pub fn stop_subagent(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let stopped = crate::registry::stop_subagent(&ctx, &session_id);
+    if stopped {
+        crate::audit::record(&ctx, "local-user", "subagent.stop", &session_id, json!({}), true);
+    }
+    Ok(json!({ "stopped": stopped, "session_id": session_id }))
+}
+
+/// 停止一个在跑的后台命令（面板「停止」按钮 / 输入框「停止 <job_id>」；kill 进程，随后 shell-job killed 事件广播）
+#[tauri::command]
+pub fn cancel_shell(state: State<'_, Arc<Ctx>>, job_id: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    if crate::shellbg::cancel(&job_id) {
+        crate::audit::record(&ctx, "local-user", "shell.cancel_request", &job_id, json!({}), true);
+        Ok(json!({ "cancelled": true, "job_id": job_id }))
+    } else {
+        Err(format!("后台命令 {job_id} 不存在或已结束"))
+    }
+}
+
+/// 所有在跑的后台命令（面板挂载时恢复初始状态用）
+#[tauri::command]
+pub fn list_running_shells() -> serde_json::Value {
+    crate::shellbg::list()
+}
+
 /// AI 行为设置（设置页读写）：自动推进 / 子代理自动委派 / 审批模式 / 敏感词审核 / 兼容模式
 #[tauri::command]
 pub fn get_behavior_settings(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
@@ -1707,11 +1736,19 @@ pub fn list_sessions(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
                 "updated": s.updated,
                 "count": s.messages.iter().filter(|m| m.role != "system").count(),
                 "preview": s.preview(),
+                "favorite": s.favorite,
+                "color": s.color,
             })
         })
         .collect();
-    // 最近更新的排在前面
-    list.sort_by(|a, b| b["updated"].as_str().unwrap_or("").cmp(a["updated"].as_str().unwrap_or("")));
+    // 收藏的置顶；其余按最近更新排序
+    list.sort_by(|a, b| {
+        let fa = a["favorite"].as_bool().unwrap_or(false);
+        let fb = b["favorite"].as_bool().unwrap_or(false);
+        fb.cmp(&fa).then_with(|| {
+            b["updated"].as_str().unwrap_or("").cmp(a["updated"].as_str().unwrap_or(""))
+        })
+    });
     json!({ "sessions": list, "active": store.active })
 }
 
@@ -1795,6 +1832,67 @@ pub fn delete_session(state: State<'_, Arc<Ctx>>, session_id: String) -> serde_j
     }
     ctx.save_sessions();
     json!({ "deleted": true, "active": active })
+}
+
+/// 收藏 / 取消收藏会话（收藏的会话置顶，批量删除时受保护）
+#[tauri::command]
+pub fn set_session_favorite(state: State<'_, Arc<Ctx>>, session_id: String, favorite: bool) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut store = ctx.sessions.lock().unwrap();
+        let s = store.get_mut(&session_id).ok_or("会话不存在")?;
+        s.favorite = favorite;
+    }
+    ctx.save_sessions();
+    Ok(json!({ "favorite": favorite }))
+}
+
+/// 设置会话彩色标签（color：十六进制色值或空串=清除）
+#[tauri::command]
+pub fn set_session_color(state: State<'_, Arc<Ctx>>, session_id: String, color: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut store = ctx.sessions.lock().unwrap();
+        let s = store.get_mut(&session_id).ok_or("会话不存在")?;
+        let c = color.trim().to_string();
+        s.color = if c.starts_with('#') && c.len() >= 4 { c } else { String::new() };
+    }
+    ctx.save_sessions();
+    Ok(json!({ "color": color }))
+}
+
+/// 批量删除会话（收藏的会话自动跳过，不会删除）；删空后自动补一个默认会话
+#[tauri::command]
+pub fn delete_sessions(state: State<'_, Arc<Ctx>>, session_ids: Vec<String>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let mut deleted = 0usize;
+    let mut skipped = 0usize;
+    let active;
+    {
+        let mut store = ctx.sessions.lock().unwrap();
+        let ids: std::collections::HashSet<String> = session_ids.into_iter().collect();
+        store.sessions.retain(|s| {
+            if !ids.contains(&s.id) {
+                true
+            } else if s.favorite {
+                skipped += 1;
+                true
+            } else {
+                deleted += 1;
+                false
+            }
+        });
+        if store.sessions.is_empty() {
+            let s = crate::session::Session::new("新对话");
+            store.active = s.id.clone();
+            store.sessions.push(s);
+        } else if ids.contains(&store.active) && !store.sessions.iter().any(|s| s.id == store.active) {
+            store.active = store.sessions.last().map(|s| s.id.clone()).unwrap_or_default();
+        }
+        active = store.active.clone();
+    }
+    ctx.save_sessions();
+    json!({ "deleted": deleted, "skipped": skipped, "active": active })
 }
 
 /// 清空某会话的消息（保留会话本身）

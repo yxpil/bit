@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::ai::ChatMessage;
 
 /// 一段独立的对话会话（多会话分组）
+/// favorite：收藏（置顶且批量删除时受保护）；color：彩色标签（十六进制色值，空=无色）
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Session {
     pub id: String,
@@ -13,6 +14,10 @@ pub struct Session {
     pub updated: String,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub color: String,
 }
 
 impl Session {
@@ -24,6 +29,8 @@ impl Session {
             created: now.clone(),
             updated: now,
             messages: Vec::new(),
+            favorite: false,
+            color: String::new(),
         }
     }
 
@@ -104,6 +111,8 @@ impl SessionStore {
                 created: now.clone(),
                 updated: now,
                 messages: Vec::new(),
+                favorite: false,
+                color: String::new(),
             });
         }
         self.get_mut(id).expect("会话已创建")

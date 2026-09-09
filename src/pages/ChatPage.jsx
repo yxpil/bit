@@ -18,11 +18,23 @@ import {
   IconCopy,
   IconCheck,
   IconTarget,
+  IconStar,
+  IconStarSolid,
+  IconTerminal,
 } from "../components/Icons.jsx";
+import PillSwitch from "../components/PillSwitch.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
 import PendingToolCard from "../components/PendingToolCard.jsx";
 import FileCard from "../components/FileCard.jsx";
 import Markdown from "../components/Markdown.jsx";
+import { useShellJobs } from "../hooks/useShellJobs.js";
+
+// 对话彩色标签调色板（十六进制色值）
+const TAG_COLORS = [
+  "#ef4444", "#f97316", "#f59e0b", "#eab308", "#84cc16", "#22c55e",
+  "#10b981", "#14b8a6", "#06b6d4", "#0ea5e9", "#3b82f6", "#6366f1",
+  "#8b5cf6", "#d946ef", "#ec4899", "#78716c",
+];
 
 // AI 对话：多会话分组 + 工具调用可视化
 export default function ChatPage({ onStats, visible }) {
@@ -32,6 +44,18 @@ export default function ChatPage({ onStats, visible }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [renaming, setRenaming] = useState(null); // {id, title}
+  // 工具栏：后台任务 popover
+  const [bgJobsOpen, setBgJobsOpen] = useState(false);
+  // 后台长命令状态（集中 hook：拉取 + 事件订阅 + 停止）
+  const shellJobs = useShellJobs();
+  // 会话收藏 / 多选批量删除 / 彩色标签（右滑调出调色板）
+  const [multiMode, setMultiMode] = useState(false); // 是否处于多选删除模式
+  const [selSet, setSelSet] = useState(() => new Set()); // 多选模式下勾选的会话 id
+  const [colorFor, setColorFor] = useState(null); // 正在打彩色标签的会话 id（null=无）
+  const [batchHint, setBatchHint] = useState(""); // 多选/删除的临时反馈文字
+  const dragRef = useRef(null); // {x, y, id, armed} 右滑手势起点
+  const swipedRef = useRef(null); // 刚完成右滑的会话 id（抑制随后的 click）
+  const hintTimer = useRef(null);
   // 多会话并发：busyMap/liveMap 以会话 id 为键，A 会话流式时仍可切到 B 会话继续聊
   const [busyMap, setBusyMap] = useState({}); // { sessionId: true }
   const [liveMap, setLiveMap] = useState({}); // { sessionId: { text, cards } }
@@ -81,15 +105,21 @@ export default function ChatPage({ onStats, visible }) {
   // 子代理（宿主调度）：模型侧没有这个工具，只有宿主/用户能派生；这里做生命周期可视化
   const [subs, setSubs] = useState({}); // { session_id: { title, phase, ms, error, at, parent } }
   const [delegateOpen, setDelegateOpen] = useState(false);
-  const [delegateTask, setDelegateTask] = useState("");
-  const [delegateBusy, setDelegateBusy] = useState(false);
-  const [delegateErr, setDelegateErr] = useState("");
   // 设置里「子代理自动委派」开关：true 时 popover 切观察态，不暴露手动派出入口
   const [autoDelegate, setAutoDelegate] = useState(false);
   // 观察态用：活跃目标与未开始待办（仅在 popover 打开 + 自动模式时拉取并定期刷新）
   const [delegateGoals, setDelegateGoals] = useState([]);
   const [delegateTodos, setDelegateTodos] = useState([]);
   const subList = Object.entries(subs).map(([id, v]) => ({ session_id: id, ...v }));
+
+  // 停止单个在跑的子代理（委派面板「停止」按钮；只停该子会话，保留其进度）
+  const stopSubagent = async (sid) => {
+    try {
+      await api.stopSubagent(sid);
+    } catch (e) {
+      console.warn("stop subagent failed:", e);
+    }
+  };
 
   // 审批模式初始化 + 全局审批请求监听 + 非流式对话的用量统计监听
   useEffect(() => {
@@ -129,7 +159,9 @@ export default function ChatPage({ onStats, visible }) {
     return () => un.then((f) => f());
   }, []);
 
-  // 取「子代理自动委派」开关：决定 popover 走手动态（手动输入任务+派出）还是观察态（只读）
+  // 取「子代理自动委派」开关：决定 popover 走手动态（手动输入任务+派出）还是观察态（只读）。
+  // 页面常驻挂载不销毁，设置页里改掉后这里必须实时重读：每次切回本页 / 打开弹层都刷新，
+  // 否则会一直停留应用启动时的旧值（表现为已关闭仍显示「已开启」）
   useEffect(() => {
     let stop = false;
     api
@@ -141,7 +173,31 @@ export default function ChatPage({ onStats, visible }) {
     return () => {
       stop = true;
     };
-  }, []);
+  }, [delegateOpen, visible]);
+
+  // 对话页直接开始/暂停「子代理自动委派」，与设置页 auto_delegate 双向联动
+  const toggleAutoDelegate = async () => {
+    try {
+      const cur = await api.getBehaviorSettings();
+      const next = {
+        auto_drive: cur?.auto_drive ?? true,
+        tool_approval: cur?.tool_approval || "ask",
+        moderation_enabled: cur?.moderation_enabled ?? true,
+        auto_delegate: !autoDelegate,
+        compat_mode: cur?.compat_mode ?? false,
+        subagent_max: cur?.subagent_max ?? 3,
+      };
+      await api.setBehaviorSettings(
+        next.auto_drive,
+        next.tool_approval,
+        next.moderation_enabled,
+        next.auto_delegate,
+        next.compat_mode,
+        next.subagent_max,
+      );
+      setAutoDelegate(next.auto_delegate);
+    } catch {}
+  };
 
   // 观察态：popover 打开时拉活跃目标 + 未开始待办；自动模式下每 5s 刷新一次
   useEffect(() => {
@@ -168,25 +224,6 @@ export default function ChatPage({ onStats, visible }) {
       if (timer) clearInterval(timer);
     };
   }, [delegateOpen, autoDelegate]);
-
-  // 宿主调度：把一段自包含任务派给子代理（阻塞直到它跑完，结论原样带回本会话）
-  const delegate = async () => {
-    const task = delegateTask.trim();
-    if (!task || !activeId) return;
-    setDelegateBusy(true);
-    setDelegateErr("");
-    try {
-      await api.spawnSubagent(task, "", activeId);
-      setDelegateTask("");
-      setDelegateOpen(false);
-      loadSessions();
-    } catch (e) {
-      const msg = typeof e === "string" ? e : e?.message || String(e);
-      setDelegateErr(`${t("chat.callFailed")}${msg}`);
-    } finally {
-      setDelegateBusy(false);
-    }
-  };
 
   // 拖拽文件 / 文件夹到窗口：插入链接到输入框
   // 注意：拖拽事件由 Tauri 发在 Webview 目标上，用全局 listen（Any 目标）确保能收到，
@@ -472,6 +509,18 @@ export default function ChatPage({ onStats, visible }) {
     return () => window.removeEventListener("bit-new-session", h);
   }, []);
 
+  // 后台 shell / 子代理等面板请求：打开指定会话
+  useEffect(() => {
+    const h = (e) => {
+      const id = e.detail?.id;
+      if (!id) return;
+      selectSession(id);
+    };
+    window.addEventListener("bit-open-session", h);
+    return () => window.removeEventListener("bit-open-session", h);
+    // selectSession 只依赖稳定 api 与 setState，空依赖即可
+  }, []);
+
   const deleteSession = async (id, e) => {
     e?.stopPropagation();
     if (busyMap[id]) return; // 执行中的会话不能删除，避免流式结果写入已删会话
@@ -489,8 +538,139 @@ export default function ChatPage({ onStats, visible }) {
     loadSessions();
   };
 
+  // 临时提示（自动消失）
+  const flashHint = (msg) => {
+    setBatchHint(msg);
+    clearTimeout(hintTimer.current);
+    hintTimer.current = setTimeout(() => setBatchHint(""), 3000);
+  };
+
+  const toggleFavorite = async (id) => {
+    const s = sessions.find((x) => x.id === id);
+    if (!s) return;
+    await api.setSessionFavorite(id, !s.favorite).catch(() => {});
+    loadSessions();
+  };
+
+  const setTagColor = async (id, color) => {
+    setColorFor(null);
+    await api.setSessionColor(id, color || "").catch(() => {});
+    loadSessions();
+  };
+
+  // 向右拖动（按住右移超过阈值）→ 召唤该会话的彩色调色板
+  useEffect(() => {
+    const move = (e) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const dx = e.clientX - d.x;
+      const dy = e.clientY - d.y;
+      if (!d.armed && dx > 26 && Math.abs(dx) > Math.abs(dy) * 1.3) d.armed = true;
+      if (d.armed) e.preventDefault();
+    };
+    const up = () => {
+      const d = dragRef.current;
+      dragRef.current = null;
+      if (d?.armed) {
+        swipedRef.current = d.id;
+        setColorFor(d.id);
+        setTimeout(() => (swipedRef.current = null), 0);
+      }
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+    return () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+    };
+  }, []);
+
+  const startRowDrag = (e, id) => {
+    if (e.button !== 0 || multiMode) return; // 多选模式下不做右滑手势
+    if (busyMap[id]) return;
+    dragRef.current = { x: e.clientX, y: e.clientY, id, armed: false };
+  };
+
+  // 会话行点击：多选=勾选；普通=切换；刚右滑完的这一次点击被抑制
+  const onRowClick = (id) => {
+    if (swipedRef.current === id) {
+      swipedRef.current = null;
+      return;
+    }
+    if (multiMode) {
+      if (busyMap[id]) return;
+      setSelSet((prev) => {
+        const n = new Set(prev);
+        if (n.has(id)) n.delete(id);
+        else n.add(id);
+        return n;
+      });
+      return;
+    }
+    if (colorFor) setColorFor(null);
+    selectSession(id);
+  };
+
+  const enterMulti = () => {
+    setMultiMode(true);
+    setSelSet(new Set());
+    setColorFor(null);
+  };
+  const exitMulti = () => {
+    setMultiMode(false);
+    setSelSet(new Set());
+    setColorFor(null);
+    setBatchHint("");
+  };
+
+  const allSelectableIds = sessions.filter((s) => !busyMap[s.id]).map((s) => s.id);
+  const allSelected = allSelectableIds.length > 0 && allSelectableIds.every((id) => selSet.has(id));
+  const toggleSelectAll = () => {
+    setSelSet(allSelected ? new Set() : new Set(allSelectableIds));
+  };
+
+  // 批量删除：收藏与执行中的对话自动跳过；有跳过时留在多选态并给出反馈
+  const batchDelete = async () => {
+    if (selSet.size === 0) return;
+    const picked = sessions.filter((s) => selSet.has(s.id));
+    const favIds = picked.filter((s) => s.favorite).map((s) => s.id);
+    const busyPicked = picked.filter((s) => busyMap[s.id]);
+    const ids = picked.filter((s) => !s.favorite && !busyMap[s.id]).map((s) => s.id);
+    if (ids.length === 0) {
+      flashHint(favIds.length ? t("chat.favOnly") : t("chat.skipBusy"));
+      return;
+    }
+    const r = await api.deleteSessions(ids).catch(() => null);
+    if (!r) return;
+    await loadSessions();
+    if (ids.includes(activeId)) setActiveId(r.active || "");
+    // 保留未被删除的勾选项（收藏 / 执行中），供用户继续处理
+    setSelSet(new Set(picked.filter((s) => !ids.includes(s.id)).map((s) => s.id)));
+    const notes = [];
+    if (favIds.length) notes.push(t("chat.favProtected"));
+    if (busyPicked.length) notes.push(t("chat.skipBusy"));
+    if (notes.length) flashHint(notes.join(" · "));
+    else exitMulti();
+  };
+
   const send = async () => {
     const text = input.trim();
+    // 「停止 <job_id>」：直接取消对应后台长命令，不再发给 AI（AI 提示用户时可这么用）
+    const stopM = text.match(/^(?:停止|stop)\s+(sh\d+)\s*$/i);
+    if (stopM) {
+      const jid = stopM[1];
+      setInput("");
+      try {
+        await api.cancelShell(jid);
+        if (activeRef.current)
+          setMessages((msgs) => [...msgs, { role: "assistant", content: `⏹ 已请求停止后台命令 ${jid}（进程即将终止）。` }]);
+      } catch (e) {
+        const emsg = typeof e === "string" ? e : e?.message || String(e);
+        if (activeRef.current)
+          setMessages((msgs) => [...msgs, { role: "assistant", content: `⚠️ ${emsg}` }]);
+      }
+      return;
+    }
     // 允许只带附件（图片/文档）而无文字时也可发送
     if ((!text && !hasAttachments) || !activeId) return;
     const sid = activeId; // 锁定目标会话：之后用户切换页面不影响本次执行
@@ -798,70 +978,224 @@ export default function ChatPage({ onStats, visible }) {
         </div>
       )}
       {/* 会话侧栏：纯文字列表（仪表盘已上移页眉） */}
-      <div className="flex w-52 shrink-0 flex-col gap-2">
+      <div className="flex w-52 shrink-0 flex-col gap-1.5">
+        {/* 会话操作条：默认提供「多选」；多选态下可 全选 / 批量删除 / 完成 */}
+        <div className="flex shrink-0 flex-wrap items-center gap-1 px-1">
+          {!multiMode ? (
+            <button
+              onClick={enterMulti}
+              title={`${t("chat.multi")} · ${t("chat.colorSwipeHint")}`}
+              className="flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
+            >
+              <IconCheck size={12} />
+              {t("chat.multi")}
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={toggleSelectAll}
+                className="rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
+              >
+                {allSelected ? t("chat.unselectAll") : t("common.selectAll")}
+              </button>
+              <button
+                onClick={batchDelete}
+                disabled={selSet.size === 0}
+                title={t("common.deleteSelected")}
+                className="flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-red-500 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <IconTrash size={11} />
+                {t("common.deleteSelected")}
+                {selSet.size > 0 && `(${selSet.size})`}
+              </button>
+              <button
+                onClick={exitMulti}
+                className="ml-auto rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
+              >
+                {t("chat.multiDone")}
+              </button>
+            </>
+          )}
+        </div>
+        {multiMode && (
+          <p
+            className={`px-1 text-[10px] leading-snug ${
+              batchHint ? "text-amber-500" : "text-neutral-400 dark:text-neutral-500"
+            }`}
+          >
+            {batchHint || t("chat.multiHint")}
+          </p>
+        )}
+
         <div className="flex-1 space-y-0.5 overflow-y-auto">
           {sessions.length === 0 && (
             <div className="px-2 py-4 text-center text-xs text-neutral-400">{t("chat.noSessions")}</div>
           )}
           {sessions.map((s) => {
             const active = s.id === activeId;
+            const selected = selSet.has(s.id);
+            const colored = !!s.color && !multiMode;
             return (
-              <div
-                key={s.id}
-                onClick={() => selectSession(s.id)}
-                className={`anim-rise group flex cursor-pointer items-center gap-2 rounded-xl px-2.5 py-2 transition-all duration-200 hover:translate-x-0.5 ${
-                  active
-                    ? "accent-solid"
-                    : "text-neutral-600 hover:bg-neutral-900/5 dark:text-neutral-300 dark:hover:bg-white/5"
-                }`}
-              >
-                <IconChat size={14} className={`shrink-0 opacity-70 ${busyMap[s.id] ? "hidden" : ""}`} />
-                {busyMap[s.id] && (
-                  <span
-                    title={t("chat.running")}
-                    className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-emerald-500 ring-2 ring-emerald-500/30"
-                  />
-                )}
-                {renaming?.id === s.id ? (
-                  <input
-                    autoFocus
-                    value={renaming.title}
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) => setRenaming({ id: s.id, title: e.target.value })}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") submitRename();
-                      if (e.key === "Escape") setRenaming(null);
-                    }}
-                    onBlur={submitRename}
-                    className="min-w-0 flex-1 rounded bg-white/20 px-1 text-[13px] outline-none dark:bg-black/20"
-                  />
-                ) : (
-                  <div
-                    className="min-w-0 flex-1 truncate text-[13px] font-medium"
-                    title={s.preview || s.title}
-                  >
-                    {s.title || t("chat.newChat")}
-                  </div>
-                )}
-                {renaming?.id !== s.id && (
-                  <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-                    <button
-                      title={t("chat.rename")}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setRenaming({ id: s.id, title: s.title || "" });
+              <div key={s.id} className="relative">
+                <div
+                  onClick={() => onRowClick(s.id)}
+                  onMouseDown={(e) => startRowDrag(e, s.id)}
+                  style={colored ? { boxShadow: `inset 3px 0 0 ${s.color}` } : undefined}
+                  className={`anim-rise group flex cursor-pointer items-center gap-2 rounded-xl px-2.5 py-2 transition-all duration-200 hover:translate-x-0.5 ${
+                    multiMode
+                      ? selected
+                        ? "accent-solid"
+                        : busyMap[s.id]
+                          ? "cursor-default text-neutral-400 opacity-60"
+                          : "text-neutral-600 hover:bg-neutral-900/5 dark:text-neutral-300 dark:hover:bg-white/5"
+                      : active
+                        ? "accent-solid"
+                        : "text-neutral-600 hover:bg-neutral-900/5 dark:text-neutral-300 dark:hover:bg-white/5"
+                  }`}
+                >
+                  {multiMode ? (
+                    busyMap[s.id] ? (
+                      <span
+                        title={t("chat.skipBusy")}
+                        className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-emerald-500 ring-2 ring-emerald-500/30"
+                      />
+                    ) : (
+                      <span className="flex shrink-0 items-center gap-1">
+                        {s.favorite && <IconStarSolid size={10} className="text-amber-400" />}
+                        <span
+                          className={`flex h-4 w-4 items-center justify-center rounded-md border ${
+                            selected
+                              ? "border-transparent bg-amber-400 text-white"
+                              : "border-neutral-300 dark:border-neutral-600"
+                          }`}
+                        >
+                          {selected && <IconCheck size={10} strokeWidth={3} />}
+                        </span>
+                      </span>
+                    )
+                  ) : (
+                    <>
+                      <IconChat
+                        size={14}
+                        className={`shrink-0 ${busyMap[s.id] ? "hidden" : ""} ${
+                          colored ? "opacity-100" : "opacity-70"
+                        }`}
+                        style={colored ? { color: s.color } : undefined}
+                      />
+                      {busyMap[s.id] && (
+                        <span
+                          title={t("chat.running")}
+                          className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-emerald-500 ring-2 ring-emerald-500/30"
+                        />
+                      )}
+                      {s.favorite && (
+                        <IconStarSolid
+                          size={10}
+                          className={`shrink-0 text-amber-400 ${active ? "dark:text-amber-300" : ""}`}
+                        />
+                      )}
+                    </>
+                  )}
+                  {renaming?.id === s.id ? (
+                    <input
+                      autoFocus
+                      value={renaming.title}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => setRenaming({ id: s.id, title: e.target.value })}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") submitRename();
+                        if (e.key === "Escape") setRenaming(null);
                       }}
-                      className={`rounded p-1 ${active ? "hover:bg-white/20 dark:hover:bg-black/20" : "hover:bg-neutral-900/10 dark:hover:bg-white/10"}`}
+                      onBlur={submitRename}
+                      className="min-w-0 flex-1 rounded bg-white/20 px-1 text-[13px] outline-none dark:bg-black/20"
+                    />
+                  ) : (
+                    <div
+                      className="min-w-0 flex-1 truncate text-[13px] font-medium"
+                      title={s.preview || s.title}
                     >
-                      <IconEdit size={12} />
-                    </button>
-                    <button
-                      title={t("common.delete")}
-                      onClick={(e) => deleteSession(s.id, e)}
-                      className={`rounded p-1 ${active ? "hover:bg-white/20 dark:hover:bg-black/20" : "hover:bg-neutral-900/10 dark:hover:bg-white/10"}`}
-                    >
-                      <IconTrash size={12} />
-                    </button>
+                      {s.title || t("chat.newChat")}
+                    </div>
+                  )}
+                  {!multiMode && renaming?.id !== s.id && (
+                    <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                      <button
+                        title={s.favorite ? t("chat.favRemove") : t("chat.favAdd")}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleFavorite(s.id);
+                        }}
+                        className={`rounded p-1 ${
+                          s.favorite
+                            ? "text-amber-400"
+                            : active
+                              ? "hover:bg-white/20 dark:hover:bg-black/20"
+                              : "text-neutral-300 hover:text-amber-400 dark:text-neutral-600 dark:hover:text-amber-400"
+                        }`}
+                      >
+                        {s.favorite ? <IconStarSolid size={12} /> : <IconStar size={12} />}
+                      </button>
+                      <button
+                        title={t("chat.rename")}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRenaming({ id: s.id, title: s.title || "" });
+                        }}
+                        className={`rounded p-1 ${active ? "hover:bg-white/20 dark:hover:bg-black/20" : "hover:bg-neutral-900/10 dark:hover:bg-white/10"}`}
+                      >
+                        <IconEdit size={12} />
+                      </button>
+                      <button
+                        title={t("common.delete")}
+                        onClick={(e) => deleteSession(s.id, e)}
+                        className={`rounded p-1 ${active ? "hover:bg-white/20 dark:hover:bg-black/20" : "hover:bg-neutral-900/10 dark:hover:bg-white/10"}`}
+                      >
+                        <IconTrash size={12} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {/* 右滑对话召出的彩色标签调色板 */}
+                {colorFor === s.id && (
+                  <div
+                    onMouseDown={(e) => e.stopPropagation()}
+                    className="mt-0.5 rounded-xl border border-neutral-200 bg-white p-2 shadow-sm dark:border-neutral-700 dark:bg-neutral-900"
+                  >
+                    <div className="mb-1.5 flex items-center justify-between">
+                      <span className="text-[10px] font-medium text-neutral-500 dark:text-neutral-300">
+                        {t("chat.colorTitle")}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        {s.color && (
+                          <button
+                            onClick={() => setTagColor(s.id, "")}
+                            className="text-[10px] text-neutral-400 hover:text-red-500"
+                          >
+                            {t("chat.colorClear")}
+                          </button>
+                        )}
+                        <button
+                          onClick={() => setColorFor(null)}
+                          title={t("common.close")}
+                          className="text-neutral-400 hover:text-neutral-900 dark:hover:text-white"
+                        >
+                          <IconX size={11} />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {TAG_COLORS.map((c) => (
+                        <button
+                          key={c}
+                          onClick={() => setTagColor(s.id, c)}
+                          title={c}
+                          className={`h-[18px] w-[18px] rounded-full transition-transform hover:scale-110 ${
+                            s.color === c ? "ring-2 ring-neutral-900/40 ring-offset-1 dark:ring-white/50" : ""
+                          }`}
+                          style={{ background: c }}
+                        />
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
@@ -1213,6 +1547,8 @@ export default function ChatPage({ onStats, visible }) {
             </div>
           )}
 
+          {/* 后台长命令状态：原固定条已迁移到工具栏「后台运行任务状态」按钮 popover */}
+
           {/* 子代理状态条：宿主派出的子代理实时进度（点击查看子会话全过程） */}
           {subList.length > 0 && (
             <div className="flex flex-wrap items-center gap-2 rounded-xl border border-neutral-200 bg-neutral-50 px-2.5 py-1.5 text-xs dark:border-neutral-800 dark:bg-neutral-900">
@@ -1248,7 +1584,10 @@ export default function ChatPage({ onStats, visible }) {
             </div>
           )}
 
-          <div className="flex items-center gap-2">
+          {/* 底部 pb-12 为工具栏/发送按钮预留独立一行：textarea 只在自己的区域滚动，永不进入按钮行 */}
+          <div className="relative rounded-2xl border border-neutral-300 bg-white pb-12 transition-colors focus-within:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:focus-within:border-neutral-200">
+            {/* 工具栏：左下角 absolute 排成一行（外层按钮收进输入框内） */}
+            <div className="pointer-events-auto absolute bottom-2 left-2 z-10 flex items-center gap-0.5">
             {/* 上下文预览 */}
             <button
               onClick={openPreview}
@@ -1272,7 +1611,7 @@ export default function ChatPage({ onStats, visible }) {
                 <IconShield size={18} />
               </button>
               {approvalMenu && (
-                <div className="card absolute bottom-11 right-0 z-20 w-60 p-1">
+                <div className="card absolute bottom-11 left-0 z-20 w-60 p-1">
                   {[
                     ["ask", "chat.approvalAsk"],
                     ["auto", "chat.approvalAuto"],
@@ -1440,116 +1779,182 @@ export default function ChatPage({ onStats, visible }) {
               </button>
               {delegateOpen && (
                 <div className="card absolute bottom-11 left-0 z-20 w-80 p-2.5">
+                  {/* 开始/暂停与设置页 auto_delegate 双向联动：开启=观察态（只读进度），关闭=未开启提示 */}
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                    <p className="text-xs font-medium">{t("chat.delegateAutoTitle")}</p>
+                    <PillSwitch
+                      size="sm"
+                      checked={autoDelegate}
+                      onChange={toggleAutoDelegate}
+                      title={autoDelegate ? t("chat.delegateAutoPause") : t("chat.delegateAutoStart")}
+                    />
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-neutral-500">
+                    {autoDelegate ? t("chat.delegateAutoHint") : t("chat.delegateAutoOffHint")}
+                  </p>
                   {autoDelegate ? (
-                    // 观察态：设置里开了自动委派，UI 只展示「活跃目标 + 未开始待办 + 在跑子代理」，
-                    // 不暴露手动派出入口——子智能体的生命周期由宿主周期接管，UI 只读
-                    <>
-                      <div className="mb-1.5 flex items-center justify-between gap-2">
-                        <p className="text-xs font-medium">{t("chat.delegateAutoTitle")}</p>
-                        <span className="chip">{t("chat.delegateAutoOn")}</span>
-                      </div>
-                      <p className="text-[11px] leading-relaxed text-neutral-500">
-                        {t("chat.delegateAutoHint")}
-                      </p>
-                      <div className="mt-2 space-y-1.5 text-[11px]">
-                        <div>
-                          <p className="mb-0.5 text-neutral-500">{t("chat.delegateAutoGoals")}</p>
-                          {delegateGoals.length === 0 ? (
-                            <p className="text-neutral-400">{t("chat.delegateAutoEmpty")}</p>
-                          ) : (
-                            <ul className="space-y-0.5">
-                              {delegateGoals.map((g) => {
-                                const n = delegateTodos.filter((t) => t.goal_id === g.id).length;
-                                return (
-                                  <li
-                                    key={g.id}
-                                    className="flex items-center justify-between gap-2 rounded-md px-1.5 py-0.5 hover:bg-neutral-900/5 dark:hover:bg-white/10"
-                                  >
-                                    <span className="truncate">{g.title}</span>
-                                    <span className="shrink-0 text-neutral-400">
-                                      {n} {t("chat.delegateAutoTodos")}
-                                    </span>
-                                  </li>
-                                );
-                              })}
-                            </ul>
-                          )}
-                        </div>
-                        <div>
-                          <p className="mb-0.5 text-neutral-500">{t("chat.delegateAutoRunning")}</p>
-                          {subList.length === 0 ? (
-                            <p className="text-neutral-400">{t("chat.delegateAutoEmpty")}</p>
-                          ) : (
-                            <ul className="space-y-0.5">
-                              {subList.map((s) => {
-                                const done = s.phase === "done";
-                                const failed = s.phase === "error";
-                                return (
-                                  <li
-                                    key={s.session_id}
-                                    className={`truncate rounded-md px-1.5 py-0.5 ${
+                  <div className="mt-2 space-y-1.5 text-[11px]">
+                    <div>
+                      <p className="mb-0.5 text-neutral-500">{t("chat.delegateAutoGoals")}</p>
+                      {delegateGoals.length === 0 ? (
+                        <p className="text-neutral-400">{t("chat.delegateAutoEmpty")}</p>
+                      ) : (
+                        <ul className="space-y-0.5">
+                          {delegateGoals.map((g) => {
+                            const n = delegateTodos.filter((t) => t.goal_id === g.id).length;
+                            return (
+                              <li
+                                key={g.id}
+                                className="flex items-center justify-between gap-2 rounded-md px-1.5 py-0.5 hover:bg-neutral-900/5 dark:hover:bg-white/10"
+                              >
+                                <span className="truncate">{g.title}</span>
+                                <span className="shrink-0 text-neutral-400">
+                                  {n} {t("chat.delegateAutoTodos")}
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+                    </div>
+                    <div>
+                      <p className="mb-0.5 text-neutral-500">{t("chat.delegateAutoRunning")}</p>
+                      {subList.length === 0 ? (
+                        <p className="text-neutral-400">{t("chat.delegateAutoEmpty")}</p>
+                      ) : (
+                        <ul className="space-y-0.5">
+                          {subList.map((s) => {
+                            const done = s.phase === "done";
+                            const failed = s.phase === "error";
+                            const running = !done && !failed;
+                            return (
+                              <li
+                                key={s.session_id}
+                                className="group rounded-md px-1.5 py-1 hover:bg-neutral-900/5 dark:hover:bg-white/10"
+                              >
+                                <div className="flex items-center justify-between gap-1.5">
+                                  <span
+                                    title={s.task || s.title || ""}
+                                    className={`min-w-0 truncate font-medium ${
                                       failed
                                         ? "text-red-500"
                                         : done
                                         ? "text-emerald-600 dark:text-emerald-400"
-                                        : "text-neutral-600 dark:text-neutral-300"
+                                        : "text-neutral-700 dark:text-neutral-200"
                                     }`}
                                   >
                                     {s.title || t("chat.subagent")}
-                                    <span className="ml-1 text-neutral-400">
-                                      {failed ? "✗" : done ? "✓" : "…"}
-                                    </span>
-                                  </li>
-                                );
-                              })}
-                            </ul>
-                          )}
-                        </div>
-                      </div>
-                    </>
+                                  </span>
+                                  <span className="shrink-0 text-[10px] text-neutral-400">
+                                    {running ? (
+                                      <button
+                                        onClick={() => stopSubagent(s.session_id)}
+                                        title={t("chat.stop")}
+                                        className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-neutral-400 hover:bg-red-500/10 hover:text-red-500"
+                                      >
+                                        <IconStop size={10} />
+                                      </button>
+                                    ) : failed ? (
+                                      "✗"
+                                    ) : (
+                                      "✓"
+                                    )}
+                                  </span>
+                                </div>
+                                {s.task && (
+                                  <p className="mt-0.5 truncate leading-snug text-neutral-400 dark:text-neutral-500" title={s.task}>
+                                    {s.task}
+                                  </p>
+                                )}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="mt-2 text-[11px] leading-relaxed text-neutral-400">{t("chat.delegateAutoEmpty")}</p>
+                )}
+                </div>
+              )}
+            </div>
+            {/* 后台运行任务状态：弹出 popover 查看长命令，可逐条停止 */}
+            <div className="relative shrink-0">
+              <button
+                onClick={() => setBgJobsOpen((v) => !v)}
+                title={t("chat.bgJobs")}
+                className={`relative shrink-0 rounded-full p-2 transition-colors ${
+                  bgJobsOpen
+                    ? "accent-solid"
+                    : shellJobs.jobs.length > 0
+                      ? "bg-sky-500/15 text-sky-600 hover:bg-sky-500/25 dark:text-sky-400"
+                      : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:hover:bg-white/10 dark:hover:text-white"
+                }`}
+              >
+                <IconTerminal size={18} />
+                {shellJobs.jobs.length > 0 && (
+                  <span className="absolute -right-0.5 -top-0.5 min-w-[16px] rounded-full bg-sky-500 px-1 text-[9px] font-bold leading-4 text-white">
+                    {shellJobs.jobs.length}
+                  </span>
+                )}
+              </button>
+              {bgJobsOpen && (
+                <div className="card absolute bottom-11 left-0 z-20 w-80 p-2.5">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <p className="flex items-center gap-1.5 text-xs font-medium">
+                      <IconTerminal size={12} />
+                      {t("chat.bgJobs")}
+                    </p>
+                    <span className="text-[10px] text-neutral-400">
+                      {t("chat.bgJobsCount", { n: shellJobs.jobs.length })}
+                    </span>
+                  </div>
+                  <p className="mb-1.5 text-[11px] leading-relaxed text-neutral-500">
+                    {t("chat.bgJobsHint")}
+                  </p>
+                  {shellJobs.jobs.length === 0 ? (
+                    <p className="py-4 text-center text-xs text-neutral-400">{t("chat.bgJobsEmpty")}</p>
                   ) : (
-                    // 手动态：原有 UI；输入框去胶囊（rounded-lg）以与消息输入框区分
-                    <>
-                      <p className="mb-1.5 text-xs font-medium">{t("chat.delegate")}</p>
-                      <textarea
-                        autoFocus
-                        rows={4}
-                        value={delegateTask}
-                        onChange={(e) => setDelegateTask(e.target.value)}
-                        placeholder={t("chat.delegatePlaceholder")}
-                        className="w-full resize-none rounded-lg border border-neutral-300 bg-white px-3 py-2 text-xs text-neutral-900 outline-none transition-colors placeholder:text-neutral-400 focus:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-500 dark:focus:border-neutral-200"
-                      />
-                      <p className="mt-1 text-[11px] leading-relaxed text-neutral-400">{t("chat.delegateHint")}</p>
-                      {delegateErr && <p className="mt-1 text-[11px] text-red-500">{delegateErr}</p>}
-                      <div className="mt-2 flex items-center justify-end gap-2">
-                        <button
-                          onClick={() => {
-                            setDelegateOpen(false);
-                            setDelegateErr("");
-                          }}
-                          className="pill pill-hover"
-                        >
-                          {t("common.close")}
-                        </button>
-                        <button
-                          onClick={delegate}
-                          disabled={!delegateTask.trim() || delegateBusy}
-                          className="accent-solid rounded-full px-3 py-1 text-xs disabled:opacity-40"
-                        >
-                          {delegateBusy ? t("chat.thinking") : t("chat.delegateSubmit")}
-                        </button>
-                      </div>
-                    </>
+                    <ul className="space-y-1">
+                      {shellJobs.jobs.map((j) => {
+                        const s = Math.max(0, Math.floor((shellJobs.now - j.startedAt) / 1000));
+                        const mm = Math.floor(s / 60);
+                        const ss = s % 60;
+                        const dur = mm > 0 ? `${mm}m${ss}s` : `${ss}s`;
+                        return (
+                          <li
+                            key={j.job_id}
+                            className="group flex items-center gap-1.5 rounded-md bg-neutral-100 px-2 py-1 text-[11px] dark:bg-neutral-800"
+                          >
+                            <IconTerminal size={11} className="shrink-0 animate-pulse text-sky-500" />
+                            <code className="min-w-0 flex-1 truncate font-mono" title={j.command}>
+                              {j.command}
+                            </code>
+                            <span className="shrink-0 tabular-nums text-neutral-400">{dur}</span>
+                            <button
+                              onClick={() => shellJobs.stopJob(j.job_id)}
+                              disabled={shellJobs.stopping.includes(j.job_id)}
+                              title={`${t("chat.stop")} ${j.job_id}`}
+                              className="shrink-0 rounded p-0.5 text-neutral-400 hover:bg-red-500/10 hover:text-red-500 disabled:opacity-50"
+                            >
+                              {shellJobs.stopping.includes(j.job_id) ? "…" : <IconStop size={10} />}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
                   )}
                 </div>
               )}
             </div>
+            </div>
 
-            {/* 多行输入：随内容自动增高，超出后内部滚动；Enter 发送，Shift+Enter 换行 */}
+            {/* 多行输入：随内容自动增高，超出后内部滚动；Enter 换行，Ctrl/Shift/Cmd+Enter 发送 */}
             <textarea
               ref={inputRef}
               rows={1}
-              className="max-h-40 min-h-[42px] flex-1 resize-none overflow-y-auto rounded-2xl border border-neutral-300 bg-white px-4 py-2.5 text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-400 focus:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-500 dark:focus:border-neutral-200"
+              className="block w-full max-h-[160px] min-h-[80px] resize-none overflow-y-auto rounded-t-2xl bg-transparent px-4 pt-3 pb-2 text-sm text-neutral-900 outline-none transition-colors placeholder:text-neutral-400 dark:text-neutral-100 dark:placeholder:text-neutral-500"
               value={input}
               placeholder={
                 !activeId
@@ -1572,23 +1977,26 @@ export default function ChatPage({ onStats, visible }) {
               }}
               disabled={!activeId}
             />
-            {busy && (
-              <button
-                onClick={interrupt}
-                title={t("chat.stop")}
-                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-red-500/10 text-red-600 transition-colors hover:bg-red-500/25 dark:text-red-400"
-              >
-                <IconStop size={16} />
-              </button>
-            )}
-            <button
-              onClick={send}
-              disabled={(!input.trim() && !hasAttachments) || !activeId}
-              title={t("common.send")}
-              className="accent-solid flex h-10 w-10 shrink-0 items-center justify-center rounded-full shadow-sm transition-all duration-200 hover:brightness-110 active:scale-95 disabled:opacity-40"
-            >
-              <IconSend size={16} />
-            </button>
+            <div className="absolute bottom-2 right-2 z-10 flex items-center gap-1.5">
+              {busy ? (
+                <button
+                  onClick={interrupt}
+                  title={t("chat.stop")}
+                  className="flex h-10 w-10 items-center justify-center rounded-full bg-red-500/10 text-red-600 transition-colors hover:bg-red-500/25 dark:text-red-400"
+                >
+                  <IconStop size={16} />
+                </button>
+              ) : (
+                <button
+                  onClick={send}
+                  disabled={(!input.trim() && !hasAttachments) || !activeId}
+                  title={t("common.send")}
+                  className="accent-solid flex h-10 w-10 items-center justify-center rounded-full shadow-sm transition-all duration-200 hover:brightness-110 active:scale-95 disabled:opacity-40"
+                >
+                  <IconSend size={16} />
+                </button>
+              )}
+            </div>
           </div>
         </div>
 
@@ -1718,10 +2126,24 @@ function ThinkPanel({ text, openDefault = false, streaming = false }) {
 // send_file 成功的调用渲染为文件卡片（如同收文件），不出工具卡
 function MessageBubble({ message }) {
   const isUser = message.role === "user";
+  // 后台 shell 自然结束时由宿主注入的说明消息（用户没说话，别渲染成用户的气泡）
+  const isBgDone =
+    isUser && typeof message.content === "string" && message.content.startsWith("[后台任务完成]");
   const calls = message.tool_calls || [];
   const fileCalls = calls.filter((c) => c.tool === "send_file" && c.ok);
   const toolCalls = calls.filter((c) => !(c.tool === "send_file" && c.ok));
   const hasText = message.content && message.content.trim().length > 0;
+
+  if (isBgDone) {
+    return (
+      <div className="group mr-auto flex max-w-[85%] flex-col gap-0.5">
+        <div className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-2xl border border-dashed border-neutral-300 bg-neutral-50 px-3 py-2 font-mono text-[11px] leading-relaxed text-neutral-500 dark:border-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-400">
+          {message.content}
+        </div>
+        <CopyBtn text={message.content || ""} />
+      </div>
+    );
+  }
 
   if (isUser) {
     return (

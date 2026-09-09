@@ -25,7 +25,7 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub auto_drive: bool,
     /// 子代理自动委派：Autopilot 周期里由宿主把「活跃目标下未开始的待办」派生给子代理并行推进。
-    /// 模型侧无该工具（宿主管控），这里只是宿主是否主动派活的开关；默认关闭以免悄悄烧 token
+    /// 只是宿主是否主动派活的开关（模型侧始终可自主调用 sub_agent 派生，共用并行上限）；默认关闭以免悄悄烧 token
     #[serde(default)]
     pub auto_delegate: bool,
     /// 自动委派并行子代理数上限（1..=8）：宿主每周期最多同时推进这么多条待办。
