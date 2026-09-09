@@ -15,7 +15,12 @@ apk add --no-cache \
 
 rustc --version
 # 编译（前端资源经 tauri-build 的 generate_context! 在编译期嵌入二进制）
-cargo build --release --manifest-path src-tauri/Cargo.toml
+# 注意：不能用 cargo build 原样启用 Cargo.toml 的全部 features，
+#       因为 tauri v2 build.rs 会校验 features 与 tauri.conf.json allowlist 匹配。
+#       Cargo.toml 包含 macos-private-api（macOS 专用），Linux 平台不识别会直接 exit 1。
+#       只启用 Linux 必需的 tray-icon，跳过 macos 专属 features。
+cargo build --release --manifest-path src-tauri/Cargo.toml \
+  --no-default-features --features tray-icon
 BIN=src-tauri/target/release/bit
 ls -lh "$BIN"
 
