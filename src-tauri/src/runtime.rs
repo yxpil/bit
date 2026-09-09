@@ -60,7 +60,7 @@ fn candidates() -> Vec<(&'static str, &'static str, &'static str, &'static str, 
         ("Rscript", "R", "r", "interpret", "--version"),
         ("julia", "Julia", "jl", "interpret", "--version"),
         ("groovy", "Groovy", "groovy", "interpret", "--version"),
-        ("tclsh", "Tcl", "tcl", "interpret", "% puts [info patchlevel]; exit"),
+        ("tclsh", "Tcl", "tcl", "interpret", "script:puts [info patchlevel]; exit"),
         ("elixir", "Elixir", "exs", "interpret", "--version"),
         ("pwsh", "PowerShell 7+", "ps1", "interpret", "-Command $PSVersionTable.PSVersion.ToString()"),
         ("powershell", "PowerShell", "ps1", "interpret", "-Command $PSVersionTable.PSVersion.ToString()"),
@@ -78,15 +78,29 @@ fn candidates() -> Vec<(&'static str, &'static str, &'static str, &'static str, 
 
 /// 探测某个命令是否可用，返回其路径与版本
 fn probe(cmd: &str, version_arg: &str) -> Option<(String, String)> {
-    // 版本探测参数可能含空格（powershell），拆分处理
-    let args: Vec<&str> = version_arg.split(' ').filter(|s| !s.is_empty()).collect();
     // 先解析可执行文件的绝对路径（macOS .app 进程 PATH 很干净，which 会扫常见路径兜底）
     let exe_path = which(cmd)?;
-    // 启动时批量探测，必须隐藏子进程控制台窗口（否则启动瞬间黑窗闪烁）
-    let mut c = Command::new(&exe_path);
-    c.args(&args);
-    crate::registry::no_window(&mut c);
-    let output = c.output().ok()?;
+    // "script:<code>" = 代码写临时文件后以文件参数执行（tclsh 等把裸 argv 当文件名的解释器；
+    // 实测部分解释器在 GUI 进程环境下 stdin 管道静默不执行，临时文件最可靠）。
+    // 其余按命令行参数拆分（可能含空格，如 powershell）
+    let output = if let Some(script) = version_arg.strip_prefix("script:") {
+        let tmp = std::env::temp_dir().join(format!("bit-probe-{}.tcl", std::process::id()));
+        if std::fs::write(&tmp, script).is_err() {
+            return None;
+        }
+        let mut c = Command::new(&exe_path);
+        c.arg(&tmp);
+        crate::registry::no_window(&mut c);
+        let out = c.output();
+        let _ = std::fs::remove_file(&tmp);
+        out.ok()?
+    } else {
+        let args: Vec<&str> = version_arg.split(' ').filter(|s| !s.is_empty()).collect();
+        let mut c = Command::new(&exe_path);
+        c.args(&args);
+        crate::registry::no_window(&mut c);
+        c.output().ok()?
+    };
     if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
         return None;
     }

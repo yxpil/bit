@@ -37,6 +37,21 @@ pub struct Config {
     /// 工具调用。只用于不支持 tools 参数的端点（纯文本中转等），无需探测、不做自动降级
     #[serde(default)]
     pub compat_mode: bool,
+    /// 极简提示词：开启后默认系统提示词只保留一句身份 + 兼容模式契约（如启用）
+    /// + 按启用工具动态注入的少量提示；用户自定义覆盖模板时不生效
+    #[serde(default)]
+    pub minimal_prompt: bool,
+    /// 工具权限闸门：screen / mouse / keyboard 三个本机操控能力（实验性功能）默认关闭——
+    /// 关闭时不给模型下发 schema/一览（省 token），工具调用也直接拒绝。
+    /// 现状：macOS 上整体屏蔽（tool_gate 恒 false，见下）；Windows/Linux 构建保留实验性入口
+    /// 但平台后端尚未落地，即使手动打开，实际调用也会返回“实现未就绪”的明确错误，绝不误报成功。
+    /// 历史遗留的注册项在启动时按出厂清单自动移除
+    #[serde(default)]
+    pub tool_screen: bool,
+    #[serde(default)]
+    pub tool_mouse: bool,
+    #[serde(default)]
+    pub tool_keyboard: bool,
     /// 幻觉防护：单个词在一条回复里出现次数达到该值即判定为幻觉循环（0=关闭）
     #[serde(default = "default_word_repeat_max")]
     pub word_repeat_max: u32,
@@ -179,6 +194,10 @@ impl Default for Config {
             auto_delegate: false,
             subagent_max: default_subagent_max(),
             compat_mode: false,
+            minimal_prompt: false,
+            tool_screen: false,
+            tool_mouse: false,
+            tool_keyboard: false,
             word_repeat_max: default_word_repeat_max(),
             tool_loop_max: default_tool_loop_max(),
             custom_prompt: String::new(),
@@ -369,5 +388,22 @@ mod tests {
             ..Config::default()
         };
         assert!(!empty.verify_client_key(""));
+    }
+}
+
+impl Config {
+    /// 工具权限闸门：screen / mouse / keyboard 需在设置页开启才对模型生效
+    /// （关闭 = 不下发 schema/一览 + 调用直接拒绝，省 token 且避免无谓报错）。
+    /// macOS 上直接屏蔽（用户决定：TCC 授权体验太差，仅 Windows/Linux 开放）
+    pub fn tool_gate(&self, name: &str) -> bool {
+        if cfg!(target_os = "macos") {
+            return !matches!(name, "screen" | "mouse" | "keyboard");
+        }
+        match name {
+            "screen" => self.tool_screen,
+            "mouse" => self.tool_mouse,
+            "keyboard" => self.tool_keyboard,
+            _ => true,
+        }
     }
 }

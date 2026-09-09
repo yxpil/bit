@@ -1219,12 +1219,21 @@ fn finish_truncated(f: &str) -> bool {
 }
 
 /// 生成当前已注册工具的清单（供 AI 了解可用工具）
+/// 模型可见性判定（纯函数，便于单元测试）：
+/// 启用 + 非宿主管控 + 通过配置闸门。
+/// config.json 缺失/损坏时上层走 Config::default()（见 state::read_json），此处照样有明确判定。
+pub fn tool_visible(cfg: &crate::config::Config, t: &crate::registry::ToolDef) -> bool {
+    t.enabled && !is_host_only_tool(&t.name) && cfg.tool_gate(&t.name)
+}
+
 pub fn tools_manifest(ctx: &Arc<crate::state::Ctx>) -> serde_json::Value {
+    // 锁序纪律：config 快照（克隆）后立即释放，绝不跨锁持有 config 再锁 tools
+    let cfg = ctx.config.lock().unwrap().clone();
     let tools = ctx.tools.lock().unwrap().clone();
     serde_json::json!(tools
         .iter()
-        // 暂停的工具不告知 AI；宿主管控工具同样不告知
-        .filter(|t| t.enabled && !is_host_only_tool(&t.name))
+        // 暂停的工具不告知 AI；宿主管控工具同样不告知；权限闸门未开的操控类工具不下发
+        .filter(|t| tool_visible(&cfg, t))
         .map(|t| serde_json::json!({
             "id": t.id,
             "name": t.name,
@@ -1244,20 +1253,99 @@ pub fn system_prompt_native(ctx: &Arc<crate::state::Ctx>, session: Option<&str>)
     system_prompt_mode(ctx, session, true)
 }
 
+/// 记忆主题分词停用词：虚词/代词/万能动词，切出来没有归类价值
+const MEM_STOP_WORDS: &[&str] = &[
+    "我", "我的", "我们", "用户", "关于", "你", "他", "她", "它",
+    "的", "是", "在", "了", "有", "和", "与", "要", "会", "能",
+    "用", "使用", "喜欢", "习惯", "常", "经常", "都", "也", "很",
+    "一个", "这个", "那个", "自己", "以后", "之后", "时候", "现在",
+    "还有", "但是", "然后", "可以", "应该", "需要", "进行", "通过", "已经",
+];
+
 /// session：当前会话 —— 目标/待办只注入「本会话创建的」或「全局（无会话归属）」的
 fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, native: bool) -> String {
     let memories = ctx.memories.lock().unwrap();
-    let mem_lines: Vec<String> = memories
+    // 记忆主题索引：jieba 分词 → 优先取「多条记忆共现」的词（同词归类到一起），同级从短到长；
+    // 每条只注入一行 `about 关键词 [短id]`，全文由 AI 按需用 memory(id) 取回
+    static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
+    let jieba = JIEBA.get_or_init(jieba_rs::Jieba::new);
+    let cut = |content: &str| -> Vec<String> {
+        // AI 存记忆时常把 kind 塞进正文开头（如 "fact: ..."），剥掉再分词，避免主题全变成 fact
+        let s = content.trim_start();
+        let content = ["fact:", "summary:", "preference:", "raw:", "note:"]
+            .iter()
+            .find_map(|p| s.strip_prefix(p))
+            .map(str::trim_start)
+            .unwrap_or(s);
+        let first: String = content
+            .chars()
+            .take_while(|c| {
+                !matches!(c, '。' | '，' | ',' | '：' | ':' | '；' | ';' | '\n' | '！' | '？' | '!' | '?' | '.')
+            })
+            .collect();
+        jieba.cut(&first, false)
+            .into_iter()
+            .map(str::trim)
+            // 停用词、单字、纯数字/版本号（"26"、"2.14"、"v3"）都没有归类价值
+            .filter(|w| {
+                w.chars().count() >= 2
+                    && !MEM_STOP_WORDS.contains(w)
+                    && !w.trim_start_matches(['v', 'V'])
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+            })
+            .map(String::from)
+            .collect()
+    };
+    let mems: Vec<&crate::memory::Memory> = memories.iter().rev().take(20).collect();
+    let word_lists: Vec<Vec<String>> = mems.iter().map(|m| cut(&m.content)).collect();
+    // 词共现计数：出现在多条记忆里的词 = 天然的归类锚点
+    let mut freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for ws in &word_lists {
+        for w in ws {
+            *freq.entry(w.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mem_lines: Vec<String> = mems
         .iter()
-        .rev()
-        .take(12)
-        .map(|m| format!("- [{}] {}", m.kind, m.content))
+        .zip(&word_lists)
+        .map(|(m, ws)| {
+            let mut cands: Vec<&String> = ws.iter().collect();
+            // 共现词优先（跨记忆归类），同级从短到长（短词更通用）
+            cands.sort_by_key(|w| (freq.get(w.as_str()).copied().unwrap_or(1) < 2, w.chars().count()));
+            // 拼接候选词直到主题满 4 字（上限 12）：两字词太笼统，多词组合才有分类价值
+            let mut topic = String::new();
+            for w in &cands {
+                if topic.chars().count() + w.chars().count() > 12 {
+                    break;
+                }
+                topic.push_str(w);
+                if topic.chars().count() >= 4 {
+                    break;
+                }
+            }
+            // 无有效分词（拼不出主题）：回退首句截断
+            if topic.is_empty() {
+                let first: String = m
+                    .content
+                    .trim()
+                    .chars()
+                    .take_while(|c| {
+                        !matches!(c, '。' | '，' | ',' | '：' | ':' | '；' | ';' | '\n' | '！' | '？' | '!' | '?' | '.')
+                    })
+                    .take(12)
+                    .collect();
+                let t = first.trim();
+                topic = if t.is_empty() { "未命名".to_string() } else { t.to_string() };
+            }
+            format!("- about {} [{}]", topic, m.id)
+        })
         .collect();
     let skills = ctx.skills.lock().unwrap();
     let skill_lines: Vec<String> = skills
         .iter()
         .rev()
-        .take(100)
+        .take(30)
         .map(|s| format!("- {}", s.name))
         .collect();
     drop(skills);
@@ -1304,14 +1392,13 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         .filter(|r| r.enabled)
         .map(|r| {
             let how = match r.mode.as_str() {
-                "compile" => "compiled: write full source, BIT compiles then runs",
-                "exec" => "executable: invoked directly",
-                _ => "interpreted: write a script and run it",
+                "compile" => "compiled",
+                "exec" => "executable",
+                _ => "interpreted",
             };
-            format!(
-                "- id=\"{}\" ({}, lang {}, {}, version {})",
-                r.id, r.name, r.lang, how, r.version
-            )
+            // 版本串有的带编译器横幅（ruby/perl/tclsh），截断防污染
+            let ver: String = r.version.split('\n').next().unwrap_or("").chars().take(30).collect();
+            format!("- {} ({}, {}, {})", r.id, r.lang, how, ver)
         })
         .collect();
 
@@ -1326,63 +1413,88 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         }
     };
 
-    // 动态运行时信息：无论用户是否覆盖模板都追加
-    let runtime_info = format!(
-        "\n\
-        ## Local interpreters\n{}\n\
-        ## Active goals\n{}\n\
-        ## Pending todos\n{}\n\
-        ## Auto-drive\n\
+    // 动态运行时信息：只注入非空状态段（空列表不占 token）；Auto-drive 是静态规则，始终保留
+    let mut runtime_info = String::from(
+        "\n## Auto-drive\n\
         - When your session has an incomplete active goal, the system auto-sends the next pending todo. Execute it immediately.\n\
         - Use plan_update to mark goal achieved or update todo statuses when done.\n\
-        - Reply starting with [WAIT] if you truly need user input/decision to continue.\n\
-        ## Memories\n{}\n\
-        ## Skills (names)\n{}",
-        if runtime_lines.is_empty() { "(no interpreter detected — click Refresh on the Tools page)".to_string() } else { runtime_lines.join("\n") },
-        if goal_lines.is_empty() { "(none)".to_string() } else { goal_lines.join("\n") },
-        if todo_lines.is_empty() { "(none)".to_string() } else { todo_lines.join("\n") },
-        if mem_lines.is_empty() { "(empty)".to_string() } else { mem_lines.join("\n") },
-        if skill_lines.is_empty() { "(empty)".to_string() } else { skill_lines.join("\n") },
+        - Reply starting with [WAIT] if you truly need user input/decision to continue.",
     );
+    if !runtime_lines.is_empty() {
+        runtime_info.push_str(&format!("\n## Local interpreters\n{}", runtime_lines.join("\n")));
+    }
+    if !goal_lines.is_empty() {
+        runtime_info.push_str(&format!("\n## Active goals\n{}", goal_lines.join("\n")));
+    }
+    if !todo_lines.is_empty() {
+        runtime_info.push_str(&format!("\n## Pending todos\n{}", todo_lines.join("\n")));
+    }
+    if !mem_lines.is_empty() {
+        runtime_info.push_str("\n## Memories (topics; full text via memory(id))\n");
+        runtime_info.push_str(&mem_lines.join("\n"));
+    }
+    if !skill_lines.is_empty() {
+        runtime_info.push_str(&format!("\n## Skills (names)\n{}", skill_lines.join("\n")));
+    }
 
     // 操作手册 / skill 示例 / 收尾句：文本约定与原生函数调用两种模式各自一份
     // 提示词默认英文（各模型兼容性最好），但要求模型始终以用户的语言回复
     let (manual, skill_examples, closing) = if native {
         (
-            "## How to call tools (native function calling)\n\
-            You act ONLY through the protocol `tool_calls` field. Follow these rules in order:\n\
-            1. The schema is the contract: every tool ships a JSON Schema in the `tools` parameter. Read it and send arguments that match exactly — correct names, correct types, all required fields. Never guess a parameter name.\n\
-            2. Act in the same turn: if your reply says you are going to do something, that turn MUST contain the call. Never announce an action and then stop.\n\
-            3. Parallel by default: independent calls belong in ONE turn (several entries in `tool_calls`). Sequence them only when one call needs another's result.\n\
-            4. No calls in prose: never emit bare JSON, code fences, <xxx_function_call> markers or restated arguments in the reply body — the body holds only words addressed to the user.\n\
-            5. Continue from tool messages: each result returns as a tool message; call again or answer. If a call fails, fix the arguments (or pick another tool) and retry instead of apologising.\n\
-            6. Ask only when truly blocked: if a required detail is genuinely missing, ask the user; otherwise proceed with the best available default.\n\
-            7. Long work never blocks the chat: commands still running after ~2s are auto-moved to a background job; for known long tasks (builds, installs, batch jobs) pass background=true to shell and keep working. The job result is delivered back to you when it finishes — never re-run it to poll.\n\
-            8. Delegate with care: for a long, self-contained subtask call sub_agent {\"task\": string, \"title\": string} — a fresh sub-session agent runs it with all tools and returns its final answer. Make the task self-contained (background + goal + acceptance criteria); sub-agents cannot spawn sub-agents. Do the work yourself when it is quick or needs this conversation's context.",
-            "The SKILL list in this prompt shows names only. When a skill name looks relevant to the current task, fetch its full content first via Tool 6 · skill with action=search and query=that name, then follow it. action=save writes a skill (same name overwrites), action=search finds existing skills.",
+            "## Tool calls (native)\n\
+            1. Match the JSON Schema in `tools` exactly — names, types, required fields.\n\
+            2. Announcing an action requires the call in the same turn.\n\
+            3. Independent calls: one turn, in parallel.\n\
+            4. Reply body holds words only — no JSON, no markers.\n\
+            5. Results return as tool messages: continue, or fix args and retry.\n\
+            6. Ask only when truly blocked.",
+            "Skills: names only here. Relevant → skill(action=search, query=name) for full content, then follow. action=save writes (same name overwrites).",
             "When no more tool calls are needed, just output the final answer in natural language.",
         )
     } else {
         (
-            "## How to call tools (follow strictly)\n\
-            When you need to act (run commands, read/write files, make plans, extend yourself, save/find skills), output a JSON array on its own single line in your reply; each element looks like {{\"tool\":\"tool_name\",\"params\":{{...}}}}.\n\
-            That line must be pure JSON — no explanatory text before or after, not wrapped in code fences. The system executes it and returns the results to you, then you continue.\n\
-            Never invent marker syntax (like <xxx_function_call>), never output a bare object without the square brackets, never split multiple calls into multiple lines — \
-            multiple calls must stay in ONE array: [{{...}},{{...}}]. When no action is needed, just answer in natural language.\n\
-            Single call example: [{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]\n\
-            Long work never blocks the chat: for known long tasks pass background=true to shell and keep going; the job result returns to you when it finishes — never re-run it to poll.\n\
-            Delegate with care: for a long, self-contained subtask call sub_agent {{\"task\": string, \"title\": string}} — a fresh sub-session agent runs it with all tools and returns its final answer; make the task self-contained and never delegate quick or context-heavy work (sub-agents cannot nest).",
-            "The SKILL list in this prompt shows names only. When a skill name looks relevant to the current task, fetch its full content first via Tool 6 · skill with action=search and query=that name, then follow it. save writes a skill, search finds existing skills. Examples:\n\
-            - save a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"save\",\"name\":\"batch-rename\",\"summary\":\"use shell to walk the directory and mv-rename files…\"}}}}]\n\
-            - search a skill: [{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"rename\"}}}}]",
+            "## Tool calls (text protocol)\n\
+            To act, output ONE line of pure JSON, nothing wrapped around it: [{{\"tool\":\"name\",\"params\":{{...}}}}]\n\
+            Example: [{{\"tool\":\"shell\",\"params\":{{\"command\":\"echo hi\"}}}}]\n\
+            Multiple calls stay in ONE array. No action → answer in natural language.",
+            "Skills: names only here. Relevant → [{{\"tool\":\"skill\",\"params\":{{\"action\":\"search\",\"query\":\"name\"}}}}] for full content, then follow. save writes (same name overwrites).",
             "When you need to call a capability, output a JSON array, each element {{\"tool\":string,\"params\":object}}, on its own line, with nothing else wrapped around it.",
         )
     };
+
+    // 按启用工具条件注入：工具被暂停/删除时，对应提示词段落一并消失
+    let enabled: std::collections::HashSet<String> = {
+        let cfg = ctx.config.lock().unwrap().clone();
+        ctx.tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| tool_visible(&cfg, t))
+            .map(|t| t.name.to_lowercase())
+            .collect()
+    };
+    let has = |n: &str| enabled.contains(n);
+    let mut manual = manual.to_string();
+    if has("shell") {
+        if native {
+            manual.push_str("\n7. shell background=true for known long tasks (builds/installs/batch); result auto-returns — never poll by re-running.");
+        } else {
+            manual.push_str("\nshell background=true for known long tasks; result auto-returns — never poll.");
+        }
+    }
+    if has("sub_agent") {
+        if native {
+            manual.push_str("\n8. sub_agent {\"task\",\"title\"} only for long self-contained subtasks (task text must carry background + goal + acceptance; final answer returns to you). No nesting; do quick or context-heavy work yourself.");
+        } else {
+            manual.push_str("\nsub_agent {\"task\",\"title\"} only for long self-contained subtasks, task text must be self-contained. No nesting.");
+        }
+    }
 
     let system_prompt_override = {
         let cfg = ctx.config.lock().unwrap();
         cfg.system_prompt.trim().to_string()
     };
+    let has_override = !system_prompt_override.is_empty();
 
     let static_template = if !system_prompt_override.is_empty() {
         system_prompt_override
@@ -1391,7 +1503,51 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
     };
 
     let tools_at_a_glance = dynamic_tools_at_a_glance(ctx, native);
-    let static_template = static_template.replace("{DYNAMIC_TOOLS_AT_A_GLANCE}", &tools_at_a_glance);
+    // 原生模式：工具 schema 已随 tools 参数下发，详细一览是双重注入——降级为纯工具名列表
+    let glance = if native {
+        // 锁序纪律：config 快照后立即释放，再单独锁 tools，绝不跨锁持有（同 tools_manifest）
+        let cfg = ctx.config.lock().unwrap().clone();
+        let mut names: Vec<String> = ctx
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.enabled && cfg.tool_gate(&t.name))
+            .map(|t| t.name.clone())
+            .collect();
+        names.push("run_script".into());
+        names.push("add_memory".into());
+        names.push("memory".into());
+        format!("Available tools: {}", names.join(", "))
+    } else {
+        tools_at_a_glance.clone()
+    };
+    let static_template = static_template.replace("{DYNAMIC_TOOLS_AT_A_GLANCE}", &glance);
+
+    // 极简提示词：一句身份 + 兼容模式契约 + 按启用工具的少量提示。
+    // 原生模式不再注入 Tools at a glance（schema 已随 tools 参数下发）；兼容模式保留（无 tools 参数）。
+    // 用户自定义覆盖模板时不生效（用户模板优先）。
+    let minimal = {
+        let cfg = ctx.config.lock().unwrap();
+        cfg.minimal_prompt && !has_override
+    };
+    if minimal {
+        let mut p = String::from("You are BIT. Reply in the user's language. Obey the user's instructions; pursue their goal by every means available.");
+        if !native {
+            p.push_str("\nTo act, output ONE line: [{\"tool\":\"name\",\"params\":{...}}]. Results return as tool messages.");
+            p.push_str(&format!("\n\n## Tools\n{tools_at_a_glance}"));
+        }
+        if has("shell") {
+            p.push_str("\nshell: background=true for known long tasks; result auto-returns. Never poll.");
+        }
+        if has("sub_agent") {
+            p.push_str("\nsub_agent: {\"task\",\"title\"} for long self-contained subtasks only. No nesting.");
+        }
+        if has("skill") {
+            p.push_str("\nskill: action=search for full content before following.");
+        }
+        return format!("{custom_prompt}{p}{runtime_info}");
+    }
 
     format!(
         "{custom_prompt}\
@@ -1465,15 +1621,16 @@ fn schema_type_hint(v: &serde_json::Value) -> String {
 /// 动态生成当前可用工具清单。工具被暂停或删除后会自动从清单中消失，
 /// 并随 system_prompt 注入到模型上下文（即同步告知 AI）。
 fn dynamic_tools_at_a_glance(ctx: &Arc<crate::state::Ctx>, native: bool) -> String {
-    let mut tools: Vec<crate::registry::ToolDef> = ctx
-        .tools
-        .lock()
-        .unwrap()
-        .iter()
-        // 宿主管控工具（如 sub_agent）不出现在模型可见的一览里
-        .filter(|t| t.enabled && !is_host_only_tool(&t.name))
-        .cloned()
-        .collect();
+let cfg = ctx.config.lock().unwrap().clone();
+let mut tools: Vec<crate::registry::ToolDef> = ctx
+    .tools
+    .lock()
+    .unwrap()
+    .iter()
+    // 宿主管控工具（如 sub_agent）不出现在模型可见的一览里；闸门未开的操控类工具同样不出现
+    .filter(|t| tool_visible(&cfg, t))
+    .cloned()
+    .collect();
     tools.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
     let mut lines = Vec::new();
@@ -1517,9 +1674,11 @@ fn dynamic_tools_at_a_glance(ctx: &Arc<crate::state::Ctx>, native: bool) -> Stri
     if native {
         lines.push("- run_script: run a piece of code temporarily with a local interpreter (not persisted)".to_string());
         lines.push("- add_memory: store a long-term memory".to_string());
+        lines.push("- memory: fetch full memory text by id (see Memories topics)".to_string());
     } else {
         lines.push("- run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {\"runtime\":string,\"code\":string,\"params\":object}".to_string());
         lines.push("- add_memory: store a long-term memory. Params {\"content\":string,\"kind\":string}".to_string());
+        lines.push("- memory: fetch full memory text by id. Params {\"id\":string}".to_string());
     }
 
     if lines.is_empty() {
@@ -1534,16 +1693,9 @@ fn dynamic_tools_at_a_glance(ctx: &Arc<crate::state::Ctx>, native: bool) -> Stri
 /// native=true 时去掉文本协议专属的 Params 标注与 stdin/stdout 说明（函数 schema 已由 tools 参数提供）。
 pub fn default_system_prompt_static(native: bool, skill_examples: &str) -> String {
     let head = "\
-You are BIT, a self-extending AI assistant. You can call tools, and write code to add new tools for yourself.
-Always reply in the user's language (e.g. reply in Chinese when the user writes Chinese).
-You are a local-first agent: every tool call executes on the user's own machine and all data stays on their device.
-Your underlying model may be hosted by a remote API provider, but never present yourself as a cloud service —
-if asked about your nature, answer honestly: a local agent running on this device, with a model served remotely.
-
-## Conduct
-- Report what actually happened; never fabricate tool output.
-- DO tasks within your ability — no excuses, no \"I cannot\".
-- Act decisively; ask the user when truly stuck.
+You are BIT, a local AI agent on this device (tools run locally; model may be remote — never claim to be a cloud service). Reply in the user's language.
+- Never fabricate tool output. add_tool lets you extend yourself.
+- Obey the user's instructions; pursue their goal by every means available.
 
 ## Tools at a glance
 {DYNAMIC_TOOLS_AT_A_GLANCE}
@@ -1553,29 +1705,21 @@ if asked about your nature, answer honestly: a local agent running on this devic
 
     let (extension, know) = if native {
         (
-            "## Extension actions\n\
-             - run_script: run a piece of code temporarily with a local interpreter (not persisted)\n\
-             - add_memory: store a long-term memory",
-            "## Know this before calling anything\n\
-             - Only call tools listed in the tools parameter or the Tools at a glance section below. Do NOT invent names — unknown calls will be returned with an available list.\n\
-             - Only use runtime ids listed under Local interpreters below.\n\
-             - Skill list shows names only; search with skill(action=search) to get full content.\n\
-             - sub_agent(task, title): delegate a long, self-contained subtask to a fresh sub-session agent; its final answer returns to you. Never delegate quick or context-heavy work; sub-agents cannot nest.",
+            // 原生模式：扩展动作已在工具 schema + 名字列表里，不再重复
+            "",
+            "## Know\n\
+             - Only call listed tools; unknown calls return an available list.\n\
+             - Runtime ids: see Local interpreters below.",
         )
     } else {
         (
             "## Extension actions\n\
              - run_script: run a piece of code temporarily with a local interpreter (not persisted). Params {\"runtime\":string,\"code\":string,\"params\":object}\n\
              - add_memory {\"content\":string,\"kind\":string} — store a long-term memory",
-            "## Know this before calling anything\n\
-             - Only call tools listed in the tools parameter or the Tools at a glance section below. Do NOT invent names — unknown calls will be returned with an available list.\n\
-             - Script I/O: read one JSON from stdin, print result JSON to stdout. Examples:\n\
-               Node: `const p=JSON.parse(require('fs').readFileSync(0,'utf8')||'{}');console.log(JSON.stringify({sum:(p.a||0)+(p.b||0)}))`\n\
-               Python: `import sys,json; p=json.loads(sys.stdin.read() or '{}'); print(json.dumps({'sum':p.get('a',0)+p.get('b',0)}))`\n\
-               Compiled langs: same stdin/stdout contract, BIT compiles then runs.\n\
-             - Only use runtime ids listed under Local interpreters below.\n\
-             - Skill list shows names only; search with skill(action=search) to get full content.\n\
-             - sub_agent(task, title): delegate a long, self-contained subtask to a fresh sub-session agent; its final answer returns to you. Never delegate quick or context-heavy work; sub-agents cannot nest.",
+            "## Know\n\
+             - Only call listed tools; unknown calls return an available list.\n\
+             - Script I/O: stdin one JSON → stdout one JSON. Node: `const p=JSON.parse(require('fs').readFileSync(0,'utf8')||'{}');console.log(JSON.stringify({sum:(p.a||0)+(p.b||0)}))` Python: `import sys,json; p=json.loads(sys.stdin.read() or '{}'); print(json.dumps({'sum':p.get('a',0)+p.get('b',0)}))` Compiled: same contract, BIT compiles then runs.\n\
+             - Runtime ids: see Local interpreters below.",
         )
     };
 
@@ -1712,10 +1856,11 @@ pub fn is_host_only_tool(name: &str) -> bool {
 /// 中立格式（name/description/parameters），发送前按协议转换。
 pub fn native_tool_defs(ctx: &Arc<crate::state::Ctx>) -> Vec<serde_json::Value> {
     let mut defs: Vec<serde_json::Value> = {
+        let cfg = ctx.config.lock().unwrap().clone();
         let tools = ctx.tools.lock().unwrap();
         tools
             .iter()
-            .filter(|t| t.enabled && !is_host_only_tool(&t.name))
+            .filter(|t| tool_visible(&cfg, t))
             .map(|t| {
                 serde_json::json!({
                     "name": t.name,
@@ -1735,6 +1880,11 @@ pub fn native_tool_defs(ctx: &Arc<crate::state::Ctx>) -> Vec<serde_json::Value> 
             "add_memory",
             "沉淀一条长期记忆",
             serde_json::json!({"type":"object","properties":{"content":{"type":"string"},"kind":{"type":"string","description":"如 preference/fact"}},"required":["content"]}),
+        ),
+        (
+            "memory",
+            "按 id 取回一条长期记忆全文（id 见提示词 Memories 主题索引）",
+            serde_json::json!({"type":"object","properties":{"id":{"type":"string","description":"记忆 id"}},"required":["id"]}),
         ),
     ];
     for (name, desc, params) in extra {
@@ -3592,5 +3742,55 @@ mod host_only_tests {
         for n in ["shell", "write_file", "run_script", "plan", "sub_agent_x"] {
             assert!(!is_host_only_tool(n), "{n} 不应被当作宿主管控工具");
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_visible_tests {
+    use super::*;
+
+    fn def(name: &str, enabled: bool) -> crate::registry::ToolDef {
+        crate::registry::ToolDef {
+            id: format!("t-{name}"),
+            name: name.into(),
+            description: "d".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            kind: crate::registry::ToolKind::Builtin { handler: "x".into() },
+            created_by: "system".into(),
+            created_at: "t".into(),
+            enabled,
+        }
+    }
+
+    /// 模拟配置文件缺失（Config::default()）：常规工具必须可见，不至于整页不可用
+    #[test]
+    fn default_config_keeps_normal_tools_visible() {
+        let cfg = crate::config::Config::default();
+        assert!(tool_visible(&cfg, &def("shell", true)));
+        assert!(tool_visible(&cfg, &def("view_image", true)));
+        assert!(tool_visible(&cfg, &def("sub_agent", true)));
+    }
+
+    /// 暂停（enabled=false）的工具不可见
+    #[test]
+    fn paused_tools_hidden() {
+        let cfg = crate::config::Config::default();
+        assert!(!tool_visible(&cfg, &def("shell", false)));
+    }
+
+    /// 权限闸门：配置开启才可见；macOS 上 screen/mouse/keyboard 恒隐藏
+    #[test]
+    fn gated_tools_follow_config() {
+        let mut cfg = crate::config::Config::default();
+        cfg.tool_mouse = true;
+        cfg.tool_screen = true;
+        if cfg!(target_os = "macos") {
+            assert!(!tool_visible(&cfg, &def("mouse", true)));
+            assert!(!tool_visible(&cfg, &def("screen", true)));
+        } else {
+            assert!(tool_visible(&cfg, &def("mouse", true)));
+            assert!(tool_visible(&cfg, &def("screen", true)));
+        }
+        assert!(!tool_visible(&cfg, &def("keyboard", true)), "keyboard 闸门未开");
     }
 }

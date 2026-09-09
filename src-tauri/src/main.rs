@@ -17,6 +17,7 @@ mod http_api;
 mod mcp;
 mod memory;
 mod netinfo;
+mod perms;
 mod registry;
 mod relay;
 mod repetition;
@@ -172,6 +173,10 @@ fn main() {
             let (actor, target) = if tui_mode { ("local-cli", "tui") } else { ("local-app", "BIT") };
             audit::record(&ctx, actor, "app.start", target, serde_json::json!({}), true);
             app.manage(ctx.clone());
+            // 非 macOS：出厂工具装入后按配置闸门同步 screen/mouse/keyboard 的启用态
+            // （macOS 已整体移除这三个工具，无需同步；sync_gate_enabled 内部只读快照 + 单锁，异常静默）
+            #[cfg(not(target_os = "macos"))]
+            crate::registry::sync_gate_enabled(&ctx);
             // 后台 shell 的顶层续跑 worker：长命令自然结束时自动把结果唤回所属会话的 AI
             crate::shellbg::init(&ctx);
 

@@ -189,8 +189,12 @@ fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// 守护开关：默认开启，BIT_NO_GUARDIAN=1 关闭（E2E / 调试 / TUI）
+/// 守护开关：默认开启，BIT_NO_GUARDIAN=1 关闭（E2E / 调试 / TUI）。
+/// macOS 上默认关闭（用户 kill 后会被重拉，"关不掉"；如需守护可设 BIT_GUARDIAN=1 显式开启）。
 pub fn enabled() -> bool {
+    if cfg!(target_os = "macos") {
+        return std::env::var("BIT_GUARDIAN").is_ok();
+    }
     std::env::var("BIT_NO_GUARDIAN").is_err()
 }
 
@@ -199,6 +203,9 @@ pub fn enabled() -> bool {
 /// 换装二进制后被下一次布防"洗白"。
 pub fn arm(ctx: &Arc<Ctx>) {
     if !enabled() {
+        // 关闭守护时通知残留的旧守护进程退出（它每 2s 读一次握手文件，读到 expect_exit 即退出），
+        // 否则升级前布防的旧守护进程会继续重拉主进程，造成"关不掉"
+        expect_exit(ctx);
         return;
     }
     let exe = match std::env::current_exe() {

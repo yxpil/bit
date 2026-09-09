@@ -53,6 +53,13 @@ fn persist(ctx: &Arc<crate::state::Ctx>) {
 
 // ---------- Goal ----------
 
+/// 短数字 id：现有 id 中最大数字 +1（如 "12"）。旧 uuid 长 id 共存——所有查找都是精确匹配。
+/// 提示词/面板里可读性好（对比 32 位 hex）。
+pub fn next_short_id<'a>(ids: impl Iterator<Item = &'a String>) -> String {
+    let max = ids.filter_map(|s| s.parse::<u64>().ok()).max().unwrap_or(0);
+    (max + 1).to_string()
+}
+
 pub fn create_goal(
     ctx: &Arc<crate::state::Ctx>,
     title: &str,
@@ -64,8 +71,9 @@ pub fn create_goal(
     if title.is_empty() {
         return Err("目标标题不能为空".into());
     }
+    let mut goals = ctx.goals.lock().unwrap();
     let g = Goal {
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: next_short_id(goals.iter().map(|x| &x.id)),
         ts: now(),
         updated_ts: now(),
         title: title.to_string(),
@@ -74,7 +82,6 @@ pub fn create_goal(
         source: source.to_string(),
         session_id: session.map(|s| s.to_string()),
     };
-    let mut goals = ctx.goals.lock().unwrap();
     goals.push(g.clone());
     drop(goals);
     persist(ctx);
@@ -105,6 +112,22 @@ pub fn update_goal_status(ctx: &Arc<crate::state::Ctx>, id: &str, status: &str) 
     let status = normalize_goal_status(status)
         .ok_or("状态必须是 active / achieved / abandoned（也接受：进行中/已完成/放弃 等同义词）")?;
     let mut goals = ctx.goals.lock().unwrap();
+    // 防抢跑：还有未完成待办时禁止把 active 目标标成 achieved（AI 曾因此跳过全部待办）。
+    // 宿主自动推进（全部完成后）不受影响——那时 pending 已为空。
+    if status == "achieved" {
+        let pending = {
+            let todos = ctx.todos.lock().unwrap();
+            todos
+                .iter()
+                .filter(|t| t.goal_id.as_deref() == Some(id) && t.status != "completed")
+                .count()
+        };
+        if pending > 0 {
+            return Err(format!(
+                "目标 {id} 下还有 {pending} 条未完成待办，不能标记 achieved；请先逐条完成并标记待办（或把目标改为 abandoned 放弃）"
+            ));
+        }
+    }
     let g = goals.iter_mut().find(|g| g.id == id).ok_or("目标不存在")?;
     g.status = status.to_string();
     g.updated_ts = now();
@@ -145,8 +168,9 @@ pub fn add_todo(
             return Err("关联目标不存在".into());
         }
     }
+    let mut todos = ctx.todos.lock().unwrap();
     let t = Todo {
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: next_short_id(todos.iter().map(|x| &x.id)),
         ts: now(),
         goal_id,
         content: content.to_string(),
@@ -154,7 +178,6 @@ pub fn add_todo(
         source: source.to_string(),
         session_id: session.map(|s| s.to_string()),
     };
-    let mut todos = ctx.todos.lock().unwrap();
     todos.push(t.clone());
     drop(todos);
     persist(ctx);
@@ -209,8 +232,9 @@ pub fn rewrite_todos(
             continue;
         }
         let status = normalize_todo_status(&status_str).unwrap_or("pending").to_string();
+        let new_id = next_short_id(todos.iter().map(|x| &x.id));
         todos.push(Todo {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: new_id,
             ts: now(),
             goal_id: goal_id.clone(),
             content,

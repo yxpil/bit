@@ -1,6 +1,6 @@
 // yxpil · BIT
 use crate::state::Ctx;
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -141,6 +141,7 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/debug/mcp", get(debug_mcp))
         .route("/api/debug/interrupt", post(debug_interrupt))
         .route("/api/debug/config", post(debug_config))
+        .route("/api/debug/system_prompt", get(debug_system_prompt))
         .route("/mcp", post(mcp_endpoint).delete(mcp_delete))
         // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
         .route("/v1/models", get(openai_models))
@@ -1003,6 +1004,9 @@ async fn debug_state(State(ctx): State<Arc<Ctx>>) -> Response {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "pid": std::process::id(),
+        // 守护是否启用：macOS 默认关闭（见 guardian::enabled）。T58 guardian-revive 据此
+        // 判断可否 kill 复活自测，避免在守护未启用时误杀被测实例
+        "guardian_enabled": crate::guardian::enabled(),
         "data_dir": ctx.data_dir.display().to_string(),
         "remote": { "port": cfg.port, "access_password_enabled": cfg.password_enabled },
         "provider": active,
@@ -1137,6 +1141,24 @@ async fn debug_interrupt(State(ctx): State<Arc<Ctx>>, Json(body): Json<serde_jso
     };
     crate::audit::record(&ctx, "remote", "chat.interrupt", &sid, json!({ "was_running": hit }), true);
     Json(json!({ "id": sid, "interrupted": hit })).into_response()
+}
+
+/// GET /api/debug/system_prompt?session_id=xxx：返回该会话下一轮将注入的系统提示词。
+/// 用于验证「记忆主题关键词压缩」（## Memories topics：about 关键词 [id]，全文按需 memory(id) 取回）
+/// 与技能名压缩（## Skills (names)）是否按预期工作；session_id 省略时按全局态（不含会话目标/待办）。
+/// 只读、双鉴权保护（同其它 /api/debug/*），不产生副作用。
+async fn debug_system_prompt(
+    State(ctx): State<Arc<Ctx>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let sid = q.get("session_id").cloned().unwrap_or_default();
+    // system_prompt_mode 内部对 memories/skills 等均只读快照加锁（jieba 分词不 panic、空数据安全）
+    let prompt = if sid.trim().is_empty() {
+        crate::ai::system_prompt(&ctx, None)
+    } else {
+        crate::ai::system_prompt(&ctx, Some(sid.trim()))
+    };
+    Json(json!({ "system_prompt": prompt })).into_response()
 }
 
 /// POST /api/debug/config：运行时调整幻觉防护阈值 / 对话限速 / 审批模式（E2E 熔断用例 / 调试桥），仅接受列出的键，同步落盘

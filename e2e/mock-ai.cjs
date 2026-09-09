@@ -82,9 +82,17 @@ function geminiContentText(c) {
     .join("\n");
 }
 
-// 从工具反馈 JSON 里提取 shell stdout（各家反馈格式序列化后字段名一致）
+// 从工具反馈 JSON 里提取 shell stdout（各家反馈格式序列化后字段名一致）。
+// 统一做 JSON 反转义（echo 的 \n 还原成真实换行）再 trim：此前把字面 \n 直接拼进最终文本，
+// 导致 BIT 回复里出现 stdout=「…ok\n」使 E2E 正则断言失配（T59-T62）
 function stdoutOf(fbText) {
-  return (fbText.match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "";
+  const raw = (fbText.match(/"stdout"\s*:\s*"((?:[^"\\]|\\.)*)"/) || [])[1];
+  if (raw == null) return "";
+  try {
+    return JSON.parse(`"${raw}"`).trim();
+  } catch {
+    return raw.trim();
+  }
 }
 
 // Claude SSE 响应：text 块 + 可选 tool_use 块（参数拆两段 input_json_delta 验证增量拼接）
@@ -404,13 +412,23 @@ const server = http.createServer((req, res) => {
         return respond(res, "E2E-FINAL-OK 计划完成并自动归档", sse);
       }
 
-      // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）
-      const stdouts = messages
+      // 其余场景（shell / markup / multi / plan）一轮工具即完成；回显所有工具的 stdout（单轮多工具场景）。
+      // 统一 JSON 反转义 + 逐条 trim：多工具反馈可能是一条 tool 消息含多段结果，也可能分多条消息，
+      // 全部收集避免只取到第一段（T28 noindex 曾因此只见 alpha 缺 beta）
+      const collectStdouts = (text) => {
+        const out = [];
+        for (const m of String(text || "").matchAll(/"stdout"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+          let v;
+          try { v = JSON.parse(`"${m[1]}"`); } catch { v = m[1]; }
+          v = String(v).trim();
+          if (v) out.push(v);
+        }
+        return out;
+      };
+      const echo = messages
         .filter((m) => m.role === "tool")
-        .map((m) => (String(m.content || "").match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "")
-        .filter(Boolean)
-        .join(" ");
-      const echo = stdouts || (fb.match(/"stdout"\s*:\s*"([^"]*)"/) || [])[1] || "";
+        .flatMap((m) => collectStdouts(m.content))
+        .join(" ") || collectStdouts(fb).join(" ");
       return respond(res, `E2E-FINAL-OK stdout=「${echo}」`, sse);
     }
 
@@ -440,8 +458,10 @@ const server = http.createServer((req, res) => {
         );
       }
       const gid = goalIds["E2E-AUTODRIVE 目标"] || "";
+      // BIT 在待办全部完成时会先自动把目标置为 achieved，再发这条「所有待办均已完成」收尾消息——
+      // 直接确认 DONE 即可（goal_update 已由宿主完成，再发只会重复）
       if (last.includes("所有待办均已完成"))
-        return respond(res, `标记目标完成：[{"tool":"goal_update","params":{"id":"${gid}","status":"achieved"}}]`, sse);
+        return respond(res, "目标已标记 achieved。E2E-AUTODRIVE-DONE 全部完成", sse);
       if (last.includes("「step two」"))
         return respond(
           res,
@@ -739,11 +759,12 @@ const server = http.createServer((req, res) => {
       return respond(res, '好的我先把文件写上：[{"tool":"write_file","params":{"path":"./.e2e-cont.txt","content":"partial', sse);
     }
 
-    // 中断场景：慢工具（sleep 2）给 E2E 留出置位中断标志的窗口；未被打断时走通用反馈轮
+    // 中断/互斥场景：慢命令留出中断与并发窗口，又必须 < 2s 前台窗口内结束（sleep 2 恰好卡在
+    // FRONT_WINDOW_MS=2000ms 边界会被转后台，导致首回合拿不到 stdout——T27 因此误判 firstOk=false）
     if (last.includes("E2E-CMD-SLEEP"))
       return respond(
         res,
-        '先执行一个慢命令：\n[{"tool":"shell","params":{"command":"sleep 2 && echo e2e-slept"}}]',
+        '先执行一个慢命令：\n[{"tool":"shell","params":{"command":"sleep 1.5 && echo e2e-slept"}}]',
         sse
       );
 

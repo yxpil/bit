@@ -55,13 +55,13 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.shell",
             "shell",
-            "Execute a shell command (system shell) and return stdout/stderr with exit code. Commands still running after ~2s are automatically moved to a background job (the result is delivered back to the session when it finishes). For known long tasks set background=true to start in the background immediately",
+            "Run a shell command; returns stdout/stderr + exit code",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "The command to execute" },
                     "cwd": { "type": "string", "description": "Working directory (optional)" },
-                    "background": { "type": "boolean", "description": "Set true for known long tasks (builds, installs, batch jobs): returns a job_id immediately, the chat continues, and the command result is automatically reported back to this session when it finishes. The job is visible and stoppable in the background-tasks panel" }
+                    "background": { "type": "boolean", "description": "Known long tasks: run in background; job_id returns at once, result auto-reports when done" }
                 },
                 "required": ["command"]
             }),
@@ -188,7 +188,7 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.sub_agent",
             "sub_agent",
-            "Spawn a sub-agent: it opens an independent session, has all tools, and runs autonomously until done — then its final answer returns verbatim to you. The sub-agent cannot see your history, so the task must be self-contained (background + goal + acceptance criteria). Use it only for long subtasks that benefit from parallelism; do quick or context-heavy work yourself. Sub-agents cannot spawn further sub-agents.",
+            "Spawn an independent sub-session agent (all tools) for a long self-contained subtask; its final answer returns to you. Task text must be self-contained. No nesting",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -276,7 +276,7 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.view_image",
             "view_image",
-            "View a local image: the image is injected into the next turn as visual content that vision models (GPT, Gemini, Claude, etc.) can see directly. Supports png/jpg/jpeg/webp/gif/bmp",
+            "View a local image (png/jpg/webp/gif/bmp): injected into the next turn as visual content",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -287,7 +287,94 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "view_image",
         ),
+        // 7.6-7.8 screen / mouse / keyboard：本机操控三件套（实验性功能）。
+        // 背景：最初为 macOS 实现（screencapture / osascript / CoreGraphics / System Events）。
+        // 现状与决策：
+        //   1) macOS 整体不注册不启用（TCC 授权体验差，用户决定 macOS 屏蔽）；
+        //   2) Windows/Linux 构建仍保留入口作为「实验性」预留，默认关闭（config 闸门三者恒默认
+        //      false，设置里可尝试开启）。⚠️ 平台后端尚未落地：实际调用会返回明确的
+        //      “实验性功能、平台实现未就绪”错误，不会执行任何本机操控、也不会误报成功。
+        //   3) 历史遗留的注册项会在启动加载时按出厂清单自动移除。
+        #[cfg(not(target_os = "macos"))]
+        mk(
+            "builtin.screen",
+            "screen",
+            "(Experimental) Capture the screen or a region to a PNG for view_image. Platform backend not shipped yet for Windows/Linux — keep OFF in Settings; calling it returns an explicit error.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number", "description": "Region left (optional; all four fields required to capture a region)" },
+                    "y": { "type": "number", "description": "Region top (optional)" },
+                    "width": { "type": "number", "description": "Region width (optional)" },
+                    "height": { "type": "number", "description": "Region height (optional)" }
+                }
+            }),
+            "screen",
+        ),
+        #[cfg(not(target_os = "macos"))]
+        mk(
+            "builtin.mouse",
+            "mouse",
+            "(Experimental) Read/control the mouse. Platform backend not shipped yet for Windows/Linux — keep OFF in Settings; calling it returns an explicit error. Actions: position / move / click / double_click / right_click (x,y) / drag (x,y→x2,y2) / scroll (dx,dy)",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["position", "move", "click", "double_click", "right_click", "drag", "scroll"], "description": "What to do" },
+                    "x": { "type": "number", "description": "Cursor X in screen coordinates (origin top-left)" },
+                    "y": { "type": "number", "description": "Cursor Y in screen coordinates" },
+                    "x2": { "type": "number", "description": "Drag target X (drag only)" },
+                    "y2": { "type": "number", "description": "Drag target Y (drag only)" },
+                    "dx": { "type": "number", "description": "Horizontal scroll pixels (scroll only)" },
+                    "dy": { "type": "number", "description": "Vertical scroll pixels (scroll only)" }
+                },
+                "required": ["action"]
+            }),
+            "mouse",
+        ),
+        // 7.8 keyboard：键盘输入（实验性；同上——Windows/Linux 后端未就绪，默认关闭）
+        #[cfg(not(target_os = "macos"))]
+        mk(
+            "builtin.keyboard",
+            "keyboard",
+            "(Experimental) Type text or press keys. Platform backend not shipped yet for Windows/Linux — keep OFF in Settings; calling it returns an explicit error. Actions: type (text), key (named key or single char, optional modifiers)",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["type", "key"], "description": "What to do" },
+                    "text": { "type": "string", "description": "Text to type (type only)" },
+                    "key": { "type": "string", "description": "Named key (return/tab/space/delete/escape/home/end/pageup/pagedown/left/right/up/down/f1-f12) or a single character (key only)" },
+                    "cmd": { "type": "boolean", "description": "Hold ⌘ (key only)" },
+                    "shift": { "type": "boolean", "description": "Hold ⇧ (key only)" },
+                    "option": { "type": "boolean", "description": "Hold ⌥ (key only)" },
+                    "ctrl": { "type": "boolean", "description": "Hold ⌃ (key only)" }
+                },
+                "required": ["action"]
+            }),
+            "keyboard",
+        ),
     ]
+}
+
+/// 把 screen / mouse / keyboard 三个操控工具的 enabled 同步为设置页闸门状态。
+/// 启动时与闸门变更时调用：闸门关 = 工具页显示关闭 + 不下发模型 + 调用拒绝，三层一致。
+/// 仅 Windows/Linux 有这三个工具（macOS 已整体移除，无需也不应触碰 tools 列表）
+#[cfg(not(target_os = "macos"))]
+pub fn sync_gate_enabled(ctx: &Arc<crate::state::Ctx>) {
+    // 锁序纪律 + 单次加锁：config 快照克隆后立即释放，tools 只在一次锁内完成「改 + 序列化」，
+    // 不在持锁期间写盘、也不对同一 Mutex 二次加锁（std Mutex 不可重入，二次 lock 即死锁）
+    let cfg = ctx.config.lock().unwrap().clone();
+    let json = {
+        let mut tools = ctx.tools.lock().unwrap();
+        for t in tools.iter_mut() {
+            match t.name.as_str() {
+                "screen" | "mouse" | "keyboard" => t.enabled = cfg.tool_gate(&t.name),
+                _ => {}
+            }
+        }
+        serde_json::to_string(&*tools).unwrap_or_default()
+    };
+    // 落盘失败静默（下次启动会再同步），不让存储问题拖垮启动
+    let _ = std::fs::write(ctx.data_dir.join("tools.json"), json);
 }
 
 /// 注册新工具。name 唯一；Remote 需要回调 URL。
@@ -315,6 +402,23 @@ pub fn register_opts(
     let name = name.trim();
     if name.is_empty() {
         return Err("Tool name cannot be empty".into());
+    }
+    // 参数 schema 必须可读：空 properties 会让模型猜参数名（曾导致 csv_stats 收不到 column 只回元信息）。
+    // 例外：Interpreter / Script（add_tool 自建、run_script 沉淀）走「stdin 全 JSON」协议，参数天然自由，
+    // 由模型按 description + additionalProperties 传参——空 schema 是它们的正常形态，不能一刀切拦截
+    // （否则 AI 自建工具全部注册失败，E2E add-tool / overwrite / delete-tool 链路回归）。
+    let freeform = matches!(&kind, ToolKind::Interpreter { .. } | ToolKind::Script { .. });
+    if !freeform && parameters.get("type").and_then(|v| v.as_str()) == Some("object") {
+        let empty = parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|p| p.is_empty())
+            .unwrap_or(true);
+        if empty {
+            return Err(
+                "parameters.properties cannot be empty: declare every parameter with name, type and description — the model relies on this schema to pass arguments correctly".into(),
+            );
+        }
     }
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut tools = ctx.tools.lock().unwrap();
@@ -616,6 +720,19 @@ pub fn no_window_tokio(cmd: &mut tokio::process::Command) {
 #[cfg(not(windows))]
 pub fn no_window_tokio(_cmd: &mut tokio::process::Command) {}
 
+/// 辅助功能权限检测（macOS）：未授权时 CGEventPost 会静默丢弃（不报错但事件不生效），
+/// 必须显式检测并给用户明确指引，否则模型会以为操作成功。
+/// 进程内 FFI 检测（归属 BIT 本体），不再借道 osascript（TCC 会误判成 osascript 的授权状态）
+/// 仅 Windows/Linux 的操控工具在调用前探测（macOS 上这些工具已不注册）
+#[cfg(not(target_os = "macos"))]
+fn ax_trusted() -> bool {
+    crate::perms::ax_trusted()
+}
+
+#[cfg(not(target_os = "macos"))]
+const AX_DENIED_MSG: &str =
+    "辅助功能权限未授予：打开 系统设置 → 隐私与安全性 → 辅助功能，勾选 BIT 后重试（授权后无需重启）";
+
 /// 五个出厂内置工具的真实实现
 async fn builtin_invoke(
     ctx: &Arc<crate::state::Ctx>,
@@ -714,6 +831,269 @@ async fn builtin_invoke(
                 // agent 循环会把 data_url 抽出注入下一轮请求，并把本结果脱敏后再回喂模型
                 "data_url": format!("data:{mime};base64,{b64}"),
             }))
+        }
+        // ── 2.7 screen：截屏（macOS，screencapture），返回路径供 view_image 查看 ──
+        #[cfg(not(target_os = "macos"))]
+        "screen" => {
+            if !cfg!(target_os = "macos") {
+                return Err("screen：本机操控为实验性功能，Windows/Linux 实现尚未提供（设置中默认关闭，请保持关闭）".into());
+            }
+            if !ctx.config.lock().unwrap().tool_gate("screen") {
+                return Err("screen 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开并完成屏幕录制授权".into());
+            }
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S%3f");
+            let path = format!("/tmp/bit-screen-{ts}.png");
+            let mut cmd = tokio::process::Command::new("screencapture");
+            cmd.arg("-x").arg("-t").arg("png");
+            let (x, y, w, h) = (
+                params.get("x").and_then(|v| v.as_f64()),
+                params.get("y").and_then(|v| v.as_f64()),
+                params.get("width").and_then(|v| v.as_f64()),
+                params.get("height").and_then(|v| v.as_f64()),
+            );
+            if let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) {
+                cmd.arg(format!("-R{x},{y},{w},{h}"));
+            }
+            cmd.arg(&path);
+            let out = cmd
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run screencapture: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "screencapture failed: {} (首次使用需在 系统设置 → 隐私与安全性 → 屏幕录制 中授权 BIT)",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok(serde_json::json!({
+                "path": path,
+                "note": "Screenshot saved. Now call view_image with this path to see the screen.",
+            }))
+        }
+        // ── 2.8 mouse：查看/操作鼠标（macOS，osascript JXA + CoreGraphics）──
+        #[cfg(not(target_os = "macos"))]
+        "mouse" => {
+            if !cfg!(target_os = "macos") {
+                return Err("mouse：本机操控为实验性功能，Windows/Linux 实现尚未提供（设置中默认关闭，请保持关闭）".into());
+            }
+            if !ctx.config.lock().unwrap().tool_gate("mouse") {
+                return Err("mouse 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开并完成辅助功能授权".into());
+            }
+            let action = params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing parameter: action")?;
+            // 未授权时 CGEventPost 静默丢弃——先检测，给出可操作的指引
+            if action != "position" && !ax_trusted() {
+                return Err(AX_DENIED_MSG.into());
+            }
+            let xy = |k1: &str, k2: &str| -> Result<(f64, f64), String> {
+                let x = params
+                    .get(k1)
+                    .and_then(|v| v.as_f64())
+                    .ok_or(format!("Missing parameter: {k1}"))?;
+                let y = params
+                    .get(k2)
+                    .and_then(|v| v.as_f64())
+                    .ok_or(format!("Missing parameter: {k2}"))?;
+                Ok((x, y))
+            };
+            let script = match action {
+                "position" => {
+                    r#"ObjC.import('CoreGraphics'); const p=$.CGEventGetLocation($.CGEventCreate($())); JSON.stringify({x:p.x, y:p.y})"#.to_string()
+                }
+                "move" => {
+                    let (x, y) = xy("x", "y")?;
+                    format!(
+                        r#"ObjC.import('CoreGraphics'); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventMouseMoved, $.CGPointMake({x},{y}), $.kCGMouseButtonLeft)); 'moved'"#
+                    )
+                }
+                "click" | "double_click" | "right_click" => {
+                    let (x, y) = xy("x", "y")?;
+                    let pairs = if action == "double_click" { 2 } else { 1 };
+                    let (down, up, btn) = if action == "right_click" {
+                        (
+                            "$.kCGEventRightMouseDown",
+                            "$.kCGEventRightMouseUp",
+                            "$.kCGMouseButtonRight",
+                        )
+                    } else {
+                        (
+                            "$.kCGEventLeftMouseDown",
+                            "$.kCGEventLeftMouseUp",
+                            "$.kCGMouseButtonLeft",
+                        )
+                    };
+                    let mut s = format!(
+                        r#"ObjC.import('CoreGraphics'); const p=$.CGPointMake({x},{y}); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventMouseMoved, p, {btn}));"#
+                    );
+                    for _ in 0..pairs {
+                        s.push_str(&format!(
+                            r#" $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), {down}, p, {btn})); $.NSThread.sleepForTimeInterval(0.03); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), {up}, p, {btn})); $.NSThread.sleepForTimeInterval(0.06);"#
+                        ));
+                    }
+                    s.push_str(" 'clicked'");
+                    s
+                }
+                "drag" => {
+                    let (x, y) = xy("x", "y")?;
+                    let (tx, ty) = xy("x2", "y2")?;
+                    format!(
+                        r#"ObjC.import('CoreGraphics');
+                        function mv(px,py){{ $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventLeftMouseDragged, $.CGPointMake(px,py), $.kCGMouseButtonLeft)); }}
+                        $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventMouseMoved, $.CGPointMake({x},{y}), $.kCGMouseButtonLeft));
+                        $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventLeftMouseDown, $.CGPointMake({x},{y}), $.kCGMouseButtonLeft));
+                        for (let i=1;i<=12;i++){{ mv({x}+({tx}-{x})*i/12, {y}+({ty}-{y})*i/12); $.NSThread.sleepForTimeInterval(0.02); }}
+                        $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventLeftMouseUp, $.CGPointMake({tx},{ty}), $.kCGMouseButtonLeft));
+                        'dragged'"#
+                    )
+                }
+                "scroll" => {
+                    let dx = params.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
+                    let dy = params.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
+                    if dx == 0 && dy == 0 {
+                        return Err("scroll needs a non-zero dx or dy".into());
+                    }
+                    format!(
+                        r#"ObjC.import('CoreGraphics'); const e=$.CGEventCreateScrollWheelEvent($(), $.kCGScrollEventUnitPixel, 1, {dy}); if ({dx} !== 0) {{ $.CGEventSetIntegerValueField(e, $.kCGScrollWheelEventDeltaAxis2, {dx}); }} $.CGEventPost($.kCGHIDEventTap, e); 'scrolled'"#
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "Unknown action '{other}'; available: position, move, click, double_click, right_click, drag, scroll"
+                    ))
+                }
+            };
+            let out = tokio::process::Command::new("osascript")
+                .args(["-l", "JavaScript", "-e", &script])
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run osascript: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "mouse {action} failed: {} (首次使用需在 系统设置 → 隐私与安全性 → 辅助功能 中授权 BIT)",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if action == "position" {
+                // position 返回 {"x":..,"y":..} JSON；解析失败则原样返回
+                return Ok(match serde_json::from_str::<serde_json::Value>(&stdout) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::json!({ "raw": stdout }),
+                });
+            }
+            Ok(serde_json::json!({ "ok": true, "action": action, "result": stdout }))
+        }
+        // ── 2.9 keyboard：键盘输入（macOS，System Events keystroke / key code）──
+        #[cfg(not(target_os = "macos"))]
+        "keyboard" => {
+            if !cfg!(target_os = "macos") {
+                return Err("keyboard：本机操控为实验性功能，Windows/Linux 实现尚未提供（设置中默认关闭，请保持关闭）".into());
+            }
+            if !ctx.config.lock().unwrap().tool_gate("keyboard") {
+                return Err(
+                    "keyboard 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开并完成辅助功能授权".into(),
+                );
+            }
+            if !ax_trusted() {
+                return Err(AX_DENIED_MSG.into());
+            }
+            let action = params
+                .get("action")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing parameter: action")?;
+            let mods = {
+                let mut m: Vec<&str> = Vec::new();
+                if params.get("cmd").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    m.push("command down");
+                }
+                if params.get("shift").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    m.push("shift down");
+                }
+                if params.get("option").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    m.push("option down");
+                }
+                if params.get("ctrl").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    m.push("control down");
+                }
+                if m.is_empty() { String::new() } else { format!(" using {{{}}}", m.join(", ")) }
+            };
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = match action {
+                "type" => {
+                    let text = params
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing parameter: text")?;
+                    if text.is_empty() {
+                        return Err("text cannot be empty".into());
+                    }
+                    format!(r#"tell application "System Events" to keystroke "{}""#, esc(text))
+                }
+                "key" => {
+                    let key = params
+                        .get("key")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Missing parameter: key")?;
+                    let named = match key.to_lowercase().as_str() {
+                        "return" | "enter" => Some(36),
+                        "tab" => Some(48),
+                        "space" => Some(49),
+                        "delete" | "backspace" => Some(51),
+                        "forwarddelete" => Some(117),
+                        "escape" | "esc" => Some(53),
+                        "home" => Some(115),
+                        "end" => Some(119),
+                        "pageup" => Some(116),
+                        "pagedown" => Some(121),
+                        "left" => Some(123),
+                        "right" => Some(124),
+                        "down" => Some(125),
+                        "up" => Some(126),
+                        "f1" => Some(122),
+                        "f2" => Some(120),
+                        "f3" => Some(99),
+                        "f4" => Some(118),
+                        "f5" => Some(96),
+                        "f6" => Some(97),
+                        "f7" => Some(98),
+                        "f8" => Some(100),
+                        "f9" => Some(101),
+                        "f10" => Some(109),
+                        "f11" => Some(103),
+                        "f12" => Some(111),
+                        _ => None,
+                    };
+                    match named {
+                        Some(code) => {
+                            format!(r#"tell application "System Events" to key code {code}{mods}"#)
+                        }
+                        None if key.chars().count() == 1 => {
+                            format!(r#"tell application "System Events" to keystroke "{}"{mods}"#, esc(key))
+                        }
+                        None => {
+                            return Err(format!(
+                                "Unknown key '{key}'; use a single character or a named key (return/tab/space/delete/escape/home/end/pageup/pagedown/left/right/up/down/f1-f12)"
+                            ))
+                        }
+                    }
+                }
+                other => return Err(format!("Unknown action '{other}'; available: type, key")),
+            };
+            let out = tokio::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run osascript: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "keyboard {action} failed: {} (需辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能)",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok(serde_json::json!({ "ok": true, "action": action }))
         }
         // ── 3. 制定计划（目标 + 待办）──
         "plan" => {

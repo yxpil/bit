@@ -177,6 +177,10 @@ function record(name, ok, detail) {
   // 原生 tools 专项集中在 T59-64，各块开头已显式切换 compat_mode
   try { await call("/api/debug/config", { compat_mode: true }); } catch {}
 
+  // 上游基线：active_provider 是持久配置——被其它矩阵/失败用例切到 Claude/Gemini 后必须归位
+  // 到默认 OpenAI mock，否则 T1-T58 的 mock 通用工具关键词全落在别的协议 fallback（只见「好的。」）
+  try { await call("/api/debug/config", { active_provider: "e2e-mock-provider" }); } catch {}
+
   // 中继测试态清零：防上一轮崩溃遗留的封禁/盒子状态跨轮泄漏（T53 自身的 _reset 只覆盖它前后）
   {
     const rport = Number(process.env.FAKE_RELAY_PORT) || 9802;
@@ -224,10 +228,13 @@ function record(name, ok, detail) {
     record("T5 tool-files-roundtrip", /E2E-FINAL-FILES/.test(r.reply || "") && content === "alpha-beta", `reply=${(r.reply || "").slice(0, 60)} file=${content}`);
   } catch (e) { record("T5 tool-files-roundtrip", false, e.message); } finally { delTmp(); }
 
-  // T6 plan 待办沉淀
+  // T6 plan 待办沉淀：plan 建目标后由 auto-drive 自动收尾。
+  // BIT 现在会把目标推进到全部待办完成并自动归档，最终确认语可能是 plan 的 E2E-FINAL-OK，
+  // 也可能是自动收尾统一的 E2E-AUTODRIVE-DONE（两种都代表「计划落地并被自动完成/归档」）
   try {
     const r = await chat(sid(6), "E2E-CMD-PLAN todo");
-    record("T6 tool-plan", /E2E-FINAL-OK/.test(r.reply || ""), `reply=${(r.reply || "").slice(0, 80)}`);
+    const ok6 = /E2E-FINAL-OK/.test(r.reply || "") || /E2E-AUTODRIVE-DONE/.test(r.reply || "");
+    record("T6 tool-plan", ok6, `reply=${(r.reply || "").slice(0, 80)}`);
   } catch (e) { record("T6 tool-plan", false, e.message); }
 
   // T7 skill save → search 跨轮连续调用
@@ -1700,27 +1707,33 @@ function record(name, ok, detail) {
     const st = JSON.parse((await callGet("/api/debug/state")).body);
     const oldPid = st.pid;
     if (!oldPid) throw new Error("debug/state missing pid");
-    // 平台感知强杀：只杀主进程本体——守护进程是主进程子进程，Windows 绝不能带 /T（会把守护一起杀掉）
-    if (process.platform === "win32") {
-      require("child_process").execSync(`taskkill /F /PID ${oldPid}`);
+    // 守护未启用时（macOS 默认关闭 guardian；见 guardian::enabled）不做 kill 复活自测：
+    // 此时强杀只会误杀被测实例且无人拉起，后续一切请求全挂——表现为“跑完全量服务消失”。
+    if (!st.guardian_enabled) {
+      record("T58 guardian-revive", true, "skip（guardian_enabled=false，本环境不执行 kill/复活自测）");
     } else {
-      try { process.kill(oldPid, "SIGKILL"); } catch (e) { if (e.code !== "ESRCH") throw e; }
+      // 平台感知强杀：只杀主进程本体——守护进程是主进程子进程，Windows 绝不能带 /T（会把守护一起杀掉）
+      if (process.platform === "win32") {
+        require("child_process").execSync(`taskkill /F /PID ${oldPid}`);
+      } else {
+        try { process.kill(oldPid, "SIGKILL"); } catch (e) { if (e.code !== "ESRCH") throw e; }
+      }
+      // 守护 tick 2s + 应用启动：/api/health 免鉴权，恢复 200 即复活
+      const deadline = Date.now() + 25_000;
+      let back = false;
+      while (Date.now() < deadline) {
+        try { if ((await callGet("/api/health")).code === 200) { back = true; break; } } catch {}
+        await new Promise((r) => setTimeout(r, 800));
+      }
+      // 复活确证：pid 已更换（防 kill 未生效时 health 仍 200 的假阳性）
+      let newPid = 0;
+      for (let i = 0; i < 20 && !newPid; i++) {
+        try { newPid = JSON.parse((await callGet("/api/debug/state")).body).pid || 0; } catch {}
+        if (!newPid) await new Promise((r) => setTimeout(r, 800));
+      }
+      record("T58 guardian-revive", back && newPid > 0 && newPid !== oldPid,
+        `health=${back} oldPid=${oldPid} newPid=${newPid}`);
     }
-    // 守护 tick 2s + 应用启动：/api/health 免鉴权，恢复 200 即复活
-    const deadline = Date.now() + 25_000;
-    let back = false;
-    while (Date.now() < deadline) {
-      try { if ((await callGet("/api/health")).code === 200) { back = true; break; } } catch {}
-      await new Promise((r) => setTimeout(r, 800));
-    }
-    // 复活确证：pid 已更换（防 kill 未生效时 health 仍 200 的假阳性）
-    let newPid = 0;
-    for (let i = 0; i < 20 && !newPid; i++) {
-      try { newPid = JSON.parse((await callGet("/api/debug/state")).body).pid || 0; } catch {}
-      if (!newPid) await new Promise((r) => setTimeout(r, 800));
-    }
-    record("T58 guardian-revive", back && newPid > 0 && newPid !== oldPid,
-      `health=${back} oldPid=${oldPid} newPid=${newPid}`);
   } catch (e) {
     record("T58 guardian-revive", false, e.message);
   }

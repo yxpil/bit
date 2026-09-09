@@ -393,11 +393,41 @@ pub fn replace_binary(target: &Path, new_file: &Path) -> std::io::Result<PathBuf
 /// - Windows：NSIS 安装器静默覆盖安装（/S），随后退出（安装器负责替换文件）
 /// - macOS：app.zip 解包后整体替换 .app（ditto 保留签名），respawn 时重启
 /// - Linux：AppImage 单文件换装，respawn 时重启
+/// 版本三元组解析（"0.6.2" → (0,6,2)；容忍 v 前缀与非数字尾巴）
+fn ver_tuple(v: &str) -> (u64, u64, u64) {
+    let mut it = v
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split('.')
+        .map(|seg| {
+            seg.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(0)
+        });
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
 pub fn apply_update(ctx: &Arc<Ctx>, respawn: bool) -> Result<String, String> {
     let st = read_state(ctx).ok_or("没有已下载的更新")?;
     let state = st["state"].as_str().unwrap_or("");
     if state != "downloaded" {
         return Err("没有已下载的更新".into());
+    }
+    // 防降级：暂存包版本不高于当前版本时拒装并清除暂存。
+    // （曾发生过：退出时把数小时前的旧暂存包装回去，新功能整体蒸发）
+    let staged = st["version"].as_str().unwrap_or("").to_string();
+    let cur = ctx.app.package_info().version.to_string();
+    if ver_tuple(&staged) <= ver_tuple(&cur) {
+        let _ = std::fs::remove_dir_all(upgrade_dir(ctx));
+        return Err(format!(
+            "暂存更新版本 {staged} 不高于当前 {cur}，已丢弃（防降级保护）"
+        ));
     }
     let file = upgrade_dir(ctx).join(st["file"].as_str().unwrap_or(""));
     if !file.exists() {

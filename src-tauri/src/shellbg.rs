@@ -26,10 +26,15 @@ const BG_TIMEOUT_SECS: u64 = 6 * 3600;
 /// 与 run 链无类型依赖，彻底断开递归。
 pub struct JobDone {
     pub session: String,
+    pub job_id: String,
     pub command: String,
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// 结束方式：done=自然结束 / cancelled=用户手动停止 / timeout=运行超时被强制终止。
+    /// 三种结束都要告知所属会话的 AI——尤其 cancelled 必须让 AI 知道「是用户主动干预」，
+    /// 而不是误以为任务失败或仍在运行。
+    pub reason: String,
 }
 
 static DONE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<JobDone>> = OnceLock::new();
@@ -224,17 +229,18 @@ async fn finish(ctx: Arc<crate::state::Ctx>, job: Arc<ShellJob>) {
 
     let timeout_sleep = tokio::time::sleep(std::time::Duration::from_secs(BG_TIMEOUT_SECS));
     tokio::pin!(timeout_sleep);
-    let mut cancelled = false;
+    // 结束方式：done=自然结束 / cancelled=用户手动停止 / timeout=运行超时强制终止
+    let mut reason = "done".to_string();
     let status: Option<std::process::ExitStatus> = tokio::select! {
         st = child.wait() => st.ok(),
         _ = job.cancel.notified() => {
-            cancelled = true;
+            reason = "cancelled".into();
             let _ = child.start_kill();
             let _ = child.wait().await;
             None
         }
         _ = &mut timeout_sleep => {
-            cancelled = true;
+            reason = "timeout".into();
             let _ = child.start_kill();
             let _ = child.wait().await;
             None
@@ -244,52 +250,45 @@ async fn finish(ctx: Arc<crate::state::Ctx>, job: Arc<ShellJob>) {
     let stderr = String::from_utf8_lossy(&se_task.await.unwrap_or_default()).into_owned();
     jobs().lock().unwrap().remove(&job.id);
     let ms = job.started.elapsed().as_millis() as u64;
+    let code = status.and_then(|st| st.code());
 
-    match status {
-        Some(st) => {
-            let code = st.code();
-            emit(
-                &ctx,
-                "done",
-                &job,
-                Some(json!({ "code": code, "ms": ms })),
-            );
-            crate::audit::record(
-                &ctx,
-                "host",
-                "shell.done",
-                &job.id,
-                json!({ "command": job.command, "code": code }),
-                true,
-            );
-            // 自然结束：广播 done 后把结果投递给顶层续跑 worker（自动唤回所属会话的 AI 处理）
-            if let Some(tx) = DONE_TX.get() {
-                if let Some(sid) = job.session.clone() {
-                    let _ = tx.send(JobDone {
-                        session: sid,
-                        command: job.command.clone(),
-                        code,
-                        stdout,
-                        stderr,
-                    });
-                }
-            }
-        }
-        None => {
-            emit(
-                &ctx,
-                "killed",
-                &job,
-                Some(json!({ "ms": ms, "reason": if cancelled { "cancelled" } else { "timeout" } })),
-            );
-            crate::audit::record(
-                &ctx,
-                "host",
-                "shell.cancelled",
-                &job.id,
-                json!({ "command": job.command }),
-                true,
-            );
+    if reason == "done" {
+        emit(&ctx, "done", &job, Some(json!({ "code": code, "ms": ms })));
+        crate::audit::record(
+            &ctx,
+            "host",
+            "shell.done",
+            &job.id,
+            json!({ "command": job.command, "code": code }),
+            true,
+        );
+    } else {
+        emit(&ctx, "killed", &job, Some(json!({ "ms": ms, "reason": reason.as_str() })));
+        crate::audit::record(
+            &ctx,
+            "host",
+            if reason == "cancelled" { "shell.cancelled" } else { "shell.timeout" },
+            &job.id,
+            json!({ "command": job.command }),
+            true,
+        );
+    }
+
+    // 无论自然结束、被用户手动停止还是超时终止，都把「结束方式」投递给顶层续跑 worker，
+    // 由 resume 按 reason 生成说明唤回所属会话的 AI：
+    //   自然结束 → 带结果继续推进任务；cancelled → 明确告知「用户手动停止」，避免 AI 误以为
+    //   任务失败或仍在运行而干等 / 重复执行同一命令；timeout → 告知超时被终止、需与用户确认再走。
+    if let Some(tx) = DONE_TX.get() {
+        if let Some(sid) = job.session.clone() {
+            let _ = tx.send(JobDone {
+                session: sid,
+                job_id: job.id.clone(),
+                command: job.command.clone(),
+                code,
+                stdout,
+                stderr,
+                reason,
+            });
         }
     }
 }
@@ -308,15 +307,38 @@ async fn resume(ctx: &Arc<crate::state::Ctx>, msg: &JobDone) {
             return; // 会话已删除
         }
     }
-    let so = crate::registry::safe_trunc(msg.stdout.trim_end(), 16000);
-    let se = crate::registry::safe_trunc(msg.stderr.trim_end(), 6000);
+    let cmd = crate::registry::safe_trunc(&msg.command, 120);
     let code_txt = msg
         .code
         .map(|c| c.to_string())
         .unwrap_or_else(|| "?".to_string());
+    // 结束方式决定正文口径。cancelled 必须明确「用户手动停止」，避免 AI 误判为命令失败
+    // 或以为任务仍在跑（干等 / 重复执行同一条命令）；timeout 同理给出处置指引。
+    let (title, cap_out, cap_err, guide) = match msg.reason.as_str() {
+        "cancelled" => (
+            "[后台任务已手动停止]",
+            4000,
+            2000,
+            "命令被用户手动停止（用户在面板点了「停止」或发送了停止指令），任务未完成——这是用户主动干预，不是命令本身出错。不要继续等待它的结果，也不要自动重新执行同一条命令；若任务仍需推进，先询问用户希望如何调整或是否重新运行。",
+        ),
+        "timeout" => (
+            "[后台任务超时终止]",
+            4000,
+            2000,
+            "命令运行超过后台上限（6 小时）被强制终止，任务未完成。不要原样自动重跑同一条命令；先与用户确认是否需要分拆步骤或改用更稳妥的方式执行。",
+        ),
+        _ => (
+            "[后台任务完成]",
+            16000,
+            6000,
+            "请基于上面的结果继续推进任务；若任务已全部完成，直接给出结论即可，不要重复执行该命令。",
+        ),
+    };
+    let so = crate::registry::safe_trunc(msg.stdout.trim_end(), cap_out);
+    let se = crate::registry::safe_trunc(msg.stderr.trim_end(), cap_err);
     let body = format!(
-        "[后台任务完成] 命令 `{}` 已结束，退出码 {code_txt}。请基于上面的结果继续推进任务；若任务已全部完成，直接给出结论即可，不要重复执行该命令。\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        msg.command,
+        "{title} 命令 `{cmd}`（job {}）已结束，退出码 {code_txt}。{guide}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        msg.job_id,
         if so.is_empty() { "(空)".to_string() } else { so },
         if se.is_empty() { "(空)".to_string() } else { se },
     );

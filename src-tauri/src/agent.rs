@@ -349,18 +349,22 @@ fn guard_suffix(ctx: &Arc<Ctx>, visible: &str, tool_capped: bool, tool_rounds: u
     out
 }
 
-/// 目标自动推进判定：回合结束后调用。返回 Some(下一回合合成消息) 继续跑，None 停止。
-/// 停止条件：AI 回复以 [WAIT] 开头（请求用户决策/输入）、连续两轮回复完全一致（空转）、
+/// 目标自动推进判定：回合结束后调用。返回 Some((下一回合合成消息, 当前已完成待办数)) 继续跑，None 停止。
+/// 停止条件：AI 回复以 [WAIT] 开头（请求用户决策/输入）、空转（回复与上轮完全相同且待办进度无推进）、
 /// 本会话没有 active 目标、或该目标自动推进已达 AUTO_DRIVE_MAX 轮。
-fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> Option<String> {
+/// prev_done：上一轮结束时的已完成待办数；None 表示首轮（无历史对比）。
+fn auto_drive_next(
+    ctx: &Arc<Ctx>,
+    sid: &str,
+    reply: &str,
+    last_reply: &str,
+    prev_done: Option<usize>,
+) -> Option<(String, usize)> {
     // 幻觉防护命中（工具死循环 / 词重复刷屏）：停止自驱，等用户介入
     if reply.contains("[tool-loop-guard]") || reply.contains("[repetition-guard]") {
         return None;
     }
     if reply.trim_start().starts_with("[WAIT]") {
-        return None;
-    }
-    if !last_reply.is_empty() && last_reply == reply {
         return None;
     }
     // 本会话的 active 目标（用户手动建的全局目标 session_id=None 不自动推进）
@@ -379,6 +383,12 @@ fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> 
     drop(todos);
     drop(goals);
     let pending: Vec<&crate::goal::Todo> = all.iter().filter(|t| t.status != "completed").collect();
+    let done = all.len() - pending.len();
+    // 空转判定：回复与上一轮完全相同才算候选空转；但若本目标待办进度比上一轮有推进
+    // （例如模型刚完成一个待办，却复用了同一句确认语），不能判停——真停下来才叫空转丢进度
+    if !last_reply.is_empty() && last_reply == reply && prev_done.map_or(true, |p| p >= done) {
+        return None;
+    }
     // 安全上限：同一目标最多 AUTO_DRIVE_MAX 轮自动推进
     let mut counts = ctx.auto_drive_counts.lock().unwrap();
     let n = counts.entry(gid.clone()).or_insert(0);
@@ -387,7 +397,6 @@ fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> 
         return None;
     }
     drop(counts);
-    let done = all.len() - pending.len();
     let next_step = match pending.first() {
         Some(t) => format!("下一步：「{}」。请执行这一步。", t.content),
         // 待办全部完成：自动将该目标标记为 achieved（计划即达成），并让 AI 收尾总结
@@ -396,10 +405,11 @@ fn auto_drive_next(ctx: &Arc<Ctx>, sid: &str, reply: &str, last_reply: &str) -> 
             "所有待办均已完成，本目标已自动标记为 achieved。请简要总结成果。".to_string()
         }
     };
-    Some(format!(
+    let msg = format!(
         "继续（自动推进）：目标「{title}」尚未完成（待办 {done}/{}）。{next_step}全部完成后调用 plan_update(goal_status=achieved) 将目标标记为 achieved。若必须等用户决策或输入才能继续，回复以 [WAIT] 开头并说明需要什么。",
         all.len()
-    ))
+    );
+    Some((msg, done))
 }
 
 /// 带目标自动推进的对话回合（非流式）：回合成功结束后，本会话存在 active 目标且未完成时
@@ -416,6 +426,7 @@ pub async fn chat_turn_auto(
     let mut msg = user_input.to_string();
     let mut imgs = images;
     let mut last_reply = String::new();
+    let mut prev_done: Option<usize> = None;
     loop {
         let msgs = chat_turn(ctx, session_id, &msg, std::mem::take(&mut imgs)).await?;
         let reply = msgs
@@ -424,8 +435,9 @@ pub async fn chat_turn_auto(
             .find(|m| m.role == "assistant")
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        match auto_drive_next(ctx, session_id, &reply, &last_reply) {
-            Some(next) => {
+        match auto_drive_next(ctx, session_id, &reply, &last_reply, prev_done) {
+            Some((next, done)) => {
+                prev_done = Some(done);
                 last_reply = reply;
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                 msg = next;
@@ -450,6 +462,7 @@ pub async fn chat_turn_stream_auto(
     let mut msg = user_input.to_string();
     let mut imgs = images;
     let mut last_reply = String::new();
+    let mut prev_done: Option<usize> = None;
     loop {
         let msgs = chat_turn_stream(ctx, session_id, &msg, event_name, std::mem::take(&mut imgs)).await?;
         let reply = msgs
@@ -458,8 +471,9 @@ pub async fn chat_turn_stream_auto(
             .find(|m| m.role == "assistant")
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        match auto_drive_next(ctx, session_id, &reply, &last_reply) {
-            Some(next) => {
+        match auto_drive_next(ctx, session_id, &reply, &last_reply, prev_done) {
+            Some((next, done)) => {
+                prev_done = Some(done);
                 last_reply = reply;
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                 msg = next;

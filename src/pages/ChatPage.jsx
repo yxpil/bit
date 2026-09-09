@@ -2128,9 +2128,10 @@ function ThinkPanel({ text, openDefault = false, streaming = false }) {
 // send_file 成功的调用渲染为文件卡片（如同收文件），不出工具卡
 function MessageBubble({ message }) {
   const isUser = message.role === "user";
-  // 后台 shell 自然结束时由宿主注入的说明消息（用户没说话，别渲染成用户的气泡）
+  // 后台 shell 结束时由宿主注入的说明消息（用户没说话，别渲染成用户的气泡）。
+  // 三种结束都带 [后台任务…] 前缀：完成 / 已手动停止 / 超时终止
   const isBgDone =
-    isUser && typeof message.content === "string" && message.content.startsWith("[后台任务完成]");
+    isUser && typeof message.content === "string" && message.content.startsWith("[后台任务");
   const calls = message.tool_calls || [];
   const fileCalls = calls.filter((c) => c.tool === "send_file" && c.ok);
   const toolCalls = calls.filter((c) => !(c.tool === "send_file" && c.ok));

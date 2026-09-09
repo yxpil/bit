@@ -150,11 +150,46 @@ impl Ctx {
             read_json(&data_dir.join("tools.json")).unwrap_or_default();
         let audit: Vec<AuditEntry> = read_json(&data_dir.join("audit.json"))
             .unwrap_or_default();
-        let memories: Vec<Memory> =
+        let mut memories: Vec<Memory> =
             read_json(&data_dir.join("memories.json")).unwrap_or_default();
-        let skills: Vec<Skill> = read_json(&data_dir.join("skills.json")).unwrap_or_default();
-        let goals: Vec<Goal> = read_json(&data_dir.join("goals.json")).unwrap_or_default();
-        let todos: Vec<Todo> = read_json(&data_dir.join("todos.json")).unwrap_or_default();
+        let mut skills: Vec<Skill> = read_json(&data_dir.join("skills.json")).unwrap_or_default();
+        let mut goals: Vec<Goal> = read_json(&data_dir.join("goals.json")).unwrap_or_default();
+        let mut todos: Vec<Todo> = read_json(&data_dir.join("todos.json")).unwrap_or_default();
+        // 一次性迁移：旧 32 位 hex uuid id → 短数字 id（幂等，已是数字则保持）；
+        // todo.goal_id 引用同步重映射。提示词/面板可读性（对比 4dca90f7… → 3）
+        {
+            let mut gmap: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (i, g) in goals.iter_mut().enumerate() {
+                let new = (i + 1).to_string();
+                if g.id != new {
+                    gmap.insert(g.id.clone(), new.clone());
+                    g.id = new;
+                }
+            }
+            for (i, t) in todos.iter_mut().enumerate() {
+                if let Some(gid) = t.goal_id.as_ref() {
+                    if let Some(n) = gmap.get(gid) {
+                        t.goal_id = Some(n.clone());
+                    }
+                }
+                t.id = (i + 1).to_string();
+            }
+            for (i, m) in memories.iter_mut().enumerate() {
+                m.id = (i + 1).to_string();
+            }
+            for (i, s) in skills.iter_mut().enumerate() {
+                s.id = (i + 1).to_string();
+            }
+            for (path, v) in [
+                ("memories.json", serde_json::to_string(&memories).unwrap_or_default()),
+                ("skills.json", serde_json::to_string(&skills).unwrap_or_default()),
+                ("goals.json", serde_json::to_string(&goals).unwrap_or_default()),
+                ("todos.json", serde_json::to_string(&todos).unwrap_or_default()),
+            ] {
+                let _ = fs::write(data_dir.join(path), v);
+            }
+        }
         let sessions = SessionStore::load(&data_dir);
         let mcp: Vec<crate::mcp::McpServer> =
             read_json(&data_dir.join("mcp_servers.json")).unwrap_or_default();
@@ -319,5 +354,27 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> 
 impl Serialize for Ctx {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str("Ctx")
+    }
+}
+
+#[cfg(test)]
+mod read_json_tests {
+    use super::*;
+
+    /// 配置/数据文件缺失 → None（上层 unwrap_or_default 走默认值，不 panic）
+    #[test]
+    fn missing_file_is_none() {
+        assert!(read_json::<serde_json::Value>(std::path::Path::new("/nonexistent/bit-x.json")).is_none());
+    }
+
+    /// 文件损坏（非法 JSON）→ None，同样不 panic
+    #[test]
+    fn malformed_json_is_none() {
+        let dir = std::env::temp_dir().join("bit-readjson-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("broken.json");
+        std::fs::write(&p, "{not valid json").unwrap();
+        assert!(read_json::<serde_json::Value>(&p).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

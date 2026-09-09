@@ -21,14 +21,14 @@ pub struct Skill {
 }
 
 pub fn add_memory(ctx: &Arc<crate::state::Ctx>, content: &str, kind: &str, source: &str) -> Memory {
+    let mut mem = ctx.memories.lock().unwrap();
     let m = Memory {
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: crate::goal::next_short_id(mem.iter().map(|x| &x.id)),
         ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         kind: kind.to_string(),
         content: content.trim().to_string(),
         source: source.to_string(),
     };
-    let mut mem = ctx.memories.lock().unwrap();
     mem.push(m.clone());
     if mem.len() > 500 {
         let drop_n = mem.len() - 500;
@@ -40,14 +40,16 @@ pub fn add_memory(ctx: &Arc<crate::state::Ctx>, content: &str, kind: &str, sourc
 }
 
 pub fn add_skill(ctx: &Arc<crate::state::Ctx>, name: &str, summary: &str, source: &str) -> Skill {
+    // 单次加锁内完成 id 分配 + 去重 + 插入：Mutex 不可重入，绝不在同线程二次 lock
+    // （旧实现对 skills 连续 lock 两次 → 永久死锁，Autopilot 技能提炼 / skill save 直接卡死）
+    let mut skills = ctx.skills.lock().unwrap();
     let s = Skill {
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: crate::goal::next_short_id(skills.iter().map(|x| &x.id)),
         ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         name: name.trim().to_string(),
         summary: summary.trim().to_string(),
         source: source.to_string(),
     };
-    let mut skills = ctx.skills.lock().unwrap();
     // 同名技能去重：新总结覆盖旧的
     skills.retain(|x| !x.name.eq_ignore_ascii_case(&s.name));
     skills.push(s.clone());
@@ -102,8 +104,9 @@ pub fn compress_memories(ctx: &Arc<crate::state::Ctx>, raw_ids: &[String], summa
     let before = mem.len();
     mem.retain(|m| !raw_ids.contains(&m.id));
     let removed = before - mem.len();
+    let new_id = crate::goal::next_short_id(mem.iter().map(|x| &x.id));
     mem.push(Memory {
-        id: uuid::Uuid::new_v4().simple().to_string(),
+        id: new_id,
         ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         kind: "summary".into(),
         content: summary.trim().to_string(),
