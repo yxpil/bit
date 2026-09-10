@@ -82,6 +82,22 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             }),
             "write_file",
         ),
+        // 2.5 read_file：分块读取（防上下文爆炸）
+        mk(
+            "builtin.read_file",
+            "read_file",
+            "Read a text file in chunks. Returns numbered lines; use offset/limit for paging. Read the relevant chunk before editing",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path of the file to read" },
+                    "offset": { "type": "integer", "description": "1-based start line (default 1)" },
+                    "limit": { "type": "integer", "description": "Max lines to return (default 200, max 2000)" }
+                },
+                "required": ["path"]
+            }),
+            "read_file",
+        ),
         // 3. 制定计划（目标 + 待办清单）
         mk(
             "builtin.plan",
@@ -154,16 +170,18 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         mk(
             "builtin.edit",
             "edit",
-            "Patch a file in place: replace an exact old_string with new_string (no full rewrite)",
+            "Edit a file. Two modes: (a) exact replace via old_string/new_string; (b) replace lines start_line..end_line (1-based, from read_file output) with new_string",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Absolute path of the target file" },
-                    "old_string": { "type": "string", "description": "Exact original text to replace (must match uniquely)" },
-                    "new_string": { "type": "string", "description": "Replacement text" },
-                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false)" }
+                    "old_string": { "type": "string", "description": "Exact original text to replace (must match uniquely); omit in line-range mode" },
+                    "new_string": { "type": "string", "description": "Replacement text (multi-line allowed)" },
+                    "start_line": { "type": "integer", "description": "Line-range mode: first line to replace" },
+                    "end_line": { "type": "integer", "description": "Line-range mode: last line to replace (inclusive)" },
+                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default false, old_string mode only)" }
                 },
-                "required": ["path", "old_string", "new_string"]
+                "required": ["path"]
             }),
             "edit",
         ),
@@ -178,7 +196,7 @@ pub fn builtin_tools() -> Vec<ToolDef> {
                     "name": { "type": "string", "description": "New tool name (unique)" },
                     "description": { "type": "string", "description": "What the tool does" },
                     "runtime": { "type": "string", "description": "Interpreter id (see the available runtimes list)" },
-                    "code": { "type": "string", "description": "Code in that language: read the params JSON from stdin and print the result JSON to stdout" }
+                    "code": { "type": "string", "description": "Code in that language: read the params JSON from stdin and print the result JSON to stdout. To show the user a picture, include an \"image\" field: a local file path, \"b64:<base64>\", or a data:URL" }
                 },
                 "required": ["name", "runtime", "code"]
             }),
@@ -288,93 +306,64 @@ pub fn builtin_tools() -> Vec<ToolDef> {
             "view_image",
         ),
         // 7.6-7.8 screen / mouse / keyboard：本机操控三件套（实验性功能）。
-        // 背景：最初为 macOS 实现（screencapture / osascript / CoreGraphics / System Events）。
-        // 现状与决策：
-        //   1) macOS 整体不注册不启用（TCC 授权体验差，用户决定 macOS 屏蔽）；
-        //   2) Windows/Linux 构建仍保留入口作为「实验性」预留，默认关闭（config 闸门三者恒默认
-        //      false，设置里可尝试开启）。⚠️ 平台后端尚未落地：实际调用会返回明确的
-        //      “实验性功能、平台实现未就绪”错误，不会执行任何本机操控、也不会误报成功。
-        //   3) 历史遗留的注册项会在启动加载时按出厂清单自动移除。
-        #[cfg(not(target_os = "macos"))]
+        // 跨平台实现见 desktop_ctl.rs（Windows SendInput+DXGI / macOS CG+TCC / Linux X11）。
+        // 注册进内置清单，但对模型可见性由 config.tool_gate 控制（设置页开关，默认关——
+        // 关闭时不下发 schema 省 token，调用也会被直接拒绝）
         mk(
             "builtin.screen",
             "screen",
-            "(Experimental) Capture the screen or a region to a PNG for view_image. Platform backend not shipped yet for Windows/Linux — keep OFF in Settings; calling it returns an explicit error.",
+            "Capture the screen (full or a region) and show the screenshot to yourself via view_image. Use display index for multi-monitor",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "x": { "type": "number", "description": "Region left (optional; all four fields required to capture a region)" },
-                    "y": { "type": "number", "description": "Region top (optional)" },
-                    "width": { "type": "number", "description": "Region width (optional)" },
-                    "height": { "type": "number", "description": "Region height (optional)" }
+                    "display": { "type": "integer", "description": "Monitor index, 0 = primary (default 0)" },
+                    "x": { "type": "integer", "description": "Region crop: left (physical px, optional)" },
+                    "y": { "type": "integer", "description": "Region crop: top (optional)" },
+                    "width": { "type": "integer", "description": "Region crop: width (optional)" },
+                    "height": { "type": "integer", "description": "Region crop: height (optional)" }
                 }
             }),
             "screen",
         ),
-        #[cfg(not(target_os = "macos"))]
         mk(
             "builtin.mouse",
             "mouse",
-            "(Experimental) Read/control the mouse. Platform backend not shipped yet for Windows/Linux — keep OFF in Settings; calling it returns an explicit error. Actions: position / move / click / double_click / right_click (x,y) / drag (x,y→x2,y2) / scroll (dx,dy)",
+            "Control the mouse: position / move / click / double_click / right_click / drag / scroll. Coordinates are physical screen pixels (top-left origin)",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["position", "move", "click", "double_click", "right_click", "drag", "scroll"], "description": "What to do" },
-                    "x": { "type": "number", "description": "Cursor X in screen coordinates (origin top-left)" },
-                    "y": { "type": "number", "description": "Cursor Y in screen coordinates" },
-                    "x2": { "type": "number", "description": "Drag target X (drag only)" },
-                    "y2": { "type": "number", "description": "Drag target Y (drag only)" },
-                    "dx": { "type": "number", "description": "Horizontal scroll pixels (scroll only)" },
-                    "dy": { "type": "number", "description": "Vertical scroll pixels (scroll only)" }
+                    "action": { "type": "string", "enum": ["position", "move", "click", "double_click", "right_click", "drag", "scroll"] },
+                    "x": { "type": "integer", "description": "Target x (move/click/drag)" },
+                    "y": { "type": "integer", "description": "Target y (move/click/drag)" },
+                    "x2": { "type": "integer", "description": "drag: destination x" },
+                    "y2": { "type": "integer", "description": "drag: destination y" },
+                    "dx": { "type": "integer", "description": "scroll: horizontal pixels" },
+                    "dy": { "type": "integer", "description": "scroll: vertical pixels (positive = scroll up)" }
                 },
                 "required": ["action"]
             }),
             "mouse",
         ),
-        // 7.8 keyboard：键盘输入（实验性；同上——Windows/Linux 后端未就绪，默认关闭）
-        #[cfg(not(target_os = "macos"))]
         mk(
             "builtin.keyboard",
             "keyboard",
-            "(Experimental) Type text or press keys. Platform backend not shipped yet for Windows/Linux — keep OFF in Settings; calling it returns an explicit error. Actions: type (text), key (named key or single char, optional modifiers)",
+            "Type text (Unicode, into the currently focused window) or press a key combo. type: full text; key: single key + optional cmd/ctrl/shift/option modifiers",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["type", "key"], "description": "What to do" },
-                    "text": { "type": "string", "description": "Text to type (type only)" },
-                    "key": { "type": "string", "description": "Named key (return/tab/space/delete/escape/home/end/pageup/pagedown/left/right/up/down/f1-f12) or a single character (key only)" },
-                    "cmd": { "type": "boolean", "description": "Hold ⌘ (key only)" },
-                    "shift": { "type": "boolean", "description": "Hold ⇧ (key only)" },
-                    "option": { "type": "boolean", "description": "Hold ⌥ (key only)" },
-                    "ctrl": { "type": "boolean", "description": "Hold ⌃ (key only)" }
+                    "action": { "type": "string", "enum": ["type", "key"] },
+                    "text": { "type": "string", "description": "type: full text to type" },
+                    "key": { "type": "string", "description": "key: single char or named key (return/tab/space/delete/escape/home/end/pageup/pagedown/left/right/up/down/f1-f12)" },
+                    "cmd": { "type": "boolean", "description": "hold Cmd/Meta (Win key)" },
+                    "ctrl": { "type": "boolean", "description": "hold Ctrl" },
+                    "shift": { "type": "boolean", "description": "hold Shift" },
+                    "option": { "type": "boolean", "description": "hold Alt/Option" }
                 },
                 "required": ["action"]
             }),
             "keyboard",
         ),
     ]
-}
-
-/// 把 screen / mouse / keyboard 三个操控工具的 enabled 同步为设置页闸门状态。
-/// 启动时与闸门变更时调用：闸门关 = 工具页显示关闭 + 不下发模型 + 调用拒绝，三层一致。
-/// 仅 Windows/Linux 有这三个工具（macOS 已整体移除，无需也不应触碰 tools 列表）
-#[cfg(not(target_os = "macos"))]
-pub fn sync_gate_enabled(ctx: &Arc<crate::state::Ctx>) {
-    // 锁序纪律 + 单次加锁：config 快照克隆后立即释放，tools 只在一次锁内完成「改 + 序列化」，
-    // 不在持锁期间写盘、也不对同一 Mutex 二次加锁（std Mutex 不可重入，二次 lock 即死锁）
-    let cfg = ctx.config.lock().unwrap().clone();
-    let json = {
-        let mut tools = ctx.tools.lock().unwrap();
-        for t in tools.iter_mut() {
-            match t.name.as_str() {
-                "screen" | "mouse" | "keyboard" => t.enabled = cfg.tool_gate(&t.name),
-                _ => {}
-            }
-        }
-        serde_json::to_string(&*tools).unwrap_or_default()
-    };
-    // 落盘失败静默（下次启动会再同步），不让存储问题拖垮启动
-    let _ = std::fs::write(ctx.data_dir.join("tools.json"), json);
 }
 
 /// 注册新工具。name 唯一；Remote 需要回调 URL。
@@ -564,7 +553,7 @@ fn emit_subagent(
             obj.insert(k.clone(), v.clone());
         }
     }
-    let _ = ctx.app.emit("subagent-lifecycle", payload);
+    crate::worker::emit_ui(&ctx.app, "subagent-lifecycle", payload);
 }
 
 /// 停止一个在跑的子代理：对子会话的中断标志置位，其 agent 回合在下一个检查点停止。
@@ -657,17 +646,26 @@ pub async fn invoke(
             }
         }
         ToolKind::Interpreter { runtime, code } => {
-            // 通过本机解释器（node/python/…）执行，限时 30 秒
+            // 通过本机解释器（node/python/…）执行。
+            // 超时取 config.tool_timeout_secs（默认 120，上限 600）：鼠标/屏幕类自定义工具
+            // 常含循环监听，旧的 30 秒硬上限会把它们误杀
+            let timeout_secs = ctx.config.lock().unwrap().tool_timeout_secs.clamp(1, 600) as u64;
             let ctx_cloned = ctx.clone();
             let runtime = runtime.clone();
             let code = code.clone();
             let params_owned = params.clone();
             let handle = tauri::async_runtime::spawn_blocking(move || {
-                crate::script_runtime::run(&ctx_cloned, &runtime, &code, &params_owned)
+                crate::script_runtime::run(
+                    &ctx_cloned,
+                    &runtime,
+                    &code,
+                    &params_owned,
+                    std::time::Duration::from_secs(timeout_secs),
+                )
             });
-            match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs + 5), handle).await {
                 Ok(res) => res.map_err(|e| format!("Script task failed: {e}"))?,
-                Err(_) => Err("Script execution timed out (30s)".into()),
+                Err(_) => Err(format!("Script execution timed out ({timeout_secs}s)")),
             }
         }
     };
@@ -720,19 +718,6 @@ pub fn no_window_tokio(cmd: &mut tokio::process::Command) {
 #[cfg(not(windows))]
 pub fn no_window_tokio(_cmd: &mut tokio::process::Command) {}
 
-/// 辅助功能权限检测（macOS）：未授权时 CGEventPost 会静默丢弃（不报错但事件不生效），
-/// 必须显式检测并给用户明确指引，否则模型会以为操作成功。
-/// 进程内 FFI 检测（归属 BIT 本体），不再借道 osascript（TCC 会误判成 osascript 的授权状态）
-/// 仅 Windows/Linux 的操控工具在调用前探测（macOS 上这些工具已不注册）
-#[cfg(not(target_os = "macos"))]
-fn ax_trusted() -> bool {
-    crate::perms::ax_trusted()
-}
-
-#[cfg(not(target_os = "macos"))]
-const AX_DENIED_MSG: &str =
-    "辅助功能权限未授予：打开 系统设置 → 隐私与安全性 → 辅助功能，勾选 BIT 后重试（授权后无需重启）";
-
 /// 五个出厂内置工具的真实实现
 async fn builtin_invoke(
     ctx: &Arc<crate::state::Ctx>,
@@ -764,6 +749,46 @@ async fn builtin_invoke(
             }
             std::fs::write(path, content).map_err(|e| format!("Failed to write: {e}"))?;
             Ok(serde_json::json!({ "path": path, "bytes": content.len() }))
+        }
+        // ── 2.2 read_file：分块读取 + 行号（模型可直接按行号 edit）──
+        "read_file" => {
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
+            let raw = std::fs::read(path).map_err(|e| format!("Failed to read: {e}"))?;
+            // 二进制守卫：头部 8KB 含 NUL 即拒绝（不把乱码灌进上下文）
+            let head = &raw[..raw.len().min(8192)];
+            if head.contains(&0) {
+                return Err(format!(
+                    "`{path}` looks like a binary file (NUL byte found); use view_image for pictures or shell commands for other binary data"
+                ));
+            }
+            let text = String::from_utf8_lossy(&raw);
+            let lines: Vec<&str> = text.lines().collect();
+            let total = lines.len();
+            let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+            let limit = params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200)
+                .clamp(1, 2000) as usize;
+            let start = (offset - 1).min(total);
+            let end = (start + limit).min(total);
+            // 行号右对齐到总行数宽度：edit 的 start_line/end_line 直接引用这里的行号
+            let width = total.to_string().len();
+            let mut body = String::new();
+            for (i, line) in lines[start..end].iter().enumerate() {
+                let n = start + i + 1;
+                body.push_str(&format!("{:>width$}\u{2192}{}\n", n, line, width = width));
+            }
+            let truncated = end < total;
+            Ok(serde_json::json!({
+                "path": path,
+                "total_lines": total,
+                "offset": start + 1,
+                "returned": end - start,
+                "truncated": truncated,
+                "next_offset": truncated.then_some(end + 1),
+                "content": body,
+            }))
         }
         // ── 2.5 发送文件给用户 ──
         "send_file" => {
@@ -832,269 +857,63 @@ async fn builtin_invoke(
                 "data_url": format!("data:{mime};base64,{b64}"),
             }))
         }
-        // ── 2.7 screen：截屏（macOS，screencapture），返回路径供 view_image 查看 ──
-        #[cfg(not(target_os = "macos"))]
+        // ── 2.7 screen：截屏（desktop_ctl 跨平台实现；截图自动显示给用户并落盘）──
         "screen" => {
-            if !cfg!(target_os = "macos") {
-                return Err("screen：本机操控为实验性功能，Windows/Linux 实现尚未提供（设置中默认关闭，请保持关闭）".into());
-            }
             if !ctx.config.lock().unwrap().tool_gate("screen") {
-                return Err("screen 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开并完成屏幕录制授权".into());
+                return Err("screen 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开（macOS 首次使用还需在 系统设置 → 隐私与安全性 → 屏幕录制 中授权）".into());
             }
-            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S%3f");
-            let path = format!("/tmp/bit-screen-{ts}.png");
-            let mut cmd = tokio::process::Command::new("screencapture");
-            cmd.arg("-x").arg("-t").arg("png");
-            let (x, y, w, h) = (
-                params.get("x").and_then(|v| v.as_f64()),
-                params.get("y").and_then(|v| v.as_f64()),
-                params.get("width").and_then(|v| v.as_f64()),
-                params.get("height").and_then(|v| v.as_f64()),
-            );
-            if let (Some(x), Some(y), Some(w), Some(h)) = (x, y, w, h) {
-                cmd.arg(format!("-R{x},{y},{w},{h}"));
-            }
-            cmd.arg(&path);
-            let out = cmd
-                .output()
+            let display = params.get("display").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let region = match (
+                params.get("x").and_then(|v| v.as_u64()),
+                params.get("y").and_then(|v| v.as_u64()),
+                params.get("width").and_then(|v| v.as_u64()),
+                params.get("height").and_then(|v| v.as_u64()),
+            ) {
+                (Some(x), Some(y), Some(w), Some(h)) => Some((x as u32, y as u32, w as u32, h as u32)),
+                _ => None,
+            };
+            let ctx2 = ctx.clone();
+            let path = tokio::task::spawn_blocking(move || crate::desktop_ctl::screenshot(&ctx2, display, region))
                 .await
-                .map_err(|e| format!("Failed to run screencapture: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "screencapture failed: {} (首次使用需在 系统设置 → 隐私与安全性 → 屏幕录制 中授权 BIT)",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
+                .map_err(|e| format!("截屏任务失败: {e}"))??;
+            // image 字段 → 对话 UI 自动出图（extract_tool_image 统一路径）；模型用 view_image 看图
             Ok(serde_json::json!({
                 "path": path,
-                "note": "Screenshot saved. Now call view_image with this path to see the screen.",
+                "image": path,
+                "note": "Screenshot captured and shown to the user. Call view_image with this path to see it yourself.",
             }))
         }
-        // ── 2.8 mouse：查看/操作鼠标（macOS，osascript JXA + CoreGraphics）──
-        #[cfg(not(target_os = "macos"))]
+        // ── 2.8 mouse：查看/操作鼠标（desktop_ctl 跨平台实现）──
         "mouse" => {
-            if !cfg!(target_os = "macos") {
-                return Err("mouse：本机操控为实验性功能，Windows/Linux 实现尚未提供（设置中默认关闭，请保持关闭）".into());
-            }
             if !ctx.config.lock().unwrap().tool_gate("mouse") {
-                return Err("mouse 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开并完成辅助功能授权".into());
+                return Err("mouse 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开（macOS 首次使用还需在 系统设置 → 隐私与安全性 → 辅助功能 中授权）".into());
             }
             let action = params
                 .get("action")
                 .and_then(|v| v.as_str())
-                .ok_or("Missing parameter: action")?;
-            // 未授权时 CGEventPost 静默丢弃——先检测，给出可操作的指引
-            if action != "position" && !ax_trusted() {
-                return Err(AX_DENIED_MSG.into());
-            }
-            let xy = |k1: &str, k2: &str| -> Result<(f64, f64), String> {
-                let x = params
-                    .get(k1)
-                    .and_then(|v| v.as_f64())
-                    .ok_or(format!("Missing parameter: {k1}"))?;
-                let y = params
-                    .get(k2)
-                    .and_then(|v| v.as_f64())
-                    .ok_or(format!("Missing parameter: {k2}"))?;
-                Ok((x, y))
-            };
-            let script = match action {
-                "position" => {
-                    r#"ObjC.import('CoreGraphics'); const p=$.CGEventGetLocation($.CGEventCreate($())); JSON.stringify({x:p.x, y:p.y})"#.to_string()
-                }
-                "move" => {
-                    let (x, y) = xy("x", "y")?;
-                    format!(
-                        r#"ObjC.import('CoreGraphics'); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventMouseMoved, $.CGPointMake({x},{y}), $.kCGMouseButtonLeft)); 'moved'"#
-                    )
-                }
-                "click" | "double_click" | "right_click" => {
-                    let (x, y) = xy("x", "y")?;
-                    let pairs = if action == "double_click" { 2 } else { 1 };
-                    let (down, up, btn) = if action == "right_click" {
-                        (
-                            "$.kCGEventRightMouseDown",
-                            "$.kCGEventRightMouseUp",
-                            "$.kCGMouseButtonRight",
-                        )
-                    } else {
-                        (
-                            "$.kCGEventLeftMouseDown",
-                            "$.kCGEventLeftMouseUp",
-                            "$.kCGMouseButtonLeft",
-                        )
-                    };
-                    let mut s = format!(
-                        r#"ObjC.import('CoreGraphics'); const p=$.CGPointMake({x},{y}); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventMouseMoved, p, {btn}));"#
-                    );
-                    for _ in 0..pairs {
-                        s.push_str(&format!(
-                            r#" $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), {down}, p, {btn})); $.NSThread.sleepForTimeInterval(0.03); $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), {up}, p, {btn})); $.NSThread.sleepForTimeInterval(0.06);"#
-                        ));
-                    }
-                    s.push_str(" 'clicked'");
-                    s
-                }
-                "drag" => {
-                    let (x, y) = xy("x", "y")?;
-                    let (tx, ty) = xy("x2", "y2")?;
-                    format!(
-                        r#"ObjC.import('CoreGraphics');
-                        function mv(px,py){{ $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventLeftMouseDragged, $.CGPointMake(px,py), $.kCGMouseButtonLeft)); }}
-                        $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventMouseMoved, $.CGPointMake({x},{y}), $.kCGMouseButtonLeft));
-                        $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventLeftMouseDown, $.CGPointMake({x},{y}), $.kCGMouseButtonLeft));
-                        for (let i=1;i<=12;i++){{ mv({x}+({tx}-{x})*i/12, {y}+({ty}-{y})*i/12); $.NSThread.sleepForTimeInterval(0.02); }}
-                        $.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent($(), $.kCGEventLeftMouseUp, $.CGPointMake({tx},{ty}), $.kCGMouseButtonLeft));
-                        'dragged'"#
-                    )
-                }
-                "scroll" => {
-                    let dx = params.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
-                    let dy = params.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
-                    if dx == 0 && dy == 0 {
-                        return Err("scroll needs a non-zero dx or dy".into());
-                    }
-                    format!(
-                        r#"ObjC.import('CoreGraphics'); const e=$.CGEventCreateScrollWheelEvent($(), $.kCGScrollEventUnitPixel, 1, {dy}); if ({dx} !== 0) {{ $.CGEventSetIntegerValueField(e, $.kCGScrollWheelEventDeltaAxis2, {dx}); }} $.CGEventPost($.kCGHIDEventTap, e); 'scrolled'"#
-                    )
-                }
-                other => {
-                    return Err(format!(
-                        "Unknown action '{other}'; available: position, move, click, double_click, right_click, drag, scroll"
-                    ))
-                }
-            };
-            let out = tokio::process::Command::new("osascript")
-                .args(["-l", "JavaScript", "-e", &script])
-                .output()
+                .ok_or("Missing parameter: action")?
+                .to_string();
+            let p2 = params.clone();
+            tokio::task::spawn_blocking(move || crate::desktop_ctl::mouse(&action, &p2))
                 .await
-                .map_err(|e| format!("Failed to run osascript: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "mouse {action} failed: {} (首次使用需在 系统设置 → 隐私与安全性 → 辅助功能 中授权 BIT)",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if action == "position" {
-                // position 返回 {"x":..,"y":..} JSON；解析失败则原样返回
-                return Ok(match serde_json::from_str::<serde_json::Value>(&stdout) {
-                    Ok(v) => v,
-                    Err(_) => serde_json::json!({ "raw": stdout }),
-                });
-            }
-            Ok(serde_json::json!({ "ok": true, "action": action, "result": stdout }))
+                .map_err(|e| format!("鼠标任务失败: {e}"))?
         }
-        // ── 2.9 keyboard：键盘输入（macOS，System Events keystroke / key code）──
-        #[cfg(not(target_os = "macos"))]
+        // ── 2.9 keyboard：键盘输入（desktop_ctl 跨平台实现）──
         "keyboard" => {
-            if !cfg!(target_os = "macos") {
-                return Err("keyboard：本机操控为实验性功能，Windows/Linux 实现尚未提供（设置中默认关闭，请保持关闭）".into());
-            }
             if !ctx.config.lock().unwrap().tool_gate("keyboard") {
-                return Err(
-                    "keyboard 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开并完成辅助功能授权".into(),
-                );
-            }
-            if !ax_trusted() {
-                return Err(AX_DENIED_MSG.into());
+                return Err("keyboard 能力未开启：请在 设置 → AI 行为设置 → 工具权限 打开（macOS 首次使用还需在 系统设置 → 隐私与安全性 → 辅助功能 中授权）".into());
             }
             let action = params
                 .get("action")
                 .and_then(|v| v.as_str())
-                .ok_or("Missing parameter: action")?;
-            let mods = {
-                let mut m: Vec<&str> = Vec::new();
-                if params.get("cmd").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    m.push("command down");
-                }
-                if params.get("shift").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    m.push("shift down");
-                }
-                if params.get("option").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    m.push("option down");
-                }
-                if params.get("ctrl").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    m.push("control down");
-                }
-                if m.is_empty() { String::new() } else { format!(" using {{{}}}", m.join(", ")) }
-            };
-            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-            let script = match action {
-                "type" => {
-                    let text = params
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .ok_or("Missing parameter: text")?;
-                    if text.is_empty() {
-                        return Err("text cannot be empty".into());
-                    }
-                    format!(r#"tell application "System Events" to keystroke "{}""#, esc(text))
-                }
-                "key" => {
-                    let key = params
-                        .get("key")
-                        .and_then(|v| v.as_str())
-                        .ok_or("Missing parameter: key")?;
-                    let named = match key.to_lowercase().as_str() {
-                        "return" | "enter" => Some(36),
-                        "tab" => Some(48),
-                        "space" => Some(49),
-                        "delete" | "backspace" => Some(51),
-                        "forwarddelete" => Some(117),
-                        "escape" | "esc" => Some(53),
-                        "home" => Some(115),
-                        "end" => Some(119),
-                        "pageup" => Some(116),
-                        "pagedown" => Some(121),
-                        "left" => Some(123),
-                        "right" => Some(124),
-                        "down" => Some(125),
-                        "up" => Some(126),
-                        "f1" => Some(122),
-                        "f2" => Some(120),
-                        "f3" => Some(99),
-                        "f4" => Some(118),
-                        "f5" => Some(96),
-                        "f6" => Some(97),
-                        "f7" => Some(98),
-                        "f8" => Some(100),
-                        "f9" => Some(101),
-                        "f10" => Some(109),
-                        "f11" => Some(103),
-                        "f12" => Some(111),
-                        _ => None,
-                    };
-                    match named {
-                        Some(code) => {
-                            format!(r#"tell application "System Events" to key code {code}{mods}"#)
-                        }
-                        None if key.chars().count() == 1 => {
-                            format!(r#"tell application "System Events" to keystroke "{}"{mods}"#, esc(key))
-                        }
-                        None => {
-                            return Err(format!(
-                                "Unknown key '{key}'; use a single character or a named key (return/tab/space/delete/escape/home/end/pageup/pagedown/left/right/up/down/f1-f12)"
-                            ))
-                        }
-                    }
-                }
-                other => return Err(format!("Unknown action '{other}'; available: type, key")),
-            };
-            let out = tokio::process::Command::new("osascript")
-                .arg("-e")
-                .arg(&script)
-                .output()
+                .ok_or("Missing parameter: action")?
+                .to_string();
+            let p2 = params.clone();
+            tokio::task::spawn_blocking(move || crate::desktop_ctl::keyboard(&action, &p2))
                 .await
-                .map_err(|e| format!("Failed to run osascript: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "keyboard {action} failed: {} (需辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能)",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            Ok(serde_json::json!({ "ok": true, "action": action }))
+                .map_err(|e| format!("键盘任务失败: {e}"))?
         }
+
         // ── 3. 制定计划（目标 + 待办）──
         "plan" => {
             let goal = params.get("goal").and_then(|v| v.as_str()).ok_or("Missing parameter: goal")?;
@@ -1161,10 +980,38 @@ async fn builtin_invoke(
             let written = crate::goal::rewrite_todos(ctx, goal_id, &items, actor, session)?;
             Ok(serde_json::json!({ "written": written }))
         }
-        // ── 4. edit：增量补丁 ──
+        // ── 4. edit：增量补丁（old_string 精确匹配 或 start_line/end_line 行范围）──
         "edit" => {
             let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
-            let old = params.get("old_string").and_then(|v| v.as_str()).ok_or("Missing parameter: old_string")?;
+            let new = params.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            // 行范围模式：read_file 返回的行号直接定位替换，适配大文件（old_string 匹配大段文本既费 token 又易失配）
+            if let (Some(sl), Some(el)) = (
+                params.get("start_line").and_then(|v| v.as_u64()),
+                params.get("end_line").and_then(|v| v.as_u64()),
+            ) {
+                let text = std::fs::read_to_string(path).map_err(|e| format!("Failed to read: {e}"))?;
+                let mut lines: Vec<String> = text.lines().map(String::from).collect();
+                let total = lines.len();
+                let (sl, el) = (sl as usize, el as usize);
+                if sl == 0 || el < sl || el > total {
+                    return Err(format!(
+                        "invalid line range {sl}-{el}; file has {total} lines (1-based, from read_file output)"
+                    ));
+                }
+                // new_string 支持多行：拆行后原位替换 [sl..=el]
+                let replacement: Vec<String> = new.lines().map(String::from).collect();
+                lines.splice(sl - 1..el, replacement);
+                let mut updated = lines.join("\n");
+                if text.ends_with('\n') {
+                    updated.push('\n');
+                }
+                std::fs::write(path, &updated).map_err(|e| format!("Failed to write back: {e}"))?;
+                let replaced = el - sl + 1;
+                let res = serde_json::json!({ "path": path, "mode": "line_range", "replaced_lines": replaced, "total_lines": lines.len() });
+                let warn = crate::syntax::check(ctx, path).await;
+                return Ok(crate::syntax::annotate(ctx, session, path, warn, res));
+            }
+            let old = params.get("old_string").and_then(|v| v.as_str()).ok_or("Missing parameter: old_string (or start_line+end_line)")?;
             let new = params.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
             let replace_all = params.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
             if old.is_empty() {
@@ -1267,12 +1114,12 @@ async fn builtin_invoke(
             emit_subagent(ctx, "spawn", &sid, parent.as_deref(), &title, depth, spawn_extra.clone());
             {
                 use tauri::Emitter;
-                let _ = ctx.app.emit("sessions-updated", &sid);
+                let _ = crate::worker::emit_ui(&ctx.app, "sessions-updated", serde_json::json!(sid));
             }
             emit_subagent(ctx, "start", &sid, parent.as_deref(), &title, depth, spawn_extra);
             // 阻塞执行子任务：完整复用 agent 循环（工具、审批、自动续发全部生效）。
             // Box::pin：builtin_invoke → chat_turn → execute_tool_call → builtin_invoke 递归，需手动打断无限大小
-            let mut run = Box::pin(crate::agent::chat_turn(ctx, &sid, &task, Vec::new()));
+            let mut run = Box::pin(crate::engine::chat(ctx, &sid, &task, Vec::new()));
             const SUB_TIMEOUT_SECS: u64 = 15 * 60;
             let sleep = tokio::time::sleep(std::time::Duration::from_secs(SUB_TIMEOUT_SECS));
             // 主会话点「停止」时立刻取消子任务，而不是干等子任务跑完
@@ -1362,7 +1209,7 @@ async fn builtin_invoke(
             );
             {
                 use tauri::Emitter;
-                let _ = ctx.app.emit("sessions-updated", &sid);
+                let _ = crate::worker::emit_ui(&ctx.app, "sessions-updated", serde_json::json!(sid));
             }
             unregister_sub_session(&sid);
             outcome
@@ -1435,7 +1282,7 @@ async fn builtin_invoke(
             if dropped > 0 {
                 crate::session::persist(ctx);
                 use tauri::Emitter;
-                let _ = ctx.app.emit("sessions-updated", &sid);
+                let _ = crate::worker::emit_ui(&ctx.app, "sessions-updated", serde_json::json!(sid));
             }
             Ok(serde_json::json!({ "truncated": true, "dropped": dropped, "kept": kept }))
         }
@@ -1469,7 +1316,7 @@ async fn builtin_invoke(
             };
             crate::session::persist(ctx);
             use tauri::Emitter;
-            let _ = ctx.app.emit("sessions-updated", &sid);
+            let _ = crate::worker::emit_ui(&ctx.app, "sessions-updated", serde_json::json!(sid));
             Ok(serde_json::json!({ "compacted": true, "dropped": dropped, "kept": kept }))
         }
         // ── 6. SKILL：写入 / 搜索技能 ──

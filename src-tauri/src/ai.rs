@@ -77,18 +77,26 @@ pub struct ChatMessage {
     /// 该条 assistant 消息的思考过程（前端折叠展示，模型请求时会被剥离）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// 本地落库时间（前端回看历史时画 QQ 式时间分割线；仅对话页可见，模型请求用不到）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
 }
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        ChatMessage { role: "user".into(), content: content.into(), tool_calls: Vec::new(), thinking: None }
+        ChatMessage { role: "user".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: Some(now_ts()) }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        ChatMessage { role: "assistant".into(), content: content.into(), tool_calls: Vec::new(), thinking: None }
+        ChatMessage { role: "assistant".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: Some(now_ts()) }
     }
     pub fn system(content: impl Into<String>) -> Self {
-        ChatMessage { role: "system".into(), content: content.into(), tool_calls: Vec::new(), thinking: None }
+        ChatMessage { role: "system".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: None }
     }
+}
+
+/// 当前本地时间串（消息时间戳用，"YYYY-MM-DD HH:MM:SS"）
+pub fn now_ts() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// 单次工具调用的可视化记录
@@ -259,11 +267,50 @@ pub fn is_transient_net_error(e: &str) -> bool {
         || e.contains("流读取失败")
 }
 
-/// 流式 token 种类：Text = 正文增量，Think = 思考过程增量（reasoning/thinking）
+/// 流式 token 种类：Text = 正文增量，Think = 思考过程增量（reasoning/thinking），
+/// Image / Video = 模型生成的媒体（payload 为 data:URL；绘画/视频模型或网关返回）
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TokenKind {
     Text,
     Think,
+    Image,
+    Video,
+}
+
+/// 媒体类型深度扫描：递归遍历回复 JSON 的全部字符串，凡是以
+/// data:image/ 或 data:video/ 开头的值都视为模型产出的媒体。
+/// 比"认字段名"包容得多——images / image_url / video / artifacts / 任何网关自定义字段都能接住。
+/// 另识别 b64_json 裸 base64 字段（OpenAI images API 约定，默认 PNG）
+fn extract_media(v: &serde_json::Value, out: &mut Vec<(TokenKind, String)>) {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.starts_with("data:image/") {
+                out.push((TokenKind::Image, s.clone()));
+            } else if s.starts_with("data:video/") {
+                out.push((TokenKind::Video, s.clone()));
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                extract_media(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                // b64_json：裸 base64（无 data: 前缀），OpenAI images API 约定为 PNG
+                if k == "b64_json" {
+                    if let Some(b64) = val.as_str() {
+                        if !b64.is_empty() && !b64.starts_with("data:") {
+                            out.push((TokenKind::Image, format!("data:image/png;base64,{b64}")));
+                        }
+                        continue;
+                    }
+                }
+                extract_media(val, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 流式对话：on_token 回调返回 false 表示调用方要求立即停止（如会话中断）。
@@ -564,6 +611,17 @@ async fn stream_openai<F: FnMut(TokenKind, &str) -> bool>(
                     }
                 }
             }
+            // 模型产出媒体深度扫描（图片/视频，字段名不敏感，包容各种网关格式）
+            for (kind, media) in {
+                let mut m = Vec::new();
+                extract_media(&v, &mut m);
+                m
+            } {
+                if !on_token(kind, &media) {
+                    stopped = true;
+                    return true;
+                }
+            }
             if let Some(delta) = v
                 .pointer("/choices/0/delta/content")
                 .and_then(|x| x.as_str())
@@ -783,6 +841,24 @@ async fn stream_gemini<F: FnMut(TokenKind, &str) -> bool>(
                         if let Some(name) = fc.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
                             let args = fc.get("args").cloned().unwrap_or_else(|| serde_json::json!({}));
                             native_calls.push((name.to_string(), args));
+                        }
+                        continue;
+                    }
+                    // inlineData / inline_data：Gemini 原生媒体输出（绘画/视频/多模态生成模型）
+                    let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
+                    if let Some((mime, b64)) = inline.and_then(|d| {
+                        let m = d
+                            .get("mimeType")
+                            .or_else(|| d.get("mime_type"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("image/png")
+                            .to_string();
+                        d.get("data").and_then(|x| x.as_str()).map(|b| (m, b.to_string()))
+                    }) {
+                        let kind = if mime.starts_with("video/") { TokenKind::Video } else { TokenKind::Image };
+                        if !on_token(kind, &format!("data:{mime};base64,{b64}")) {
+                            stopped = true;
+                            return true;
                         }
                         continue;
                     }
@@ -1264,9 +1340,20 @@ const MEM_STOP_WORDS: &[&str] = &[
 
 /// session：当前会话 —— 目标/待办只注入「本会话创建的」或「全局（无会话归属）」的
 fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, native: bool) -> String {
-    let memories = ctx.memories.lock().unwrap();
     // 记忆主题索引：jieba 分词 → 优先取「多条记忆共现」的词（同词归类到一起），同级从短到长；
     // 每条只注入一行 `about 关键词 [短id]`，全文由 AI 按需用 memory(id) 取回
+    // 锁治理：memories 锁只在快照阶段持有（克隆 id/content 后立即释放），jieba 分词与
+    // 全部锁外执行——禁止持 memories 锁期间再取 config/tools 等其他锁（与 get_overview 的
+    // config→memories 反向锁序形成永久死锁，表现为点击页面卡死）
+    let mem_items: Vec<(String, String)> = {
+        let memories = ctx.memories.lock().unwrap();
+        memories
+            .iter()
+            .rev()
+            .take(20)
+            .map(|m| (m.id.clone(), m.content.clone()))
+            .collect()
+    };
     static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
     let jieba = JIEBA.get_or_init(jieba_rs::Jieba::new);
     let cut = |content: &str| -> Vec<String> {
@@ -1297,8 +1384,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             .map(String::from)
             .collect()
     };
-    let mems: Vec<&crate::memory::Memory> = memories.iter().rev().take(20).collect();
-    let word_lists: Vec<Vec<String>> = mems.iter().map(|m| cut(&m.content)).collect();
+let word_lists: Vec<Vec<String>> = mem_items.iter().map(|(_, content)| cut(content)).collect();
     // 词共现计数：出现在多条记忆里的词 = 天然的归类锚点
     let mut freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for ws in &word_lists {
@@ -1306,10 +1392,10 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             *freq.entry(w.as_str()).or_insert(0) += 1;
         }
     }
-    let mem_lines: Vec<String> = mems
+    let mem_lines: Vec<String> = mem_items
         .iter()
         .zip(&word_lists)
-        .map(|(m, ws)| {
+        .map(|((id, content), ws)| {
             let mut cands: Vec<&String> = ws.iter().collect();
             // 共现词优先（跨记忆归类），同级从短到长（短词更通用）
             cands.sort_by_key(|w| (freq.get(w.as_str()).copied().unwrap_or(1) < 2, w.chars().count()));
@@ -1326,8 +1412,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             }
             // 无有效分词（拼不出主题）：回退首句截断
             if topic.is_empty() {
-                let first: String = m
-                    .content
+                let first: String = content
                     .trim()
                     .chars()
                     .take_while(|c| {
@@ -1338,7 +1423,7 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
                 let t = first.trim();
                 topic = if t.is_empty() { "未命名".to_string() } else { t.to_string() };
             }
-            format!("- about {} [{}]", topic, m.id)
+            format!("- about {} [{}]", topic, id)
         })
         .collect();
     let skills = ctx.skills.lock().unwrap();
@@ -1383,22 +1468,18 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         })
         .collect();
 
-    // 本机可用运行时清单（仅列出「已启用」的，AI 只能用这些真实存在的解释器写代码）
-    let runtime_lines: Vec<String> = ctx
+    // 本机可用运行时清单（仅列出「已启用」的，AI 只能用这些真实存在的解释器写代码）。
+    // 压缩注入：单行列出 id(语言) 与编译型标记，不再逐条注入版本串——版本极少被用到，
+    // 每条一行会白占系统提示词上下文；需要细节时 AI 可用 run_script 实测或询问用户。
+    let runtime_ids: Vec<String> = ctx
         .runtimes
         .lock()
         .unwrap()
         .iter()
         .filter(|r| r.enabled)
-        .map(|r| {
-            let how = match r.mode.as_str() {
-                "compile" => "compiled",
-                "exec" => "executable",
-                _ => "interpreted",
-            };
-            // 版本串有的带编译器横幅（ruby/perl/tclsh），截断防污染
-            let ver: String = r.version.split('\n').next().unwrap_or("").chars().take(30).collect();
-            format!("- {} ({}, {}, {})", r.id, r.lang, how, ver)
+        .map(|r| match r.mode.as_str() {
+            "compile" => format!("{}({},{})", r.id, r.lang, "compiled"),
+            _ => format!("{}({})", r.id, r.lang),
         })
         .collect();
 
@@ -1413,16 +1494,21 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         }
     };
 
-    // 动态运行时信息：只注入非空状态段（空列表不占 token）；Auto-drive 是静态规则，始终保留
+    // 动态运行时信息：只注入非空状态段（空列表不占 token）；Auto-drive 是静态规则，始终保留。
+    // Auto-drive 恒定单行（原 3 行压缩版——压缩前就短，避免 fit_prompt_budget 常态介入）
     let mut runtime_info = String::from(
-        "\n## Auto-drive\n\
-        - When your session has an incomplete active goal, the system auto-sends the next pending todo. Execute it immediately.\n\
-        - Use plan_update to mark goal achieved or update todo statuses when done.\n\
-        - Reply starting with [WAIT] if you truly need user input/decision to continue.",
+        "\n## Auto-drive: execute auto-sent next todo until goal done; use plan_update; reply [WAIT] only if truly blocked",
     );
-    if !runtime_lines.is_empty() {
-        runtime_info.push_str(&format!("\n## Local interpreters\n{}", runtime_lines.join("\n")));
+    if !runtime_ids.is_empty() {
+        runtime_info.push_str(&format!("\n## Local interpreters\n{}", runtime_ids.join(", ")));
     }
+    // 媒体缓存目录：绘画/视频模型产图、SVG 图表的统一落盘位置（路径动态注入）。恒定 2 行
+    runtime_info.push_str(&format!(
+        "\n## Media cache folder\n\
+        - Images/videos/SVG generated or drawn are auto-saved under: {} — use it for intermediate media; to show a picture, output an \"image\" field (path/b64:/data:URL) from tool stdout\n\
+        - Diagrams (ER/architecture/sequence): output SVG directly in the reply — auto-rendered and saved as .svg",
+        ctx.image_dir().display()
+    ));
     if !goal_lines.is_empty() {
         runtime_info.push_str(&format!("\n## Active goals\n{}", goal_lines.join("\n")));
     }
@@ -1436,6 +1522,11 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
     if !skill_lines.is_empty() {
         runtime_info.push_str(&format!("\n## Skills (names)\n{}", skill_lines.join("\n")));
     }
+    // 本地插件（toolhomes/plugins）注入的提示词片段（禁用插件不注入）
+    let plugin_prompts = crate::plugins::prompt_fragment(ctx);
+    if !plugin_prompts.is_empty() {
+        runtime_info.push_str(&plugin_prompts);
+    }
 
     // 操作手册 / skill 示例 / 收尾句：文本约定与原生函数调用两种模式各自一份
     // 提示词默认英文（各模型兼容性最好），但要求模型始终以用户的语言回复
@@ -1447,9 +1538,10 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
             3. Independent calls: one turn, in parallel.\n\
             4. Reply body holds words only — no JSON, no markers.\n\
             5. Results return as tool messages: continue, or fix args and retry.\n\
-            6. Ask only when truly blocked.",
+            6. Ask only when truly blocked; otherwise end with the final answer.",
             "Skills: names only here. Relevant → skill(action=search, query=name) for full content, then follow. action=save writes (same name overwrites).",
-            "When no more tool calls are needed, just output the final answer in natural language.",
+            // 收尾句并入第 6 条，省一段重复
+            "",
         )
     } else {
         (
@@ -1546,10 +1638,10 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         if has("skill") {
             p.push_str("\nskill: action=search for full content before following.");
         }
-        return format!("{custom_prompt}{p}{runtime_info}");
+        return fit_prompt_budget(format!("{custom_prompt}{p}{runtime_info}"));
     }
 
-    format!(
+    fit_prompt_budget(format!(
         "{custom_prompt}\
         {manual}\n\
         \n\
@@ -1561,7 +1653,81 @@ fn system_prompt_mode(ctx: &Arc<crate::state::Ctx>, session: Option<&str>, nativ
         static = static_template,
         runtime_info = runtime_info,
         closing = closing,
-    )
+    ))
+}
+
+/// 系统提示词 token 预算：超出后按优先级渐进压缩，保证最终提示词 ≤ 2K token
+const PROMPT_BUDGET_TOKENS: usize = 2000;
+
+/// 粗略 token 估算：中日韩等非 ASCII 字符 ≈ 1 token/字，ASCII ≈ 4 字符/token。
+/// 对主流 tokenizer（BPE）够用，略偏保守
+fn estimate_tokens(s: &str) -> usize {
+    let units: usize = s.chars().map(|c| if c.is_ascii() { 1 } else { 4 }).sum();
+    units / 4 + 1
+}
+
+/// 定位 "\n## <header>" 起始的段落（到下一个 "\n## " 或文末），返回 (起始, 结束) 字节区间
+fn section_range(prompt: &str, header: &str) -> Option<(usize, usize)> {
+    let start = prompt.find(&format!("\n## {header}"))?;
+    let rest = &prompt[start + 1..];
+    let end = rest.find("\n## ").map(|p| start + 1 + p).unwrap_or(prompt.len());
+    Some((start, end))
+}
+
+/// 把最终系统提示词压进预算（PROMPT_BUDGET_TOKENS）。压缩按优先级渐进：
+/// 1) 媒体缓存段 3 行 → 1 行摘要；2) Memories 只留前 6 条；3) Auto-drive 3 行 → 1 行；
+/// 4) 兜底硬截断（带省略标记）。工具契约/手册/收尾句绝不压缩（功能正确的底线）
+fn fit_prompt_budget(mut prompt: String) -> String {
+    if estimate_tokens(&prompt) <= PROMPT_BUDGET_TOKENS {
+        return prompt;
+    }
+    // 1) 媒体段瘦身
+    if let Some((s, e)) = section_range(&prompt, "Media cache folder") {
+        let path = prompt[s..e]
+            .lines()
+            .find(|l| l.contains("saved under"))
+            .and_then(|l| l.split("under:").nth(1))
+            .map(|p| p.trim().to_string())
+            .unwrap_or_default();
+        prompt.replace_range(
+            s..e,
+            format!("\n## Media folder: {path} — generated images/videos/SVG auto-saved here; show pics via tool stdout \"image\" field").as_str(),
+        );
+    }
+    if estimate_tokens(&prompt) <= PROMPT_BUDGET_TOKENS {
+        return prompt;
+    }
+    // 2) Memories 只留前 6 条
+    if let Some((s, e)) = section_range(&prompt, "Memories") {
+        let kept: Vec<&str> = prompt[s..e].lines().take(7).collect();
+        let mut trimmed = kept.join("\n");
+        trimmed.push_str("\n(older memories trimmed)");
+        prompt.replace_range(s..e, &trimmed);
+    }
+    if estimate_tokens(&prompt) <= PROMPT_BUDGET_TOKENS {
+        return prompt;
+    }
+    // 3) Auto-drive 压成一行
+    if let Some((s, e)) = section_range(&prompt, "Auto-drive") {
+        prompt.replace_range(
+            s..e,
+            "\n## Auto-drive: execute auto-sent next todo until goal done; use plan_update; reply [WAIT] only if truly blocked",
+        );
+    }
+    if estimate_tokens(&prompt) <= PROMPT_BUDGET_TOKENS {
+        return prompt;
+    }
+    // 4) 兜底：按字节硬截断（4 chars≈1 token 的保守换算）
+    let max_chars = PROMPT_BUDGET_TOKENS * 4;
+    if prompt.len() > max_chars {
+        let mut cut = max_chars;
+        while !prompt.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        prompt.truncate(cut);
+        prompt.push_str("\n[...prompt truncated to fit budget...]");
+    }
+    prompt
 }
 
 /// 把 JSON Schema 的 properties 压缩成单行可读字符串（用于文本模式的 Tools at a glance）
@@ -1703,14 +1869,10 @@ You are BIT, a local AI agent on this device (tools run locally; model may be re
 {skill_examples}
 ";
 
+    // Know 段：原生模式下两行全是冗余（schema 精确匹配已被 Tool calls 手册覆盖、
+    // interpreters 段自身可读），整体省去；文本协议模式保留脚本 I/O 契约（无 schema 可依赖）
     let (extension, know) = if native {
-        (
-            // 原生模式：扩展动作已在工具 schema + 名字列表里，不再重复
-            "",
-            "## Know\n\
-             - Only call listed tools; unknown calls return an available list.\n\
-             - Runtime ids: see Local interpreters below.",
-        )
+        ("", "")
     } else {
         (
             "## Extension actions\n\
@@ -1723,7 +1885,13 @@ You are BIT, a local AI agent on this device (tools run locally; model may be re
         )
     };
 
-    let template = format!("{head}{extension}\n\n{know}");
+    // 拼接时跳过空段，避免留下连续空行浪费 token
+    let template = [head, extension, know]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     template.replace("{skill_examples}", skill_examples)
 }
 

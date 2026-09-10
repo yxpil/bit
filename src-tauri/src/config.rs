@@ -58,6 +58,32 @@ pub struct Config {
     /// 幻觉防护：单个回合内工具调用轮次达到该值即强制终止回合（0=不设限）
     #[serde(default = "default_tool_loop_max")]
     pub tool_loop_max: u32,
+    /// 自定义工具（解释器/脚本/Rhai 脚本）单次执行超时秒数：默认 120，上限 600。
+    /// 鼠标/屏幕类自定义工具常含循环监听，30 秒硬上限会把它们误杀
+    #[serde(default = "default_tool_timeout_secs")]
+    pub tool_timeout_secs: u32,
+    /// 默认 shell（agent 后台 shell 与命令执行用）：空 = 自动识别
+    /// （Windows 优先 pwsh 7 → powershell 5.1；Unix 优先 $SHELL → bash）。
+    /// 设置页可从检测到的可用 shell 列表里指定
+    #[serde(default)]
+    pub default_shell: String,
+    /// 禁用的本地插件 id 列表（toolhomes/plugins/<id>）：不在包里存，重扫不丢用户选择
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
+    /// 唤出主界面的全局快捷键（如 "Alt+Shift+B"）：窗口隐藏/最小化时也能系统级唤出；
+    /// 空字符串 = 关闭。格式遵循 tauri-plugin-global-shortcut（Ctrl/Alt/Shift/Super + 键名）
+    #[serde(default = "default_hotkey_show")]
+    pub hotkey_show: String,
+    /// 写入/编辑代码文件后的轻量语法检查（json 解析 / node --check / python ast）：
+    /// 发现语法错误时注入工具结果提醒模型自我修复，并向聊天 UI 发警告。默认开
+    #[serde(default = "default_true")]
+    pub syntax_check: bool,
+    /// 禁用的本地插件 id 列表（toolhomes/plugins/<id>）：不在包里存，重扫不丢用户选择
+    #[serde(default = "default_true")]
+    pub agent_worker_enabled: bool,
+    /// agent worker 卡死判定秒数：回合在飞但超过该时长无任何事件 → 监督循环杀掉重启（0=关闭）
+    #[serde(default = "default_worker_hang_secs")]
+    pub worker_hang_secs: u32,
     /// 用户自定义提示词/人设：追加到 system prompt 开头，空则不追加
     #[serde(default)]
     pub custom_prompt: String,
@@ -139,6 +165,18 @@ fn default_tool_loop_max() -> u32 {
     20
 }
 
+fn default_tool_timeout_secs() -> u32 {
+    120
+}
+
+fn default_worker_hang_secs() -> u32 {
+    600
+}
+
+fn default_hotkey_show() -> String {
+    "Alt+Shift+B".into()
+}
+
 fn default_chat_rpm_max() -> u32 {
     20
 }
@@ -198,8 +236,15 @@ impl Default for Config {
             tool_screen: false,
             tool_mouse: false,
             tool_keyboard: false,
+            agent_worker_enabled: true,
+            worker_hang_secs: default_worker_hang_secs(),
             word_repeat_max: default_word_repeat_max(),
             tool_loop_max: default_tool_loop_max(),
+            tool_timeout_secs: default_tool_timeout_secs(),
+            default_shell: String::new(),
+            disabled_plugins: Vec::new(),
+            hotkey_show: default_hotkey_show(),
+            syntax_check: true,
             custom_prompt: String::new(),
             system_prompt: String::new(),
             cloud_relay_url: None,
@@ -242,6 +287,8 @@ impl Config {
             dir.join("config.json"),
             serde_json::to_string_pretty(self).unwrap(),
         );
+        // agent worker 模式：宿主改配置后通知 worker 重读（worker 进程内调用为空操作）
+        crate::worker::notify_reload();
     }
 
     pub fn new_client_key(&mut self) -> String {
@@ -394,11 +441,8 @@ mod tests {
 impl Config {
     /// 工具权限闸门：screen / mouse / keyboard 需在设置页开启才对模型生效
     /// （关闭 = 不下发 schema/一览 + 调用直接拒绝，省 token 且避免无谓报错）。
-    /// macOS 上直接屏蔽（用户决定：TCC 授权体验太差，仅 Windows/Linux 开放）
+    /// 三平台均可用：Windows SendInput+DXGI / macOS CG+TCC / Linux X11（见 desktop_ctl.rs）
     pub fn tool_gate(&self, name: &str) -> bool {
-        if cfg!(target_os = "macos") {
-            return !matches!(name, "screen" | "mouse" | "keyboard");
-        }
         match name {
             "screen" => self.tool_screen,
             "mouse" => self.tool_mouse,

@@ -1,12 +1,14 @@
 // yxpil · BIT
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 子进程统一执行上限。registry 外层也有 30 秒 tokio 超时，这里负责真正杀掉
+/// 子进程统一执行上限默认值。registry 外层也有同秒数的 tokio 超时，这里负责真正杀掉
 /// 失控进程——tokio 超时只能放弃 JoinHandle，杀不掉已 spawn 的子进程。
-const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
+/// 实际超时由调用方按 config.tool_timeout_secs 传入（默认 120s，设置页可调）
+pub const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
 /// stdout/stderr 采集上限（8MB）：防止失控脚本无限打印把内存吃满
 const OUTPUT_CAP: u64 = 8 << 20;
 
@@ -22,6 +24,7 @@ pub fn run(
     runtime_id: &str,
     code: &str,
     params: &serde_json::Value,
+    timeout: Duration,
 ) -> Result<serde_json::Value, String> {
     let rt = crate::runtime::get(ctx, runtime_id)
         .ok_or_else(|| format!("Runtime `{runtime_id}` is not registered; refresh the runtime detection on the Tools page first"))?;
@@ -30,18 +33,29 @@ pub fn run(
         return Err(format!("Interpreter `{}` is paused; enable it on the Tools page first", rt.name));
     }
 
+    // BIT toolhomes：AI 代码的统一工作目录与环境（venv / NODE_PATH）
+    let home = crate::toolenv::dir(ctx);
+    let _ = std::fs::create_dir_all(&home);
+
     match rt.mode.as_str() {
-        "compile" => run_compiled(&rt, code, params),
-        "exec" => run_exec(&rt, code, params),
-        _ => run_interpreted(&rt, code, params),
+        "compile" => run_compiled(&rt, code, params, timeout, &home),
+        "exec" => run_exec(&rt, code, params, timeout, &home),
+        _ => run_interpreted(ctx, &rt, code, params, timeout, &home),
     }
 }
 
-/// 解释执行：源码写临时文件，交给解释器直接跑
+/// 解释执行：源码写临时文件，交给解释器直接跑。
+/// 环境增强（BIT toolhomes）：
+/// - py：优先用 toolhomes/pyvenv 的解释器（AI pip 装的包都在里面），并设 VIRTUAL_ENV/PATH
+/// - js：NODE_PATH 指向 toolhomes/node_modules（AI npm 装的包可直接 require）
+/// - 所有语言的工作目录都是 toolhomes
 fn run_interpreted(
+    ctx: &Arc<crate::state::Ctx>,
     rt: &crate::runtime::Runtime,
     code: &str,
     params: &serde_json::Value,
+    timeout: Duration,
+    home: &std::path::Path,
 ) -> Result<serde_json::Value, String> {
     let ext = match rt.lang.as_str() {
         "py" => "py",
@@ -61,7 +75,17 @@ fn run_interpreted(
     let tmp = std::env::temp_dir().join(format!("bit_{}.{ext}", uuid::Uuid::new_v4().simple()));
     write_private(&tmp, code).map_err(|e| format!("Failed to write temp script: {e}"))?;
 
-    let mut cmd = Command::new(&rt.path);
+    // py 优先走 venv 解释器（存在时）
+    let mut program = rt.path.clone();
+    let mut venv_root: Option<PathBuf> = None;
+    if rt.lang == "py" {
+        if let Some(vp) = crate::toolenv::venv_python(ctx) {
+            program = vp.to_string_lossy().to_string();
+            venv_root = Some(crate::toolenv::pyvenv_dir(ctx));
+        }
+    }
+
+    let mut cmd = Command::new(&program);
     if rt.id == "deno" {
         cmd.arg("run").arg("--allow-all");
     }
@@ -69,8 +93,24 @@ fn run_interpreted(
         cmd.arg(a);
     }
     cmd.arg(&tmp);
+    cmd.current_dir(home);
+    match &venv_root {
+        Some(vr) => {
+            cmd.env("VIRTUAL_ENV", vr);
+            let bin = if cfg!(windows) { vr.join("Scripts") } else { vr.join("bin") };
+            if let Some(cur) = std::env::var_os("PATH") {
+                let mut paths = std::env::split_paths(&cur).collect::<Vec<_>>();
+                paths.insert(0, bin);
+                cmd.env("PATH", std::env::join_paths(paths).unwrap_or(cur));
+            }
+        }
+        None => {}
+    }
+    if rt.lang == "js" || rt.lang == "ts" {
+        cmd.env("NODE_PATH", home.join("node_modules"));
+    }
 
-    let out = run_with_limit(cmd, Some(params), CHILD_TIMEOUT);
+    let out = run_with_limit(cmd, Some(params), timeout);
     let _ = std::fs::remove_file(&tmp);
     finalize(out)
 }
@@ -80,6 +120,8 @@ fn run_compiled(
     rt: &crate::runtime::Runtime,
     code: &str,
     params: &serde_json::Value,
+    timeout: Duration,
+    home: &std::path::Path,
 ) -> Result<serde_json::Value, String> {
     let work = std::env::temp_dir().join(format!("bit_build_{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&work).map_err(|e| format!("Failed to create temp dir: {e}"))?;
@@ -91,7 +133,7 @@ fn run_compiled(
             write_private(&src, code).map_err(|e| format!("Failed to write source: {e}"))?;
             let mut cmd = Command::new(&rt.path); // java
             cmd.arg(&src);
-            run_with_limit(cmd, Some(params), CHILD_TIMEOUT)
+            run_with_limit(cmd, Some(params), timeout)
         }
         // Rust：rustc 编译成可执行文件后运行
         "rs" => {
@@ -101,10 +143,10 @@ fn run_compiled(
             let mut compile = Command::new(&rt.path); // rustc
             compile.arg(&src).arg("-O").arg("-o").arg(&bin);
             crate::registry::no_window(&mut compile);
-            match run_with_limit(compile, None, CHILD_TIMEOUT) {
+            match run_with_limit(compile, None, timeout) {
                 Ok(o) if o.status.success() => {
                     let cmd = Command::new(&bin);
-                    run_with_limit(cmd, Some(params), CHILD_TIMEOUT)
+                    run_with_limit(cmd, Some(params), timeout)
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr);
@@ -120,7 +162,7 @@ fn run_compiled(
             write_private(&src, code).map_err(|e| format!("Failed to write source: {e}"))?;
             let mut cmd = Command::new(&rt.path); // go
             cmd.arg("run").arg(&src);
-            run_with_limit(cmd, Some(params), CHILD_TIMEOUT)
+            run_with_limit(cmd, Some(params), timeout)
         }
         // C / C++：gcc / g++ 编译成可执行文件后运行
         "c" | "cpp" => {
@@ -135,10 +177,10 @@ fn run_compiled(
                 .arg("-o")
                 .arg(&bin);
             crate::registry::no_window(&mut compile);
-            match run_with_limit(compile, None, CHILD_TIMEOUT) {
+            match run_with_limit(compile, None, timeout) {
                 Ok(o) if o.status.success() => {
                     let cmd = Command::new(&bin);
-                    run_with_limit(cmd, Some(params), CHILD_TIMEOUT)
+                    run_with_limit(cmd, Some(params), timeout)
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr);
@@ -155,10 +197,10 @@ fn run_compiled(
             let mut compile = Command::new(&rt.path); // swiftc
             compile.arg(&src).arg("-o").arg(&bin);
             crate::registry::no_window(&mut compile);
-            match run_with_limit(compile, None, CHILD_TIMEOUT) {
+            match run_with_limit(compile, None, timeout) {
                 Ok(o) if o.status.success() => {
                     let cmd = Command::new(&bin);
-                    run_with_limit(cmd, Some(params), CHILD_TIMEOUT)
+                    run_with_limit(cmd, Some(params), timeout)
                 }
                 Ok(o) => {
                     let err = String::from_utf8_lossy(&o.stderr);
@@ -174,11 +216,14 @@ fn run_compiled(
     finalize(result)
 }
 
-/// 直接调用可执行文件：code 视为空白分隔的命令行参数，params 仍从 stdin 传入
+/// 直接调用可执行文件：code 视为空白分隔的命令行参数，params 仍从 stdin 传入。
+/// 工作目录 = BIT toolhomes。
 fn run_exec(
     rt: &crate::runtime::Runtime,
     code: &str,
     params: &serde_json::Value,
+    timeout: Duration,
+    home: &std::path::Path,
 ) -> Result<serde_json::Value, String> {
     let mut cmd = Command::new(&rt.path);
     for a in &rt.run_args {
@@ -187,7 +232,7 @@ fn run_exec(
     for a in code.split_whitespace() {
         cmd.arg(a);
     }
-    finalize(run_with_limit(cmd, Some(params), CHILD_TIMEOUT))
+    finalize(run_with_limit(cmd, Some(params), timeout))
 }
 
 /// 写入 0600 权限的私有临时文件：脚本源码可能来自 AI，不对同机其他用户可读

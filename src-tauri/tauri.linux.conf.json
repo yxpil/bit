@@ -1,19 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "app": {
-    "windows": [
-      {
-        "title": "BIT",
-        "width": 1120,
-        "height": 740,
-        "minWidth": 920,
-        "minHeight": 620,
-        "center": true,
-        "decorations": false,
-        "transparent": true,
-        "shadow": true,
-        "visible": true
-      }
-    ]
+    "windows": []
   }
 }

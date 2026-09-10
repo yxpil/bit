@@ -116,6 +116,29 @@ pub async fn restart_server(ctx: &Arc<Ctx>) -> Result<String, String> {
 }
 
 pub fn build_router(ctx: Arc<Ctx>) -> Router {
+    // ═════════════════════════════════════════════════════════════════════════
+    // 路由分组总览（全部经下方 auth 中间件；除 /api/health 外均需 Bearer Client Key，
+    // password_enabled=true 时还需 X-Access-Password 双重鉴权）：
+    //
+    // 【正常业务端点】正式远程客户端 / 手机端依赖，改动需保持兼容：
+    //   GET  /api/health            健康检查（免鉴权，仅探活）
+    //   CRUD /api/tools[/...]       自定义工具列表/注册/删除/调用
+    //   /api/subagents, /api/chat   子代理派生、远程对话（模型转发）
+    //   /api/approvals[/...]        审批轮询 / 回答
+    //   /api/context/metrics        上下文用量指标
+    //   /api/audit                  审计流水
+    //   /api/qr                     连接二维码（手机配对）
+    //   /api/update/*               自动更新：检测/状态/手动下载
+    //   /mcp                        MCP 协议端点（POST 初始化/调用，DELETE 注销）
+    //   /v1/models, /v1/chat/completions   OpenAI 兼容端点（第三方客户端直连，Key=Client Key）
+    //
+    // 【测试/调试端点】仅供 E2E 测试脚本、ADB 调试桥、故障诊断使用——
+    //   改动语义不影响正式客户端，但删除前需同步更新测试（docs/调试总结/ 有用例）：
+    //   /api/debug/state|sessions|goals|mcp|system_prompt   只读快照（诊断）
+    //   POST /api/debug/interrupt                           中断当前对话轮（测试熔断）
+    //   POST /api/debug/config                              运行时调参（E2E 熔断用例）
+    //   POST /api/debug/quit                                触发真实退出链（E2E 验证"退出必生效+守护不误拉"）
+    // ═════════════════════════════════════════════════════════════════════════
     Router::new()
         .route("/api/health", get(health))
         .route("/api/tools", get(list_tools).post(register_tool))
@@ -141,6 +164,7 @@ pub fn build_router(ctx: Arc<Ctx>) -> Router {
         .route("/api/debug/mcp", get(debug_mcp))
         .route("/api/debug/interrupt", post(debug_interrupt))
         .route("/api/debug/config", post(debug_config))
+        .route("/api/debug/quit", post(debug_quit))
         .route("/api/debug/system_prompt", get(debug_system_prompt))
         .route("/mcp", post(mcp_endpoint).delete(mcp_delete))
         // OpenAI 兼容端点：第三方 OpenAI 格式客户端可直接接入（API Key 填 Client Key）
@@ -812,6 +836,17 @@ async fn remove_tool(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Res
 
 /// GET /api/approvals：列出待审批的工具调用（远程客户端轮询用；本地 UI 走 tool-approval 事件）
 async fn list_approvals(State(ctx): State<Arc<Ctx>>) -> Response {
+    // worker 活着时审批表在子进程里：转发查询
+    if crate::worker::active() && !crate::worker::IN_WORKER.load(std::sync::atomic::Ordering::Relaxed) {
+        return match crate::worker::proxy_list_approvals().await {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": format!("agent worker 不可用: {e}") })),
+            )
+                .into_response(),
+        };
+    }
     let map = ctx.approvals.lock().unwrap();
     let mut items: Vec<_> = map
         .iter()
@@ -853,15 +888,11 @@ async fn answer_approval(
                 .into_response()
         }
     };
-    let sender = ctx.approvals.lock().unwrap().remove(&id).map(|p| p.tx);
-    match sender {
-        Some(tx) => {
-            let _ = tx.send(allow);
-            Json(json!({ "id": id, "allow": allow })).into_response()
-        }
-        None => (
+    match crate::engine::approve(&ctx, &id, allow).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Approval request not found or already answered" })),
+            Json(json!({ "error": e })),
         )
             .into_response(),
     }
@@ -1159,6 +1190,22 @@ async fn debug_system_prompt(
         crate::ai::system_prompt(&ctx, Some(sid.trim()))
     };
     Json(json!({ "system_prompt": prompt })).into_response()
+}
+
+/// POST /api/debug/quit：触发真实退出链路（审计 → 守护进程 expect_exit → 换装 → exit），
+/// 与托盘退出 / quit_app 完全同链路；E2E 验证「退出必生效 + 守护进程不误拉」用
+async fn debug_quit(State(ctx): State<Arc<Ctx>>) -> Response {
+    crate::audit::record(&ctx, "remote", "app.quit", "BIT", json!({ "via": "debug_api" }), true);
+    crate::guardian::expect_exit(&ctx);
+    // 硬退出兜底（与托盘退出一致）：事件循环消费 exit(0) 失败时强制退出
+    let hard_ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = crate::update::apply_update(&hard_ctx, false);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::process::exit(0);
+    });
+    ctx.app.exit(0);
+    Json(json!({ "quitting": true })).into_response()
 }
 
 /// POST /api/debug/config：运行时调整幻觉防护阈值 / 对话限速 / 审批模式（E2E 熔断用例 / 调试桥），仅接受列出的键，同步落盘
@@ -1492,7 +1539,7 @@ async fn remote_chat(
     // 远程指定的会话不存在时自动创建（外部客户端可直接开启新会话）
     ctx.sessions.lock().unwrap().get_or_create_mut(&session_id);
 
-    match crate::agent::chat_turn_auto(&ctx, &session_id, &message, images).await {
+    match crate::engine::chat_auto(&ctx, &session_id, &message, images).await {
         Ok(messages) => {
             let last = messages
                 .iter()
@@ -1693,6 +1740,10 @@ async fn openai_chat_completions(
                 match kind {
                     crate::ai::TokenKind::Think => send_chunk(json!({ "reasoning_content": tok }), None),
                     crate::ai::TokenKind::Text => send_chunk(json!({ "content": tok }), None),
+                    // 绘画模型图片输出：以 markdown data URL 形式随 content 下发（远程客户端按内容渲染）
+                    crate::ai::TokenKind::Image => send_chunk(json!({ "content": format!("![image]({tok})") }), None),
+                    // 视频输出：同样以 markdown 链接下发（远程客户端自行处理播放）
+                    crate::ai::TokenKind::Video => send_chunk(json!({ "content": format!("\n[video]({tok})\n") }), None),
                 }
                 true
             })

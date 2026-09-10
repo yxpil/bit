@@ -67,7 +67,13 @@ pub fn mem_usage() -> u64 {
 #[tauri::command]
 pub fn get_overview(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
-    let cfg = ctx.config.lock().unwrap();
+    // 锁治理：config 锁只用于读取自身字段，立即释放后再取其他锁；
+    // 禁止持 config 锁期间再抢 memories/tools 等（与 system_prompt_mode 的
+    // memories→config 反向锁序形成永久死锁，表现为点击页面卡死）
+    let (remote_enabled, addr) = {
+        let cfg = ctx.config.lock().unwrap();
+        (cfg.remote_enabled, cfg.listen_addr())
+    };
     json!({
         "tool_count": ctx.tools.lock().unwrap().len(),
         "memory_count": ctx.memories.lock().unwrap().len(),
@@ -76,8 +82,8 @@ pub fn get_overview(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
         "todo_count": ctx.todos.lock().unwrap().iter().filter(|t| t.status != "completed").count(),
         "audit_count": ctx.audit.lock().unwrap().len(),
         "remote": {
-            "enabled": cfg.remote_enabled,
-            "addr": cfg.listen_addr(),
+            "enabled": remote_enabled,
+            "addr": addr,
         },
         "ai_configured": ctx.ai_config.lock().unwrap().is_configured(),
         "autopilot_running": ctx.autopilot_running.load(Ordering::SeqCst),
@@ -244,12 +250,14 @@ pub async fn run_script(
     let runtime2 = runtime.clone();
     let code2 = code.clone();
     let ctx2 = ctx.clone();
+    // 超时取 config.tool_timeout_secs（默认 120，上限 600），与自定义工具一致
+    let timeout_secs = ctx.config.lock().unwrap().tool_timeout_secs.clamp(1, 600) as u64;
     let handle = tauri::async_runtime::spawn_blocking(move || {
-        crate::script_runtime::run(&ctx2, &runtime2, &code2, &params)
+        crate::script_runtime::run(&ctx2, &runtime2, &code2, &params, std::time::Duration::from_secs(timeout_secs))
     });
-    let result = match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs + 5), handle).await {
         Ok(res) => res.map_err(|e| format!("脚本任务失败: {e}"))?,
-        Err(_) => Err("脚本执行超时（30 秒）".into()),
+        Err(_) => Err(format!("脚本执行超时（{timeout_secs} 秒）")),
     };
     crate::audit::record(&ctx, "local-user", "script.run", &runtime, json!({ "ok": result.is_ok() }), result.is_ok());
     result
@@ -379,9 +387,17 @@ pub fn stop_subagent(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<s
 }
 
 /// 停止一个在跑的后台命令（面板「停止」按钮 / 输入框「停止 <job_id>」；kill 进程，随后 shell-job killed 事件广播）
+/// 作业登记表每进程独立：AI 在 worker 里起的命令登记在 worker 侧 → 先问 worker，本地表兜底
 #[tauri::command]
-pub fn cancel_shell(state: State<'_, Arc<Ctx>>, job_id: String) -> Result<serde_json::Value, String> {
+pub async fn cancel_shell(state: State<'_, Arc<Ctx>>, job_id: String) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
+    if crate::worker::active() && !crate::worker::IN_WORKER.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Ok(v) = crate::worker::proxy_shell_cancel(&job_id).await {
+            if v.get("cancelled").and_then(|x| x.as_bool()).unwrap_or(false) {
+                return Ok(v);
+            }
+        }
+    }
     if crate::shellbg::cancel(&job_id) {
         crate::audit::record(&ctx, "local-user", "shell.cancel_request", &job_id, json!({}), true);
         Ok(json!({ "cancelled": true, "job_id": job_id }))
@@ -390,10 +406,27 @@ pub fn cancel_shell(state: State<'_, Arc<Ctx>>, job_id: String) -> Result<serde_
     }
 }
 
-/// 所有在跑的后台命令（面板挂载时恢复初始状态用）
+/// 所有在跑的后台命令（面板挂载时恢复初始状态用）：合并 worker 与本地两张登记表
 #[tauri::command]
-pub fn list_running_shells() -> serde_json::Value {
-    crate::shellbg::list()
+pub async fn list_running_shells() -> serde_json::Value {
+    let mut arr: Vec<serde_json::Value> = Vec::new();
+    if crate::worker::active() && !crate::worker::IN_WORKER.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Ok(v) = crate::worker::proxy_shell_list().await {
+            if let Some(list) = v.as_array() {
+                arr.extend(list.iter().cloned());
+            }
+        }
+    }
+    let local = crate::shellbg::list();
+    if let Some(list) = local.as_array() {
+        for j in list {
+            let id = j.get("job_id").and_then(|x| x.as_str()).unwrap_or("");
+            if !arr.iter().any(|x| x.get("job_id").and_then(|y| y.as_str()) == Some(id)) {
+                arr.push(j.clone());
+            }
+        }
+    }
+    serde_json::Value::Array(arr)
 }
 
 /// AI 行为设置（设置页读写）：自动推进 / 子代理自动委派 / 审批模式 / 敏感词审核 / 兼容模式
@@ -495,6 +528,136 @@ pub fn set_guard_limits(
     Ok(json!({ "ok": true }))
 }
 
+/// 工具环境设置：自定义工具超时 + 默认 shell（含本机可用 shell 列表供下拉选择）
+#[tauri::command]
+pub fn get_tool_env_settings(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let cfg = ctx.config.lock().unwrap();
+    json!({
+        "tool_timeout_secs": cfg.tool_timeout_secs,
+        "default_shell": cfg.default_shell,
+        "available_shells": crate::toolenv::available_shells(),
+    })
+}
+
+#[tauri::command]
+pub fn set_tool_env_settings(
+    state: State<'_, Arc<Ctx>>,
+    tool_timeout_secs: u32,
+    default_shell: String,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.tool_timeout_secs = tool_timeout_secs.clamp(10, 600);
+        cfg.default_shell = default_shell.clone();
+    }
+    ctx.save_config();
+    crate::audit::record(
+        &ctx,
+        "local-user",
+        "toolenv.settings",
+        "set",
+        json!({ "tool_timeout_secs": tool_timeout_secs, "default_shell": default_shell }),
+        true,
+    );
+    Ok(json!({ "ok": true }))
+}
+
+/// 本机操控三件套开关（screen / mouse / keyboard）：设置页工具权限卡片。
+/// 开启后模型可见并可调用（experimental；macOS 需 TCC 授权）
+#[tauri::command]
+pub fn set_desktop_tools(
+    state: State<'_, Arc<Ctx>>,
+    screen: bool,
+    mouse: bool,
+    keyboard: bool,
+) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.tool_screen = screen;
+        cfg.tool_mouse = mouse;
+        cfg.tool_keyboard = keyboard;
+    }
+    ctx.save_config();
+    crate::audit::record(
+        &ctx,
+        "local-user",
+        "desktop.tools",
+        "set",
+        json!({ "screen": screen, "mouse": mouse, "keyboard": keyboard }),
+        true,
+    );
+    Ok(json!({ "ok": true }))
+}
+
+/// 读取本机操控三件套开关状态
+#[tauri::command]
+pub fn get_desktop_tools(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let cfg = ctx.config.lock().unwrap();
+    json!({
+        "screen": cfg.tool_screen,
+        "mouse": cfg.tool_mouse,
+        "keyboard": cfg.tool_keyboard,
+    })
+}
+
+/// 本地插件：列表（含启用状态与内容摘要）
+#[tauri::command]
+pub fn list_plugins(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    let plugins = ctx.plugins.lock().unwrap().clone();
+    let disabled: Vec<String> = { ctx.config.lock().unwrap().disabled_plugins.clone() };
+    let list: Vec<serde_json::Value> = plugins
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "version": p.version,
+                "description": p.description,
+                "enabled": !disabled.contains(&p.id),
+                "tools": p.tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                "prompts": p.prompts.len(),
+                "skills": p.skills.len(),
+                "memories": p.memories.len(),
+                "jobs": p.jobs.iter().map(|j| json!({ "name": j.name, "schedule": j.schedule })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({ "plugins": list, "dir": crate::plugins::dir(&ctx).to_string_lossy() })
+}
+
+/// 本地插件：启用/停用（停用后工具/技能/记忆/提示词/定时任务全部摘除）
+#[tauri::command]
+pub fn toggle_plugin(state: State<'_, Arc<Ctx>>, id: String, enabled: bool) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        if enabled {
+            cfg.disabled_plugins.retain(|x| x != &id);
+        } else if !cfg.disabled_plugins.contains(&id) {
+            cfg.disabled_plugins.push(id.clone());
+        }
+    }
+    ctx.save_config();
+    crate::plugins::sync(&ctx);
+    crate::audit::record(&ctx, "local-user", "plugin.toggle", &id, json!({ "enabled": enabled }), true);
+    Ok(json!({ "ok": true }))
+}
+
+/// 本地插件：重扫目录（新建/修改插件后无需重启）
+#[tauri::command]
+pub fn refresh_plugins(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    crate::plugins::sync(&ctx);
+    let plugins = ctx.plugins.lock().unwrap().len();
+    crate::audit::record(&ctx, "local-user", "plugin.refresh", "plugins", json!({ "count": plugins }), true);
+    Ok(json!({ "ok": true, "count": plugins }))
+}
+
 /// 用户自定义提示词/人设：读取
 #[tauri::command]
 pub fn get_custom_prompt(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
@@ -515,13 +678,69 @@ pub fn set_custom_prompt(state: State<'_, Arc<Ctx>>, custom_prompt: String) -> R
     Ok(json!({ "ok": true }))
 }
 
+/// 唤出主界面的全局快捷键：保存并立即重注册（空 = 关闭）。
+/// 冲突检测：注册失败（热键被其他应用占用 / 格式非法）→ 回滚到旧热键并返回错误原因，不落盘
+#[tauri::command]
+pub fn set_hotkey(state: State<'_, Arc<Ctx>>, hotkey: String) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    let new_key = hotkey.trim().to_string();
+    let old_key = ctx.config.lock().unwrap().hotkey_show.clone();
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.hotkey_show = new_key.clone();
+    }
+    if let Err(e) = crate::tray::register_hotkey(&ctx.app) {
+        // 注册失败：回滚旧热键并恢复注册，向前端返回冲突原因
+        {
+            let mut cfg = ctx.config.lock().unwrap();
+            cfg.hotkey_show = old_key;
+        }
+        let _ = crate::tray::register_hotkey(&ctx.app);
+        return Err(format!("快捷键注册失败（可能已被其他应用占用或格式非法）：{e}"));
+    }
+    ctx.save_config();
+    Ok(json!({ "ok": true }))
+}
+
+/// 读取当前全局快捷键设置
+#[tauri::command]
+pub fn get_hotkey(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    json!({ "hotkey": ctx.config.lock().unwrap().hotkey_show })
+}
+
+/// 写文件后轻量语法检查开关：读取
+#[tauri::command]
+pub fn get_syntax_check(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
+    let ctx = ctx(state);
+    json!({ "enabled": ctx.config.lock().unwrap().syntax_check })
+}
+
+/// 写文件后轻量语法检查开关：保存（开 = 写入/编辑 json/js/py 后自动体检并提醒）
+#[tauri::command]
+pub fn set_syntax_check(state: State<'_, Arc<Ctx>>, enabled: bool) -> Result<serde_json::Value, String> {
+    let ctx = ctx(state);
+    {
+        let mut cfg = ctx.config.lock().unwrap();
+        cfg.syntax_check = enabled;
+    }
+    ctx.save_config();
+    Ok(json!({ "ok": true }))
+}
+
 /// 系统提示词模板覆盖：读取（config 为空则返回默认模板，方便用户基于默认修改）
 #[tauri::command]
 pub fn get_system_prompt(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
-    let cfg = ctx.config.lock().unwrap();
-    let stored = cfg.system_prompt.trim();
-    if stored.is_empty() {
+    // 锁序纪律：config 锁只用于读取 system_prompt 字段，读完立即释放。
+    // default_system_prompt_for_display 内部（v0.6.3 新增的 native 分支）会再次取
+    // config 锁——std Mutex 不可重入，持锁调用 = 主线程同线程死锁，表现为启动数秒后
+    // 窗口与托盘整体冻结（get_overview 等处此前已修过同类问题，此处为漏网之鱼）
+    let (stored_default, stored) = {
+        let cfg = ctx.config.lock().unwrap();
+        (cfg.system_prompt.trim().is_empty(), cfg.system_prompt.trim().to_string())
+    };
+    if stored_default {
         // 返回默认模板让前端直接显示
         json!({ "system_prompt": crate::ai::default_system_prompt_for_display(&ctx), "is_default": true })
     } else {
@@ -839,6 +1058,17 @@ pub fn list_providers(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     json!({ "providers": cfg.providers.clone() })
 }
 
+/// base_url 归一化：去首尾空白与尾部斜杠；scheme 缺失时默认补 https://
+/// （本机/局域网 http 端点在模型列表探测时会自动降级并回写正确 scheme）
+fn normalize_base_url(b: &str) -> String {
+    let b = b.trim().trim_end_matches('/');
+    if b.starts_with("http://") || b.starts_with("https://") {
+        b.to_string()
+    } else {
+        format!("https://{b}")
+    }
+}
+
 /// 新增一个提供方（默认不激活）
 #[tauri::command]
 pub fn add_provider(
@@ -923,7 +1153,7 @@ pub fn update_provider(
         p.name = { let n = name.trim(); if n.is_empty() { protocol.clone() } else { n.to_string() } };
         p.base_url = {
             let b = base_url.trim();
-            if b.is_empty() { crate::ai::Provider::default_base_url(&protocol).to_string() } else { b.to_string() }
+            if b.is_empty() { crate::ai::Provider::default_base_url(&protocol).to_string() } else { normalize_base_url(b) }
         };
         p.model = {
             let m = model.trim();
@@ -1056,7 +1286,7 @@ pub async fn chat_stream(
     let ctx = ctx(state);
     let ev = if event_name.trim().is_empty() { "chat-stream".to_string() } else { event_name };
     let messages =
-        crate::agent::chat_turn_stream_auto(&ctx, &session_id, &message, &ev, images.unwrap_or_default()).await?;
+        crate::engine::chat_stream_auto(&ctx, &session_id, &message, &ev, images.unwrap_or_default()).await?;
     notify_done(&app, &ctx, &session_id, &messages);
     Ok(json!({ "messages": messages }))
 }
@@ -1065,33 +1295,14 @@ pub async fn chat_stream(
 #[tauri::command]
 pub async fn chat_interrupt(state: State<'_, Arc<Ctx>>, session_id: String) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    let sid = if session_id.is_empty() { ctx.sessions.lock().unwrap().active.clone() } else { session_id };
-    let hit = {
-        let map = ctx.interrupts.lock().unwrap();
-        match map.get(&sid) {
-            Some(flag) => {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                true
-            }
-            None => false,
-        }
-    };
-    crate::audit::record(&ctx, "local-app", "chat.interrupt", &sid, json!({ "was_running": hit }), true);
-    Ok(json!({ "id": sid, "interrupted": hit }))
+    crate::engine::interrupt(&ctx, &session_id).await
 }
 
 /// 工具审批应答（允许 / 拒绝）
 #[tauri::command]
 pub async fn tool_approve(state: State<'_, Arc<Ctx>>, id: String, allow: bool) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
-    let sender = ctx.approvals.lock().unwrap().remove(&id).map(|p| p.tx);
-    match sender {
-        Some(tx) => {
-            let _ = tx.send(allow);
-            Ok(json!({ "id": id, "allow": allow }))
-        }
-        None => Err("审批请求不存在或已处理".into()),
-    }
+    crate::engine::approve(&ctx, &id, allow).await
 }
 
 /// 设置工具审批模式：ask（每次询问）/ auto（危险询问、安全自动通过）/ allow_all（完全放行）
@@ -1231,32 +1442,40 @@ fn ctx_key(base: &str, id: &str) -> String {
 /// - claude：GET {base}/v1/models（x-api-key + anthropic-version；无上下文字段用家族默认）
 /// 自动检测：openai 兼容端点要求 base 以 /v1 结尾，用户漏写时自动补试 {base}/v1；
 /// claude/gemini 由本函数拼路径前缀，用户多写 /v1、/v1beta 时自动去掉再试。
+/// scheme 缺失时自动补全探测：https 优先，连不上自动降级 http（本机/局域网端点常见）。
 /// 返回第一个拿到合法模型列表的 base，前端据此把输入框纠正为可直接对话的端点。
 pub async fn fetch_provider_models(
     protocol: &str,
     base_url: &str,
     api_key: &str,
 ) -> Result<(String, Vec<(String, Option<u64>)>), String> {
-    let base = base_url.trim().trim_end_matches('/').to_string();
-    if base.is_empty() {
+    let raw = base_url.trim().trim_end_matches('/').to_string();
+    if raw.is_empty() {
         return Err("Base URL 不能为空".into());
     }
-    // 候选 base：按可能性排序，第一个是用户原输入（归一化后）
-    let mut candidates: Vec<String> = vec![base.clone()];
-    match protocol {
-        "gemini" => {
-            if let Some(stripped) = base.strip_suffix("/v1beta") {
-                candidates.insert(0, stripped.to_string());
-            }
-        }
-        "claude" => {
-            if let Some(stripped) = base.strip_suffix("/v1") {
-                candidates.insert(0, stripped.to_string());
-            }
-        }
-        _ => {
-            if !base.ends_with("/v1") {
-                candidates.push(format!("{base}/v1"));
+    // scheme 候选：用户写了就用原样；没写则 https 优先、http 兜底降级
+    let scheme_bases: Vec<String> = if raw.starts_with("http://") || raw.starts_with("https://") {
+        vec![raw.clone()]
+    } else {
+        vec![format!("https://{raw}"), format!("http://{raw}")]
+    };
+    // 候选 base：scheme × 路径变体，按可能性排序
+    let mut candidates: Vec<String> = Vec::new();
+    for b in &scheme_bases {
+        match protocol {
+            "gemini" => match b.strip_suffix("/v1beta") {
+                Some(stripped) => candidates.push(stripped.to_string()),
+                None => candidates.push(b.clone()),
+            },
+            "claude" => match b.strip_suffix("/v1") {
+                Some(stripped) => candidates.push(stripped.to_string()),
+                None => candidates.push(b.clone()),
+            },
+            _ => {
+                candidates.push(b.clone());
+                if !b.ends_with("/v1") {
+                    candidates.push(format!("{b}/v1"));
+                }
             }
         }
     }
@@ -2108,8 +2327,13 @@ pub fn quit_app(state: State<'_, Arc<Ctx>>) -> Result<serde_json::Value, String>
     crate::audit::record(&ctx, "local-app", "app.quit", "BIT", json!({ "via": "ui" }), true);
     // 正常退出：先通知守护进程不要接力拉起
     crate::guardian::expect_exit(&ctx);
-    // 已下载更新：退出前静默换装（关闭时自动更新）
-    let _ = crate::update::apply_update(&ctx, false);
+    // 硬退出兜底（与托盘退出一致）：事件循环消费 exit(0) 失败时强制退出，保证 100% 退掉
+    let hard_ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = crate::update::apply_update(&hard_ctx, false);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::process::exit(0);
+    });
     ctx.app.exit(0);
     Ok(json!({ "quit": true }))
 }
@@ -2765,6 +2989,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn test_normalize_base_url_scheme() {
+        // 无 scheme 默认补 https；已带 scheme 原样保留；空白与尾斜杠归一化
+        assert_eq!(super::normalize_base_url("api.example.com"), "https://api.example.com");
+        assert_eq!(super::normalize_base_url("http://127.0.0.1:8080/"), "http://127.0.0.1:8080");
+        assert_eq!(super::normalize_base_url("  https://a.b/v1/  "), "https://a.b/v1");
+    }
+
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_clean_display_path_passthrough() {
         // 非 Windows：canonicalize 后原样转字符串（Windows 分支的转换由 test_clean_display_path_verbatim 覆盖）

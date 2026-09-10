@@ -10,6 +10,7 @@ mod commands;
 mod config;
 mod crash;
 mod delegation;
+mod desktop_ctl;
 mod extract;
 mod goal;
 mod guardian;
@@ -17,8 +18,11 @@ mod http_api;
 mod mcp;
 mod memory;
 mod netinfo;
+mod engine;
 mod perms;
+mod plugins;
 mod registry;
+mod worker;
 mod relay;
 mod repetition;
 mod shellbg;
@@ -28,10 +32,14 @@ mod script_runtime;
 mod security;
 mod session;
 mod state;
+mod syntax;
+mod toolenv;
+mod trace;
 mod tray;
 mod tui;
 mod update;
 
+use std::io::Write;
 use std::sync::Arc;
 use tauri::Manager;
 use tauri::webview::Color;
@@ -49,6 +57,21 @@ fn graceful_quit(ctx: &tauri::AppHandle, via: &str) {
 }
 
 fn main() {
+    // ================================================================================
+    // 启动总览（按执行顺序）：
+    //   [0] main() 顶部：跨平台渲染 workaround（环境变量，必须在 Builder 之前）
+    //   [1] 模式判定：guardian 守护进程 / TUI / agent worker / 桌面端 GUI（正常启动）
+    //   [2] Builder 插件注册：共用(notification/autostart) + 桌面端专属(single_instance/global_shortcut)
+    //   [3] setup 回调：worker 模式提前返回 → 桌面端正常启动链
+    //       （窗口 → 透明色 → 信号兜底 → trace/守护 → toolhomes/插件 → 托盘 →
+    //         自启同步 → HTTP 服务 → 模型上下文 → Autopilot → 自动更新）
+    //   [4] 事件循环：ExitRequested（真实退出请求）→ run
+    // 测试/调试设施（与"正常启动"区分）：
+    //   - `bit tui` / 交互终端裸 `bit` → TUI 模式（无窗口/无 HTTP/无单实例）
+    //   - `--data-dir <path>` → 隔离数据目录（E2E 测试/提权子进程用，不污染真实数据）
+    //   - `POST /api/debug/*` → 调试桥端点（见 http_api.rs，仅供 E2E/诊断，正式客户端勿依赖）
+    // ================================================================================
+
     // ============ 跨平台渲染 workaround（必须在任何 GTK/WebKit/WebView2 初始化之前） ============
 
     // Linux (WebKitGTK)：NVIDIA GPU 在 Wayland 上的 DMABUF 渲染器崩溃
@@ -137,7 +160,9 @@ fn main() {
         && std::env::args().count() == 1
         && std::env::var_os("BIT_HEADLESS").is_none()
         && std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let tui_mode = explicit_tui || bare_tty_tui;
+    // agent worker 子进程模式：宿主拉起的无 UI 引擎进程（BIT_WORKER_TOKEN 由宿主注入）
+    let worker_mode = std::env::var("BIT_WORKER_TOKEN").map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let tui_mode = explicit_tui || bare_tty_tui || worker_mode;
 
     // WebView2 默认遵循系统代理，而安装版前端经 http://tauri.localhost 加载；
     // 系统代理（如 Clash）未排除该主机时会白屏。前端资源全部本地内嵌，禁用代理无副作用。
@@ -151,6 +176,7 @@ fn main() {
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", webview_args);
     }
 
+    // ─── 板块 [2]：Builder 插件注册 ─────────────────────────────────────────────
     let mut builder = tauri::Builder::default()
         // 以下插件 TUI 与桌面端共用：autostart 开机自启、notification 系统通知
         .plugin(tauri_plugin_notification::init())
@@ -164,21 +190,58 @@ fn main() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main_window(app);
         }));
+        // 全局快捷键插件：必须在 setup 调 tray::register_hotkey 之前注册——
+        // 漏注册时 app.global_shortcut() 会 panic "state() called before manage()"，
+        // 表现为桌面端启动即崩（退出码 101）+ 守护进程反复拉起 = 用户看到的"白屏/UI 消失"
+        builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
     }
     builder
         .setup(move |app| {
+            // ===== agent worker 子进程模式：无 UI，只跑对话引擎 / 工具执行 / 审批 / 后台 shell =====
+            if worker_mode {
+                worker::IN_WORKER.store(true, std::sync::atomic::Ordering::Relaxed);
+                // 关键：平台 conf 的 app.windows 会被 Builder 无条件创建，
+                // worker 必须立刻销毁这个窗口——否则每次启动都会多出一个
+                // "能渲染但没有后端服务" 的假窗口（用户看到的第二个坏窗口）
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.destroy(); // destroy 绕过 CloseRequested（否则只会 hide 驻留）
+                }
+                let ctx = state::Ctx::load(app.handle().clone());
+                crash::install(&ctx.data_dir);
+                trace::init(&ctx.data_dir);
+                audit::record(&ctx, "host", "worker.start", "agent-worker", serde_json::json!({}), true);
+                let wctx = ctx.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = worker::serve(wctx.clone()).await {
+                        // 服务致命错误（绑定失败等）：退出码 3，宿主监督循环检测到后重拉
+                        audit::record(&wctx, "host", "worker.serve_error", "agent-worker", serde_json::json!({ "error": e }), false);
+                        std::process::exit(3);
+                    }
+                });
+                return Ok(());
+            }
+
+            // ─── 板块 [3b]：桌面端正常启动链（GUI 宿主）── 以下到 setup 结束按顺序执行 ───
+            // 顺序敏感：窗口先建（用户尽快看到 UI），重活全部丢后台（白屏修复的核心原则）。
             let ctx = state::Ctx::load(app.handle().clone());
             // 全局 panic 钩子：崩溃信息（含回溯）追加到数据目录 crash.log，诊断报告展示
             crash::install(&ctx.data_dir);
             let (actor, target) = if tui_mode { ("local-cli", "tui") } else { ("local-app", "BIT") };
             audit::record(&ctx, actor, "app.start", target, serde_json::json!({}), true);
             app.manage(ctx.clone());
-            // 非 macOS：出厂工具装入后按配置闸门同步 screen/mouse/keyboard 的启用态
-            // （macOS 已整体移除这三个工具，无需同步；sync_gate_enabled 内部只读快照 + 单锁，异常静默）
-            #[cfg(not(target_os = "macos"))]
-            crate::registry::sync_gate_enabled(&ctx);
             // 后台 shell 的顶层续跑 worker：长命令自然结束时自动把结果唤回所属会话的 AI
             crate::shellbg::init(&ctx);
+
+            // agent worker 监督：拉起独立引擎子进程并保活（仅在桌面主进程；配置可关）
+            if !tui_mode {
+                worker::boot_host(&ctx);
+            }
+
+            // 全局快捷键：唤出主界面（仅桌面端；TUI 无窗口不注册）。
+            // 启动期冲突不阻断启动：失败原因已落审计，用户改键后即恢复
+            if !tui_mode {
+                let _ = tray::register_hotkey(app.handle());
+            }
 
             if tui_mode {
                 // TUI：无窗口、无托盘、无 HTTP 服务、无 Autopilot（与桌面端零冲突）。
@@ -193,15 +256,57 @@ fn main() {
                 return Ok(());
             }
 
+            // ========== 显式创建主窗口 ==========
+            // 窗口不再放平台 conf 的 app.windows（那里会被 Builder 无条件创建，
+            // worker/TUI 也会凭空多出一个"能渲染但没有后端服务"的坏窗口）。
+            // 仅桌面宿主走到这里，worker/TUI 已在上面提前返回。
+            {
+                let mut wb = tauri::webview::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::default(),
+                )
+                .title("BIT")
+                .inner_size(1120.0, 740.0)
+                .min_inner_size(920.0, 620.0)
+                .center()
+                .transparent(true)
+                .shadow(true)
+                .visible(true);
+                // 平台差异：Windows/Linux 无边框圆角（前端自绘标题栏）；
+                // macOS 保留原生红绿灯，Overlay 让内容延伸到标题栏区域
+                #[cfg(target_os = "macos")]
+                {
+                    wb = wb
+                        .decorations(true)
+                        .title_bar_style(tauri::TitleBarStyle::Overlay)
+                        .hidden_title(true);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    wb = wb.decorations(false);
+                }
+                wb.build()?;
+            }
+
             // ========== 透明窗口强制设色 ==========
             // Rust 端直接调 set_background_color 比 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS 更可靠——
             // WebView2 的 --default-background-color 参数在某些 wry/WebView2 版本组合下不生效
             // （见 tauri-apps/tauri#1739 / khiops/termora#98）。macOS 上 transparent: true 也只对
             // 窗口级生效，WKWebView 自身默认白底，同样需要显式设透明。
-            if let Some(win) = app.get_webview_window("main") {
-                if let Err(e) = win.set_background_color(Some(Color(0, 0, 0, 0))) {
-                    eprintln!("[BIT] set_background_color failed: {e}");
-                }
+            // Windows 死锁修复：setup 在主线程执行时 WebView2 尚未就绪，同步调
+            // set_background_color（COM 调用）会与 WebView2 初始化互相等待，表现为启动即卡死
+            // （macOS 无此问题）。改为延迟到事件循环跑起来之后在旁路线程执行。
+            {
+                let bg_app = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if let Some(win) = bg_app.get_webview_window("main") {
+                        if let Err(e) = win.set_background_color(Some(Color(0, 0, 0, 0))) {
+                            eprintln!("[BIT] set_background_color failed: {e}");
+                        }
+                    }
+                });
             }
 
             // ========== 桌面端：信号兜底 ==========
@@ -212,10 +317,33 @@ fn main() {
                 graceful_quit(&handle_sig, "signal");
             });
 
+            // 调试追踪：死锁诊断专用（先初始化，后续 guardian/锁操作才有日志）
+            trace::init(&ctx.data_dir);
+
             // 守护进程布防：接力日志转存审计（此前发生的被杀/拉起/篡改拒绝事件）→ 写握手文件 → 拉起守护进程
+            let _g = trace::Span::new("guardian", "drain_log+arm+watchdog");
             guardian::drain_log(&ctx);
             guardian::arm(&ctx);
             tauri::async_runtime::spawn(guardian::watchdog_task(ctx.clone()));
+
+            // BIT toolhomes：建目录 + 缺 python venv 时后台补建（静默失败，不阻塞启动）
+            {
+                let te_ctx = ctx.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    // 插件同步必须先于 venv 创建：venv 要跑几十秒的 python -m venv，
+                    // 串在前面会把插件注册推迟一分钟（期间模型看不到插件工具/记忆）
+                    crate::plugins::sync(&te_ctx);
+                    crate::toolenv::ensure_init(&te_ctx);
+                });
+            }
+
+            // 插件定时任务调度循环（每 30 秒检查一次到期任务）
+            {
+                let pl_ctx = ctx.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::plugins::scheduler(pl_ctx).await;
+                });
+            }
 
             // 解释器探测移到后台：不阻塞窗口显示（修复启动慢/白屏）
             let rt_ctx = ctx.clone();
@@ -316,8 +444,19 @@ fn main() {
             commands::set_behavior_settings,
             commands::get_guard_limits,
             commands::set_guard_limits,
+            commands::get_tool_env_settings,
+            commands::set_tool_env_settings,
+            commands::list_plugins,
+            commands::toggle_plugin,
+            commands::refresh_plugins,
             commands::get_custom_prompt,
             commands::set_custom_prompt,
+            commands::set_hotkey,
+            commands::get_hotkey,
+            commands::get_syntax_check,
+            commands::set_syntax_check,
+            commands::set_desktop_tools,
+            commands::get_desktop_tools,
             commands::get_system_prompt,
             commands::set_system_prompt,
             commands::save_cloud_relay,
@@ -404,7 +543,10 @@ fn main() {
             }
 
             // Cmd+Q（macOS）/ 系统退出请求：走真正退出链路，
-            // 与托盘退出 / quit_app command 一致——通知守护进程 + 静默更新
+            // 与托盘退出 / quit_app command 一致——通知守护进程 + 静默更新。
+            // 注意：ExitRequested 只在真实退出请求时触发（窗口关闭被 prevent_close 拦截为隐藏），
+            // 循环默认继续退出流程；此处绝不能再调 app.exit(0)——会重入再次触发
+            // ExitRequested（审计出现 9~10s 间隔连环 app.quit、进程永不退出的根因）
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 if let Some(ctx) = app.try_state::<Arc<crate::state::Ctx>>() {
                     crate::audit::record(&ctx, "local-app", "app.quit", "BIT",
@@ -412,7 +554,6 @@ fn main() {
                     crate::guardian::expect_exit(&ctx);
                     let _ = crate::update::apply_update(&ctx, false);
                 }
-                app.exit(0);
             }
         });
 }

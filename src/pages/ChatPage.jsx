@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "../api.js";
 import { useLang, t } from "../i18n.js";
 import {
@@ -77,6 +78,10 @@ export default function ChatPage({ onStats, visible }) {
   const inputRef = useRef(null); // 输入框自动增高用
   const [attachMenu, setAttachMenu] = useState(false); // 附件 + 菜单（图片/文档/网址）
 
+  // 文档/网页预览：previewFile = { kind: "md"|"html"|"svg", path }；previewText 存 Markdown 正文
+  const [previewFile, setPreviewFile] = useState(null);
+  const [previewText, setPreviewText] = useState("");
+
   // 输入框自动增高：随内容增长，超过 160px 后内部滚动
   useEffect(() => {
     const el = inputRef.current;
@@ -132,11 +137,57 @@ export default function ChatPage({ onStats, visible }) {
       const p = e.payload || {};
       if (p.session && p.usage) setUsageMap((m) => ({ ...m, [p.session]: { ...p.usage, type: "usage" } }));
     });
+    // 工具返回的图片（自定义工具输出 image 字段）：作为 assistant 图片气泡插入当前对话
+    const unImage = listen("chat-image", (e) => {
+      const p = e.payload || {};
+      if (p.session && p.session === activeRef.current && p.data_url) {
+        setMessages((msgs) => [...msgs, { role: "assistant", content: "", image: p.data_url }]);
+      }
+    });
+    // 模型生成的视频（体积大不传 data URL）：用落盘路径经 asset 协议加载播放
+    const unVideo = listen("chat-video", (e) => {
+      const p = e.payload || {};
+      if (p.session && p.session === activeRef.current && p.path) {
+        setMessages((msgs) => [...msgs, { role: "assistant", content: "", video: p.path }]);
+      }
+    });
+    // AI 写出可预览文件（html/md/svg）：追加"点击预览"卡片气泡
+    const unPreview = listen("file-preview", (e) => {
+      const p = e.payload || {};
+      if (p.session && p.session === activeRef.current && p.path) {
+        setMessages((msgs) => [...msgs, { role: "assistant", content: "", preview: { path: p.path, kind: p.kind } }]);
+      }
+    });
+    // 写文件后的语法检查警告：AI 刚写的代码文件有语法错误时提醒用户（模型同时收到提醒去修复）
+    const unSyntax = listen("syntax-warning", (e) => {
+      const p = e.payload || {};
+      if (p.session && p.session === activeRef.current && p.path) {
+        const name = p.path.replace(/^.*[\\/]/, "");
+        setMessages((msgs) => [...msgs, { role: "assistant", content: `⚠️ ${t("chat.syntaxWarning")} ${name}\n\`\`\`\n${(p.error || "").slice(0, 600)}\n\`\`\``, warning: true }]);
+      }
+    });
     return () => {
       un.then((f) => f());
       unUsage.then((f) => f());
+      unImage.then((f) => f());
+      unVideo.then((f) => f());
+      unPreview.then((f) => f());
+      unSyntax.then((f) => f());
     };
   }, []);
+
+  // 预览 md：经 asset 协议拉取文件文本交给 Markdown 渲染
+  useEffect(() => {
+    if (!previewFile || previewFile.kind !== "md") return;
+    let alive = true;
+    fetch(convertFileSrc(previewFile.path))
+      .then((r) => r.text())
+      .then((txt) => alive && setPreviewText(txt))
+      .catch(() => alive && setPreviewText("(无法读取文件)"));
+    return () => {
+      alive = false;
+    };
+  }, [previewFile]);
 
   // 子代理生命周期：spawn → start → done|error（宿主管控，AI 不能自行派生）
   useEffect(() => {
@@ -289,9 +340,14 @@ export default function ChatPage({ onStats, visible }) {
   const runningCount = Object.keys(busyMap).length;
 
   // 计划栏派生：非放弃目标 + 归属待办；无目标待办的独立待办单独成组
-  const planVisibleGoals = planGoals.filter((g) => g.status !== "abandoned");
+  // 按会话隔离：带 session_id 的计划只在其归属会话显示，无归属（用户手建/旧数据）视为全局
+  const planVisibleGoals = planGoals.filter(
+    (g) => g.status !== "abandoned" && (!g.session_id || g.session_id === activeId)
+  );
   const planGoalIds = new Set(planVisibleGoals.map((g) => g.id));
-  const planVisibleTodos = planTodos.filter((td) => !td.goal_id || planGoalIds.has(td.goal_id));
+  const planVisibleTodos = planTodos.filter(
+    (td) => (!td.session_id || td.session_id === activeId) && (!td.goal_id || planGoalIds.has(td.goal_id))
+  );
   const planLooseTodos = planVisibleTodos.filter((td) => !td.goal_id);
   const planGroups = [
     ...planVisibleGoals.map((g) => ({ goal: g, todos: planVisibleTodos.filter((td) => td.goal_id === g.id) })),
@@ -397,6 +453,45 @@ export default function ChatPage({ onStats, visible }) {
         setImages((arr) => [...arr, { name: f.name, dataUrl }]);
       } catch {
         setAttachErr(t("chat.imageReadFailed") + f.name);
+      }
+    }
+  };
+
+  // 输入框粘贴：支持剪贴板里的截图/图片 与 资源管理器复制的任意文件
+  //   image/* → 图片附件（多模态）；其余文件 → 走文档解析链路（与 📄 菜单上传同链路）
+  const onPasteInput = async (e) => {
+    const files = Array.from(e.clipboardData?.items || [])
+      .filter((it) => it.kind === "file")
+      .map((it) => it.getAsFile())
+      .filter(Boolean);
+    if (!files.length) return; // 纯文本粘贴走默认行为
+    e.preventDefault(); // 阻止把文件名当文本插入
+    const imgs = files.filter((f) => f.type.startsWith("image/"));
+    const docs = files.filter((f) => !f.type.startsWith("image/"));
+    setAttachErr("");
+    for (const f of imgs) {
+      try {
+        const dataUrl = await readAsDataURL(f);
+        const name = f.name && f.name !== "image.png" ? f.name : t("chat.pastedImage") + `_${Date.now()}.png`;
+        setImages((arr) => [...arr, { name, dataUrl }]);
+      } catch {
+        setAttachErr(t("chat.imageReadFailed") + (f.name || "clipboard"));
+      }
+    }
+    if (docs.length) {
+      setAttaching(true);
+      try {
+        for (const f of docs) {
+          try {
+            const dataUrl = await readAsDataURL(f);
+            const r = await api.extractFile(f.name, dataUrl);
+            if (r?.text) setDocs((arr) => [...arr, { name: f.name, text: r.text }]);
+          } catch (err) {
+            setAttachErr(t("chat.parseFailed") + `${f.name} — ${err}`);
+          }
+        }
+      } finally {
+        setAttaching(false);
       }
     }
   };
@@ -1215,25 +1310,54 @@ export default function ChatPage({ onStats, visible }) {
             </div>
           )}
           <div className="flex flex-col gap-3">
-            {messages.map((m, i) =>
-              m.role === "system" ? (
-                // 压缩分割线：会话中的 system 消息即压缩摘要（仅 compress_session 写入），
-                // 悬停可查看完整摘要；上方为压缩前历史，下方为压缩后新对话
-                <div
-                  key={i}
-                  title={m.content}
-                  className="my-2 flex items-center gap-3"
-                >
-                  <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
-                  <span className="shrink-0 text-[11px] text-neutral-400">
-                    {t("chat.compressedDivider")}
-                  </span>
-                  <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
-                </div>
-              ) : (
-                <MessageBubble key={i} message={m} />
-              )
-            )}
+            {(() => {
+              // QQ 式时间分割线：相邻两条消息（带时间戳的）间隔 ≥5 分钟时，
+              // 在后一条上方画一条居中时间线，方便回看历史定位时间点。
+              // 旧会话消息无 ts 字段 → 不画线，自然兼容。
+              let lastTs = null;
+              const fmt = (ts) => {
+                const d = new Date(ts.replace(" ", "T"));
+                if (Number.isNaN(d.getTime())) return ts;
+                const now = new Date();
+                const sameDay = d.toDateString() === now.toDateString();
+                const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+                return sameDay
+                  ? hm
+                  : `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${hm}`;
+              };
+              return messages.map((m, i) => {
+                const showDivider =
+                  m.ts && (lastTs === null || new Date(m.ts.replace(" ", "T")) - new Date(lastTs.replace(" ", "T")) >= 5 * 60 * 1000);
+                if (m.ts) lastTs = m.ts;
+                return (
+                  <Fragment key={i}>
+                    {showDivider && (
+                      <div className="my-1 flex items-center gap-3">
+                        <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
+                        <span className="shrink-0 text-[11px] text-neutral-400">{fmt(m.ts)}</span>
+                        <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
+                      </div>
+                    )}
+                    {m.role === "system" ? (
+                      // 压缩分割线：会话中的 system 消息即压缩摘要（仅 compress_session 写入），
+                      // 悬停可查看完整摘要；上方为压缩前历史，下方为压缩后新对话
+                      <div
+                        title={m.content}
+                        className="my-2 flex items-center gap-3"
+                      >
+                        <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
+                        <span className="shrink-0 text-[11px] text-neutral-400">
+                          {t("chat.compressedDivider")}
+                        </span>
+                        <div className="h-px flex-1 bg-neutral-200 dark:bg-neutral-700" />
+                      </div>
+                    ) : (
+                      <MessageBubble message={m} onPreview={setPreviewFile} />
+                    )}
+                  </Fragment>
+                );
+              });
+            })()}
             {/* 流式实时区：已完成轮次的工具卡片 + 本轮增量文本 */}
             {live && (
               <div className="mr-auto flex max-w-[85%] flex-col gap-2">
@@ -1966,6 +2090,7 @@ export default function ChatPage({ onStats, visible }) {
                     : t("chat.inputPlaceholder")
               }
               onChange={(e) => setInput(e.target.value)}
+              onPaste={onPasteInput}
               onKeyDown={(e) => {
                 // Enter 直接换行便于拼接长消息；Ctrl+Enter / Shift+Enter 发送；中文输入法选词回车不发送
                 if (
@@ -2071,6 +2196,56 @@ export default function ChatPage({ onStats, visible }) {
             </div>
           </div>
         )}
+
+        {/* 文档/网页预览弹窗：html/svg 用 iframe，md 拉取文本渲染；可直接指挥修改 */}
+        {previewFile && (
+          <div
+            className="fixed inset-0 z-50 flex bg-black/50 p-4"
+            onClick={() => setPreviewFile(null)}
+          >
+            <div
+              className="mx-auto flex h-full w-full max-w-4xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl dark:bg-neutral-900"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center gap-3 border-b border-neutral-200 px-4 py-2 dark:border-neutral-800">
+                <span className="truncate font-mono text-xs text-neutral-500">{previewFile.path}</span>
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInput(`请修改 ${previewFile.path}：`);
+                      setPreviewFile(null);
+                    }}
+                    className="rounded-full bg-orange-500 px-3 py-1 text-xs text-white hover:bg-orange-600"
+                  >
+                    修改此文件
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPreviewFile(null)}
+                    className="icon-btn h-7 w-7 rounded-full"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 overflow-auto">
+                {previewFile.kind === "md" ? (
+                  <div className="px-6 py-4">
+                    <Markdown>{previewText}</Markdown>
+                  </div>
+                ) : (
+                  <iframe
+                    title="file-preview"
+                    src={convertFileSrc(previewFile.path)}
+                    className="h-full w-full border-0 bg-white"
+                    sandbox="allow-scripts allow-popups"
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2126,7 +2301,7 @@ function ThinkPanel({ text, openDefault = false, streaming = false }) {
 
 // 单条消息气泡：user / assistant，assistant 可携带工具调用卡片
 // send_file 成功的调用渲染为文件卡片（如同收文件），不出工具卡
-function MessageBubble({ message }) {
+function MessageBubble({ message, onPreview }) {
   const isUser = message.role === "user";
   // 后台 shell 结束时由宿主注入的说明消息（用户没说话，别渲染成用户的气泡）。
   // 三种结束都带 [后台任务…] 前缀：完成 / 已手动停止 / 超时终止
@@ -2169,6 +2344,29 @@ function MessageBubble({ message }) {
         </div>
       )}
       {message.thinking && message.thinking.trim() && <ThinkPanel text={message.thinking} />}
+      {message.image && (
+        <div className="overflow-hidden rounded-2xl border border-neutral-200 dark:border-neutral-800">
+          <img src={message.image} alt="tool output" className="max-h-96 w-auto max-w-full" />
+        </div>
+      )}
+      {message.video && (
+        <div className="overflow-hidden rounded-2xl border border-neutral-200 dark:border-neutral-800">
+          <video src={convertFileSrc(message.video)} controls className="max-h-96 w-auto max-w-full" />
+        </div>
+      )}
+      {message.preview && (
+        <button
+          type="button"
+          onClick={() => onPreview && onPreview(message.preview)}
+          className="flex items-center gap-2 rounded-2xl border border-neutral-200 px-4 py-2.5 text-sm transition-colors hover:bg-neutral-100 dark:border-neutral-800 dark:hover:bg-neutral-800"
+        >
+          <span className="text-base leading-none">{message.preview.kind === "html" ? "🌐" : message.preview.kind === "md" ? "📄" : "🖼"}</span>
+          <span className="max-w-64 truncate font-mono text-xs">
+            {message.preview.path.split(/[\\/]/).pop()}
+          </span>
+          <span className="text-xs text-neutral-400">点击预览</span>
+        </button>
+      )}
       {hasText && (
         <div className="group flex flex-col gap-0.5">
           <div className="rounded-3xl rounded-bl-lg border border-neutral-200 bg-white px-4 py-2.5 dark:border-neutral-800 dark:bg-neutral-900">

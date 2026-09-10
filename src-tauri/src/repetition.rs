@@ -69,6 +69,27 @@ pub fn word_counts(text: &str) -> HashMap<String, usize> {
     counts
 }
 
+/// 工具调用内容签名：工具名 + 规范化参数序列化。
+/// 用于「相同调用连跑 N 轮」的内容级幻觉判定——比纯轮次计数更准：
+/// 轮次多但每次参数不同是正常探索，同一签名反复出现才是死循环
+pub fn call_signature(name: &str, args: &serde_json::Value) -> String {
+    // 参数键排序后序列化，消除 JSON 键序差异（模型两次给同参数键序可能不同）
+    let canonical = match args {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut s = String::from("{");
+            for k in keys {
+                s.push_str(&format!("{:?}:{}", k, map.get(k).cloned().unwrap_or_default()));
+            }
+            s.push('}');
+            s
+        }
+        other => other.to_string(),
+    };
+    format!("{name} {canonical}")
+}
+
 /// 幻觉式重复检测：某词出现次数 ≥ max 即命中（max=0 关闭）。
 /// 返回次数最多的 (词, 次数)；并列时取词更长（更反常）的那个。
 pub fn find_repeat(text: &str, max: u32) -> Option<(String, usize)> {

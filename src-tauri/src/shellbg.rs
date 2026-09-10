@@ -62,27 +62,33 @@ fn next_id() -> String {
     format!("sh{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// 构造 shell 命令（Windows 用 PowerShell 强制 UTF-8，其他平台 sh -c），与旧 shell 工具一致
-fn shell_command(command: &str, cwd: Option<&str>) -> tokio::process::Command {
-    let mut cmd = if cfg!(windows) {
-        let mut c = tokio::process::Command::new("powershell");
-        c.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}"),
-        ]);
-        c
-    } else {
-        let mut c = tokio::process::Command::new("sh");
-        c.args(["-c", command]);
-        c
+/// 构造 shell 命令：按 config.default_shell 解析（空 = 自动识别，指定不存在时回退自动）。
+/// PowerShell 系沿用强制 UTF-8（与旧实现一致），Unix 用解析出的 -c 系 shell。
+fn shell_command(pref: &str, command: &str, cwd: Option<&str>) -> tokio::process::Command {
+    let (prog, args) = match crate::toolenv::resolve_shell(pref) {
+        Ok(v) => v,
+        Err(_) => crate::toolenv::resolve_shell("")
+            .unwrap_or_else(|_| ("powershell".to_string(), vec!["-Command".to_string()])),
     };
+    let is_ps = prog
+        .rsplit(['/', '\\'])
+        .next()
+        .map(|b| b == "pwsh" || b == "powershell")
+        .unwrap_or(false);
+    // PowerShell 强制 UTF-8 输出，避免中文乱码
+    let full = if is_ps {
+        format!("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; {command}")
+    } else {
+        command.to_string()
+    };
+    let mut c = tokio::process::Command::new(prog);
+    c.args(args);
+    c.arg(full);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        c.current_dir(dir);
     }
-    crate::registry::no_window_tokio(&mut cmd);
-    cmd
+    crate::registry::no_window_tokio(&mut c);
+    c
 }
 
 fn emit(ctx: &Arc<crate::state::Ctx>, phase: &str, job: &ShellJob, extra: Option<serde_json::Value>) {
@@ -102,7 +108,7 @@ fn emit(ctx: &Arc<crate::state::Ctx>, phase: &str, job: &ShellJob, extra: Option
             obj.insert(k.clone(), v.clone());
         }
     }
-    let _ = ctx.app.emit("shell-job", payload);
+    let _ = crate::worker::emit_ui(&ctx.app, "shell-job", payload);
 }
 
 /// shell 工具入口：短命令照旧秒回；超过前台窗口的命令转后台（含登记 + 事件 + 自动唤回）。
@@ -121,7 +127,9 @@ pub async fn run(
             crate::registry::safe_trunc(command, 120)
         ));
     }
-    let mut cmd = shell_command(command, cwd);
+    // 快照默认 shell 后立即释放配置锁（锁序纪律：不跨 spawn 持锁）
+    let pref = { ctx.config.lock().unwrap().default_shell.clone() };
+    let mut cmd = shell_command(&pref, command, cwd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
@@ -202,6 +210,29 @@ pub async fn run(
     }))
 }
 
+/// 进程树终止：shell 壳（pwsh/cmd）被杀后，它启动的孙进程会变成孤儿继续运行，
+/// 既占资源又握着 stdout 管道写端，卡住收尾任务。start_kill 只杀直接子进程，
+/// 这里 Windows 用 taskkill /T（整棵树）/F（强制），其他平台逐个杀子进程树尽力而为。
+fn tree_kill(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new("pkill")
+                .args(["-TERM", "-P", &pid.to_string()])
+                .output();
+        }
+    }
+    let _ = child.start_kill(); // 兜底：直接子进程必杀
+}
+
 /// 后台作业收尾：等待进程结束（或用户取消/硬超时）→ 广播 done/killed → 移除登记 → 自然结束时唤回 AI
 async fn finish(ctx: Arc<crate::state::Ctx>, job: Arc<ShellJob>) {
     let child = { job.child.lock().unwrap().take() };
@@ -235,19 +266,29 @@ async fn finish(ctx: Arc<crate::state::Ctx>, job: Arc<ShellJob>) {
         st = child.wait() => st.ok(),
         _ = job.cancel.notified() => {
             reason = "cancelled".into();
-            let _ = child.start_kill();
+            tree_kill(&mut child);
             let _ = child.wait().await;
             None
         }
         _ = &mut timeout_sleep => {
             reason = "timeout".into();
-            let _ = child.start_kill();
+            tree_kill(&mut child);
             let _ = child.wait().await;
             None
         }
     };
-    let stdout = String::from_utf8_lossy(&so_task.await.unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&se_task.await.unwrap_or_default()).into_owned();
+    // 停止后读取剩余输出，但最多等 5s：管道写端可能被 shell 的孙进程继承持有
+    // （shell 壳被杀后孙进程变孤儿继续握着 stdout），无限等会让 killed 事件
+    // 和审计遥遥无期，UI 卡片"停了但一直显示运行中"。超时放弃读取即可，
+    // cancelled/timeout 的输出本就不需要完整回收。
+    let (stdout, stderr) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async { (so_task.await.unwrap_or_default(), se_task.await.unwrap_or_default()) },
+    )
+    .await
+    .unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
     jobs().lock().unwrap().remove(&job.id);
     let ms = job.started.elapsed().as_millis() as u64;
     let code = status.and_then(|st| st.code());
@@ -290,6 +331,30 @@ async fn finish(ctx: Arc<crate::state::Ctx>, job: Arc<ShellJob>) {
                 reason,
             });
         }
+    }
+}
+
+/// 插件定时任务等外部产物的会话注入入口：把结果打包成 JobDone 交给顶层续跑 worker。
+/// 会话空闲则自动开新回合处理，忙则注入历史等下轮上下文读到（与后台 shell 同链路）。
+pub fn notify_session_result(
+    session: &str,
+    job_id: &str,
+    command: &str,
+    code: i32,
+    stdout: String,
+    stderr: String,
+    reason: &str,
+) {
+    if let Some(tx) = DONE_TX.get() {
+        let _ = tx.send(JobDone {
+            session: session.to_string(),
+            job_id: job_id.to_string(),
+            command: command.to_string(),
+            code: Some(code),
+            stdout,
+            stderr,
+            reason: reason.to_string(),
+        });
     }
 }
 
@@ -355,8 +420,8 @@ async fn resume(ctx: &Arc<crate::state::Ctx>, msg: &JobDone) {
         push_system_user(ctx, sid, &body);
         return;
     }
-    let _ = crate::agent::chat_turn_auto(ctx, sid, &body, Vec::new()).await;
-    let _ = ctx.app.emit("sessions-updated", sid);
+    let _ = crate::engine::chat_auto(ctx, sid, &body, Vec::new()).await;
+    let _ = crate::worker::emit_ui(&ctx.app, "sessions-updated", json!(sid));
 }
 
 /// 启动后台 shell 的顶层续跑 worker（进程 setup 时调用一次）：
@@ -387,7 +452,7 @@ fn push_system_user(ctx: &Arc<crate::state::Ctx>, sid: &str, body: &str) {
         }
     }
     crate::session::persist(ctx);
-    let _ = ctx.app.emit("sessions-updated", sid);
+    let _ = crate::worker::emit_ui(&ctx.app, "sessions-updated", json!(sid));
 }
 
 /// 用户 / UI 停止一个后台命令：通知其等待任务 kill 进程，事件 killed 会在片刻后广播

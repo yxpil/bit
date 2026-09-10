@@ -102,6 +102,9 @@ export default function ToolsPage({ onStats }) {
   const [mcpMsg, setMcpMsg] = useState("");
   // 工具质量统计：tool_id → { recent_rate, recent_n, fail, last_err, avg_ms }
   const [stats, setStats] = useState({});
+  const [plugins, setPlugins] = useState([]);
+  const [pluginDir, setPluginDir] = useState("");
+  const [pluginBusy, setPluginBusy] = useState(false);
 
   const reload = async () => {
     const [t, r, m, s] = await Promise.all([api.listTools(), api.listRuntimes(), api.mcpList(), api.getToolStats().catch(() => [])]);
@@ -109,6 +112,10 @@ export default function ToolsPage({ onStats }) {
     setRuntimes(r.runtimes || []);
     setMcpServers(m.servers || []);
     setStats(Object.fromEntries((Array.isArray(s) ? s : []).map((x) => [x.id, x])));
+    api.listPlugins().then((p) => {
+      setPlugins(p?.plugins || []);
+      setPluginDir(p?.dir || "");
+    }).catch(() => {});
     if (!runtime && r.runtimes?.length) setRuntime(r.runtimes[0].id);
   };
   useEffect(() => {
@@ -493,6 +500,82 @@ export default function ToolsPage({ onStats }) {
           })}
           {mcpServers.length === 0 && (
             <p className="py-4 text-center text-sm text-neutral-400">{t("tools.mcpEmpty")}</p>
+          )}
+        </div>
+      </section>
+
+      {/* ── 本地插件：toolhomes/plugins 声明式插件包 ── */}
+      <section className="card">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <IconTool size={18} />
+            <div>
+              <h2 className="text-sm font-semibold">本地插件</h2>
+              <p className="text-xs text-neutral-500 dark:text-neutral-400">
+                在插件目录建 <span className="font-mono">&lt;名字&gt;/plugin.json</span> 声明工具 / 提示词 / 技能 / 定时任务，重扫即生效
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              setPluginBusy(true);
+              try {
+                await api.refreshPlugins();
+                const p = await api.listPlugins();
+                setPlugins(p?.plugins || []);
+              } finally {
+                setPluginBusy(false);
+              }
+            }}
+            className="pill pill-outline pill-hover"
+            disabled={pluginBusy}
+          >
+            <IconRefresh size={14} />
+            重扫插件
+          </button>
+        </div>
+
+        {pluginDir && (
+          <p className="mb-3 px-2 font-mono text-[11px] text-neutral-400">{pluginDir}</p>
+        )}
+
+        <div className="flex flex-col gap-2">
+          {plugins.map((p) => (
+            <div key={p.id} className="flex items-center gap-3 rounded-2xl border border-neutral-200/70 px-4 py-2.5 dark:border-neutral-800/70">
+              <div className={`flex min-w-0 flex-1 flex-col gap-1 transition-opacity ${p.enabled ? "" : "opacity-45"}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold">{p.name}</span>
+                  {p.version && <span className="chip">{p.version}</span>}
+                  {p.tools?.length > 0 && <span className="chip">{p.tools.length} 工具</span>}
+                  {p.prompts > 0 && <span className="chip">{p.prompts} 提示词</span>}
+                  {p.skills > 0 && <span className="chip">{p.skills} 技能</span>}
+                  {p.memories > 0 && <span className="chip">{p.memories} 记忆</span>}
+                  {p.jobs?.map((j) => (
+                    <span key={j.name} className="chip">{j.name} · {j.schedule}</span>
+                  ))}
+                </div>
+                {p.description && (
+                  <p className="truncate text-xs text-neutral-500 dark:text-neutral-400">{p.description}</p>
+                )}
+              </div>
+              <PillSwitch
+                checked={p.enabled}
+                onChange={async () => {
+                  setPluginBusy(true);
+                  try {
+                    await api.togglePlugin(p.id, !p.enabled);
+                    setPlugins((arr) => arr.map((x) => (x.id === p.id ? { ...x, enabled: !p.enabled } : x)));
+                  } finally {
+                    setPluginBusy(false);
+                  }
+                }}
+                disabled={pluginBusy}
+                title={p.enabled ? "停用插件" : "启用插件"}
+              />
+            </div>
+          ))}
+          {plugins.length === 0 && (
+            <p className="py-4 text-center text-sm text-neutral-400">还没有插件：把插件包放进上面的目录后点「重扫插件」</p>
           )}
         </div>
       </section>

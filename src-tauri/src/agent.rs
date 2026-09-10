@@ -235,6 +235,8 @@ pub(crate) fn auto_pass(mode: &str, tool: &str) -> bool {
 fn is_safe_tool(tool: &str) -> bool {
     const SAFE: &[&str] = &[
         "add_memory",
+        // memory(id) 是只读取回，无副作用
+        "memory",
         "plan_update",
         // 自扩展（注册/覆盖工具）是沉淀类动作，auto 模式自动放行
         "add_tool",
@@ -281,13 +283,21 @@ pub async fn execute_tool_call(
             if runtime.is_empty() || code.is_empty() {
                 return Err("run_script requires runtime and code parameters".into());
             }
+            // 超时取 config.tool_timeout_secs（默认 120，上限 600），与自定义工具一致
+            let timeout_secs = ctx.config.lock().unwrap().tool_timeout_secs.clamp(1, 600) as u64;
             let ctx_cloned = ctx.clone();
             let handle = tauri::async_runtime::spawn_blocking(move || {
-                crate::script_runtime::run(&ctx_cloned, &runtime, &code, &script_params)
+                crate::script_runtime::run(
+                    &ctx_cloned,
+                    &runtime,
+                    &code,
+                    &script_params,
+                    std::time::Duration::from_secs(timeout_secs),
+                )
             });
-            let out = match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+            let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs + 5), handle).await {
                 Ok(res) => res.map_err(|e| format!("脚本任务失败: {e}"))?,
-                Err(_) => Err("Script execution timed out (30s)".into()),
+                Err(_) => Err(format!("Script execution timed out ({timeout_secs}s)")),
             };
             crate::audit::record(ctx, "ai-self", "script.run", "run_script", json!({ "ok": out.is_ok() }), out.is_ok());
             out
@@ -300,6 +310,25 @@ pub async fn execute_tool_call(
             }
             crate::memory::add_memory(ctx, content, kind, "ai");
             Ok(json!({ "saved": content }))
+        }
+        // memory(id)：按 id 取回记忆全文。manifest 与提示词都声明了该工具，
+        // 此前执行器漏了分支 → 模型调用必得 "Unknown tool 'memory'"（能写不能读）
+        "memory" => {
+            let id = params.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            if id.is_empty() {
+                return Err("memory requires the id parameter".into());
+            }
+            let memories = ctx.memories.lock().unwrap();
+            match memories.iter().find(|m| m.id.eq_ignore_ascii_case(id)) {
+                Some(m) => Ok(json!(m)),
+                None => {
+                    let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+                    Err(format!(
+                        "memory '{id}' not found. Available ids: {}",
+                        if ids.is_empty() { "(none)".to_string() } else { ids.join(", ") }
+                    ))
+                }
+            }
         }
         // ---- 已注册工具（内置 / 远程 / AI 自建解释器工具） ----
         other => {
@@ -327,12 +356,185 @@ pub async fn execute_tool_call(
     }
 }
 
-/// 幻觉防护备注：工具轮熔断 / 单词异常重复时在回复尾部追加标记行。
+/// 自定义工具返回图片：结果对象含 `image` 字段（data:URL / b64:<base64> / 本地路径）时，
+/// 推送 chat-image 事件到对话 UI 显示，并把该字段替换为回执说明。
+/// 图片本体不回喂模型（防上下文爆炸），模型只拿到"已送达"的确认
+fn extract_tool_image(ctx: &Arc<Ctx>, target: &str, result: &mut serde_json::Value) {
+    const MAX_IMG_BYTES: usize = 8 * 1024 * 1024;
+    let Some(img) = result.get("image").and_then(|x| x.as_str()).map(String::from) else {
+        return;
+    };
+    use base64::Engine as _;
+    let data_url = if img.starts_with("data:") {
+        img.clone()
+    } else if let Some(b64) = img.strip_prefix("b64:") {
+        format!("data:image/png;base64,{b64}")
+    } else {
+        // 本地路径：读文件 + 按扩展名猜 MIME
+        let mime = match img.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            Some("svg") => "image/svg+xml",
+            _ => "application/octet-stream",
+        };
+        match std::fs::read(&img) {
+            Ok(bytes) if bytes.len() <= MAX_IMG_BYTES => {
+                format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            Ok(_) => {
+                if let Some(o) = result.as_object_mut() {
+                    o.insert("image_error".into(), json!("image too large (>8MB), not delivered"));
+                }
+                return;
+            }
+            Err(e) => {
+                if let Some(o) = result.as_object_mut() {
+                    o.insert("image_error".into(), json!(format!("failed to read image: {e}")));
+                }
+                return;
+            }
+        }
+    };
+    crate::worker::emit_ui(&ctx.app, "chat-image", json!({ "session": target, "data_url": data_url }));
+    if let Some(o) = result.as_object_mut() {
+        o.insert("image".into(), json!("(image delivered to the user in the chat UI)"));
+    }
+}
+
+/// 文档/网页预览卡片：AI 写出可预览文件（html/md/svg）时发 file-preview 事件，
+/// 前端渲染"点击预览"卡片，点击后应用内直接查看并可持续指挥修改
+fn emit_preview_card(ctx: &Arc<Ctx>, target: &str, path: &str) {
+    let ext = path
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let kind = match ext.as_str() {
+        "html" | "htm" => "html",
+        "md" | "markdown" => "md",
+        "svg" => "svg",
+        _ => return,
+    };
+    crate::worker::emit_ui(
+        &ctx.app,
+        "file-preview",
+        json!({ "session": target, "path": path, "kind": kind }),
+    );
+}
+
+/// 落盘并推送模型生成的媒体（图片/视频共用）：
+/// 按 mime 分流——图片发 chat-image（含 data:URL，前端直接显示）；
+/// 视频体积大，只发 chat-video（含落盘路径，前端经 asset 协议加载）。
+/// 返回给模型的备注文本（含全部落盘路径，模型后续可引用/加工）；无媒体时返回空串
+fn deliver_generated_media(ctx: &Arc<Ctx>, target: &str, media: &[(ai::TokenKind, String)]) -> String {
+    use base64::Engine as _;
+    let dir = ctx.image_dir();
+    let mut notes = Vec::new();
+    for (kind, du) in media {
+        // 解析 data:URL：data:<mime>;base64,<payload>
+        let Some((mime, payload)) = du.strip_prefix("data:").and_then(|s| s.split_once(";base64,")) else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) else {
+            continue;
+        };
+        let ext = match mime.rsplit('/').next().unwrap_or("png") {
+            "jpeg" => "jpg",
+            "svg+xml" => "svg",
+            "mp4" => "mp4",
+            "webm" => "webm",
+            "quicktime" => "mov",
+            "x-matroska" => "mkv",
+            e => e,
+        };
+        let prefix = if *kind == ai::TokenKind::Video { "vid" } else { "gen" };
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S%3f");
+        let path = dir.join(format!("{prefix}_{ts}.{ext}"));
+        if std::fs::write(&path, &bytes).is_ok() {
+            let path_str = path.to_string_lossy().to_string();
+            if *kind == ai::TokenKind::Video {
+                // 视频 data URL 太大（几十 MB 会撑爆事件通道），只发路径，前端走 asset 协议
+                crate::worker::emit_ui(
+                    &ctx.app,
+                    "chat-video",
+                    json!({ "session": target, "path": path_str, "mime": mime }),
+                );
+            } else {
+                crate::worker::emit_ui(
+                    &ctx.app,
+                    "chat-image",
+                    json!({ "session": target, "data_url": du, "path": path_str }),
+                );
+            }
+            notes.push(path_str);
+        }
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n[{} media file(s) delivered to the user and saved to: {}]", notes.len(), notes.join(", "))
+    }
+}
+
+/// 提取并保存回复里的 SVG 绘图（ER 图/架构图/时序图等模型常用 ```svg / ```xml 代码块输出）：
+/// 每块落盘 diagram_<ts>.svg + 以 data URL 推送 chat-image 气泡（浏览器原生渲染 SVG）。
+/// 返回追加给模型的备注（告知文件路径）；无 SVG 块时返回空串
+fn deliver_svg_blocks(ctx: &Arc<Ctx>, target: &str, reply: &str) -> String {
+    use base64::Engine as _;
+    let mut saved = Vec::new();
+    let mut rest = reply;
+    while let Some(pos) = rest.find("<svg") {
+        // 块结束：优先找 </svg>；找不到就跳过（截断的残块不入库）
+        let Some(end) = rest[pos..].find("</svg>") else { break };
+        let svg = &rest[pos..pos + end + 6];
+        rest = &rest[pos + end + 6..];
+        let dir = ctx.image_dir();
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S%3f");
+        let path = dir.join(format!("diagram_{ts}.svg"));
+        if std::fs::write(&path, svg).is_ok() {
+            let data_url = format!(
+                "data:image/svg+xml;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(svg)
+            );
+            crate::worker::emit_ui(
+                &ctx.app,
+                "chat-image",
+                json!({ "session": target, "data_url": data_url, "path": path.to_string_lossy() }),
+            );
+            saved.push(path.to_string_lossy().to_string());
+        }
+    }
+    if saved.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n[{} SVG diagram(s) rendered in chat and saved to: {}]", saved.len(), saved.join(", "))
+    }
+}
+
+/// 幻觉防护备注：工具轮熔断 / 相同调用连跑 / 单词异常重复时在回复尾部追加标记行。
 /// 标记同时作为 auto-drive 的暂停信号（幻觉循环里继续自驱只会空烧 token）。
-fn guard_suffix(ctx: &Arc<Ctx>, visible: &str, tool_capped: bool, tool_rounds: usize, loop_max: u32) -> String {
+/// dup_repeats > 0 表示「与上一轮完全相同的工具调用」连续出现的额外轮数（≥2 触发熔断）
+fn guard_suffix(
+    ctx: &Arc<Ctx>,
+    visible: &str,
+    tool_capped: bool,
+    tool_rounds: usize,
+    loop_max: u32,
+    dup_repeats: usize,
+) -> String {
     let mut out = visible.to_string();
     if tool_capped {
-        let note = format!("[tool-loop-guard] stopped after {tool_rounds} tool rounds (limit {loop_max}).");
+        let note = if dup_repeats >= 2 {
+            format!(
+                "[tool-loop-guard] stopped: the same tool calls repeated {} consecutive rounds with identical arguments (rounds used {tool_rounds}/{loop_max}).",
+                dup_repeats + 1
+            )
+        } else {
+            format!("[tool-loop-guard] stopped after {tool_rounds} tool rounds (limit {loop_max}).")
+        };
         if out.trim().is_empty() {
             out = note;
         } else {
@@ -528,11 +730,24 @@ pub async fn chat_turn(
     // 静态值，回合内不再探测、不中途变轨——端点不支持 tools 时直接报错指路兼容模式
     let native_mode = !ctx.config.lock().unwrap().compat_mode;
 
-    // 2) 构造发给模型的对话（system + 历史 + 每轮追加的工具反馈）
+// 2) 构造发给模型的对话（system + 历史 + 每轮追加的工具反馈）
     // 提示词随协议选择切换：原生模式不教文本调用格式，避免两种约定互相干扰
+    // 锁治理：sessions 锁只在“快照历史”时持有，构建 system prompt（内部取 memories/config 等锁）在锁外进行
     let mut convo: Vec<ChatMessage> = {
-        let store = ctx.sessions.lock().unwrap();
-        let sess = store.sessions.iter().find(|s| s.id == target).ok_or("会话不存在")?;
+        let history: Vec<(String, String)> = {
+            let store = ctx.sessions.lock().unwrap();
+            store
+                .sessions
+                .iter()
+                .find(|s| s.id == target)
+                .map(|sess| {
+                    history_window(&sess.messages)
+                        .iter()
+                        .map(|m| (m.role.clone(), m.content.clone()))
+                        .collect()
+                })
+                .ok_or("会话不存在")?
+        };
         let sys = if native_mode {
             ai::system_prompt_native(ctx, Some(&target))
         } else {
@@ -540,8 +755,8 @@ pub async fn chat_turn(
         };
         let mut v = vec![ChatMessage::system(sys)];
         // 只取最近若干条，且剥离 tool_calls（模型请求只需 role/content）
-        for m in history_window(&sess.messages) {
-            v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None });
+        for (role, content) in history {
+            v.push(ChatMessage { role, content, tool_calls: Vec::new(), thinking: None, ts: None });
         }
         v
     };
@@ -555,6 +770,9 @@ pub async fn chat_turn(
     let mut net_retries = 2usize;
     // 幻觉防护：本回合已执行的「工具调用轮」计数（tool_loop_max 熔断）
     let mut tool_rounds = 0usize;
+    // 内容级幻觉防护：连续两轮「完全相同的工具调用集合」（工具名+参数签名一致）→ 死循环
+    let mut last_round_sig = String::new();
+    let mut dup_repeats = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
@@ -581,7 +799,7 @@ pub async fn chat_turn(
                     *round_thinking.lock().unwrap() = r.thinking;
                     // 记录本轮用量并推送缓存命中率统计
                     let payload = record_and_payload(ctx, &target, &r.usage);
-                    let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
+                    crate::worker::emit_ui(&ctx.app, "chat-usage", json!({ "session": target, "usage": payload }));
                     // 原生模式只认协议字段里的调用；正文 JSON 解析是兼容模式（文本约定）的专属职责
                     (r.content, r.calls)
                 }
@@ -606,14 +824,21 @@ pub async fn chat_turn(
             // 文本协议统一走 SSE 流式（与桌面端一致）：非流式请求会被仅支持流式的端点拒绝
             // 思考过程增量（reasoning/thinking）累积进 round_thinking，随消息落库
             let think_buf = round_thinking.clone();
+            let gen_media: Arc<std::sync::Mutex<Vec<(ai::TokenKind, String)>>> = Arc::default();
+            let media_acc = gen_media.clone();
             let stream = ai::chat_stream_with_images(ctx, &convo, round_images, move |kind, tok| {
-                if kind == ai::TokenKind::Think {
-                    think_buf.lock().unwrap().push_str(tok);
+                match kind {
+                    ai::TokenKind::Think => think_buf.lock().unwrap().push_str(tok),
+                    // 绘画/视频模型输出：data:URL 先收集，流结束后落盘+推送
+                    ai::TokenKind::Image | ai::TokenKind::Video => {
+                        media_acc.lock().unwrap().push((kind, tok.to_string()));
+                    }
+                    _ => {}
                 }
                 true
             })
             .await;
-            let (reply, usage) = match stream {
+            let (mut reply, usage) = match stream {
                 Ok(r) => r,
                 // 瞬态网络错误（流截断/连接失败）：自动重走本轮，业务错误不重试
                 Err(ref e) if ai::is_transient_net_error(e) && net_retries > 0 => {
@@ -626,7 +851,17 @@ pub async fn chat_turn(
             };
             // 记录本轮用量并推送缓存命中率统计
             let payload = record_and_payload(ctx, &target, &usage);
-            let _ = ctx.app.emit("chat-usage", json!({ "session": target, "usage": payload }));
+            let _ = crate::worker::emit_ui(&ctx.app, "chat-usage", json!({ "session": target, "usage": payload }));
+            // 模型生成媒体：落盘 + 推送对话 UI，回复追加落盘路径（模型后续可引用）
+            let gen_note = deliver_generated_media(ctx, &target, &gen_media.lock().unwrap().drain(..).collect::<Vec<_>>());
+            if !gen_note.is_empty() {
+                reply.push_str(&gen_note);
+            }
+            // 回复里的 SVG 绘图（ER图/架构图/时序图）：落盘 + 推送渲染
+            let svg_note = deliver_svg_blocks(ctx, &target, &reply);
+            if !svg_note.is_empty() {
+                reply.push_str(&svg_note);
+            }
             let calls = match parse_tool_calls(&reply) {
                 Some(tc) if !tc.is_empty() && looks_like_tool_calls(&tc) => text_calls_to_native(&tc),
                 _ => Vec::new(),
@@ -636,7 +871,25 @@ pub async fn chat_turn(
 
         // 幻觉防护：工具调用轮达到配置上限时不再执行（回合走收尾，附熔断说明，0=不设限）
         let loop_max = ctx.config.lock().unwrap().tool_loop_max;
-        let tool_capped = loop_max > 0 && tool_rounds >= loop_max as usize;
+        // 内容级查重：本轮回调集合签名与上一轮完全相同 → 疑似死循环，连续 3 次即熔断
+        // （轮次多但每次参数在变 = 正常探索，不触发；签名按工具名+排序后参数生成）
+        {
+            let mut sigs: Vec<String> = native_calls
+                .iter()
+                .map(|c| crate::repetition::call_signature(&c.name, &c.args))
+                .collect();
+            sigs.sort();
+            sigs.dedup();
+            let sig = sigs.join(";");
+            if !sig.is_empty() && sig == last_round_sig {
+                dup_repeats += 1;
+            } else {
+                dup_repeats = 0;
+            }
+            last_round_sig = sig;
+        }
+        let tool_capped =
+            (loop_max > 0 && tool_rounds >= loop_max as usize) || dup_repeats >= 2;
         if !native_calls.is_empty() && !tool_capped {
             tool_rounds += 1;
             // 全量执行全部工具调用（不静默丢弃超限调用），并发上限 16，结果仍按调用顺序回喂
@@ -677,6 +930,12 @@ pub async fn chat_turn(
                     if let Some(obj) = result.as_object_mut() {
                         obj.remove("data_url");
                     }
+                }
+                // 自定义工具返回图片 → 推送对话 UI 显示（结果替换为回执说明，不回喂模型）
+                extract_tool_image(ctx, &target, &mut result);
+                // 写出可预览文件（html/md/svg）→ 前端预览卡片
+                if let Some(p) = result.get("path").and_then(|x| x.as_str()) {
+                    emit_preview_card(ctx, &target, p);
                 }
                 records.push(crate::ai::ToolCallRecord {
                     tool: call.name.clone(),
@@ -766,8 +1025,8 @@ pub async fn chat_turn(
         // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
         let visible = strip_tool_json(&strip_think_blocks(&reply));
         let visible = if visible.is_empty() { reply.clone() } else { visible };
-        // 幻觉防护备注：工具熔断 / 词重复（标记同时作为 auto-drive 的暂停信号）
-        let visible = guard_suffix(ctx, &visible, tool_capped, tool_rounds, loop_max);
+        // 幻觉防护备注：工具熔断（轮次或相同调用连跑）/ 词重复（标记同时作为 auto-drive 的暂停信号）
+        let visible = guard_suffix(ctx, &visible, tool_capped, tool_rounds, loop_max, dup_repeats);
         {
             // 思考过程随最终回复落库（与流式路径一致，否则 TUI/远程对话重启后思考丢失）
             let mut msg = ChatMessage::assistant(visible);
@@ -823,7 +1082,7 @@ pub async fn chat_turn_stream(
     let app = ctx.app.clone();
     let ev = event_name.to_string();
     let emit = move |payload: serde_json::Value| {
-        let _ = app.emit(&ev, payload);
+        crate::worker::emit_ui(&app, &ev, payload);
     };
 
     // 0) 同会话回合互斥：先抢锁后写历史，被拒绝的并发请求不落任何消息；
@@ -862,17 +1121,31 @@ pub async fn chat_turn_stream(
     // 全局静态开关，回合内不再探测、不中途变轨，提示词随协议选择切换
     let native_mode = !ctx.config.lock().unwrap().compat_mode;
 
+// 锁治理：sessions 锁只在“快照历史 + 确认会话存在”时持有，构建 system prompt
+    // （内部会取 memories/config 等锁）必须在释放 sessions 锁后进行，避免跨锁死锁。
     let mut convo: Vec<ChatMessage> = {
-        let store = ctx.sessions.lock().unwrap();
-        let sess = store.sessions.iter().find(|s| s.id == target).ok_or("会话不存在")?;
+        let history: Vec<(String, String)> = {
+            let store = ctx.sessions.lock().unwrap();
+            store
+                .sessions
+                .iter()
+                .find(|s| s.id == target)
+                .map(|sess| {
+                    history_window(&sess.messages)
+                        .iter()
+                        .map(|m| (m.role.clone(), m.content.clone()))
+                        .collect()
+                })
+                .ok_or("会话不存在")?
+        };
         let sys = if native_mode {
             ai::system_prompt_native(ctx, Some(&target))
         } else {
             ai::system_prompt(ctx, Some(&target))
         };
         let mut v = vec![ChatMessage::system(sys)];
-        for m in history_window(&sess.messages) {
-            v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None });
+        for (role, content) in history {
+            v.push(ChatMessage { role, content, tool_calls: Vec::new(), thinking: None, ts: None });
         }
         v
     };
@@ -887,6 +1160,9 @@ pub async fn chat_turn_stream(
     let mut net_retries = 2usize;
     // 幻觉防护：本回合已执行的「工具调用轮」计数（tool_loop_max 熔断）
     let mut tool_rounds = 0usize;
+    // 内容级幻觉防护：连续两轮「完全相同的工具调用集合」（工具名+参数签名一致）→ 死循环
+    let mut last_round_sig = String::new();
+    let mut dup_repeats = 0usize;
     loop {
         round += 1;
         if interrupted(ctx, &target) {
@@ -969,6 +1245,8 @@ pub async fn chat_turn_stream(
             let stream_cancelled = Arc::new(AtomicBool::new(false));
             // 服务器侧同步累积已流出的正文：中断/上游断流时把部分回复落库，避免内容"消失"
             let text_buf = Arc::new(std::sync::Mutex::new(String::new()));
+            // 绘画/视频模型输出收集（块外声明：流结束后落盘+推送要用）
+            let gen_media: Arc<std::sync::Mutex<Vec<(ai::TokenKind, String)>>> = Arc::default();
             let result = {
                 let emit_ref = &emit;
                 let sc = stream_cancelled.clone();
@@ -976,6 +1254,7 @@ pub async fn chat_turn_stream(
                 let icheck_target = target.clone();
                 let think_buf = round_thinking.clone();
                 let text_acc = text_buf.clone();
+                let media_acc = gen_media.clone();
                 ai::chat_stream_with_images(ctx, &convo, round_images, move |kind, tok| {
                     if interrupted(&icheck_ctx, &icheck_target) {
                         sc.store(true, Ordering::Relaxed);
@@ -990,6 +1269,10 @@ pub async fn chat_turn_stream(
                         ai::TokenKind::Text => {
                             text_acc.lock().unwrap().push_str(tok);
                             emit_ref(json!({ "type": "delta", "text": tok }));
+                        }
+                        // 绘画/视频模型输出：data:URL 先收集，流结束后统一落盘+推送
+                        ai::TokenKind::Image | ai::TokenKind::Video => {
+                            media_acc.lock().unwrap().push((kind, tok.to_string()));
                         }
                     }
                     true
@@ -1032,6 +1315,17 @@ pub async fn chat_turn_stream(
             let mut payload = record_and_payload(ctx, &target, &round_usage);
             payload["type"] = json!("usage");
             emit(payload);
+            // 模型生成媒体：落盘 + 推送对话 UI（气泡），落盘路径追加进回复供后续引用
+            let gen_note = deliver_generated_media(ctx, &target, &gen_media.lock().unwrap().drain(..).collect::<Vec<_>>());
+            let mut reply = reply;
+            if !gen_note.is_empty() {
+                reply.push_str(&gen_note);
+            }
+            // 回复里的 SVG 绘图（ER图/架构图/时序图）：落盘 + 推送渲染
+            let svg_note = deliver_svg_blocks(ctx, &target, &reply);
+            if !svg_note.is_empty() {
+                reply.push_str(&svg_note);
+            }
             let calls = match parse_tool_calls(&reply) {
                 Some(tc) if !tc.is_empty() && looks_like_tool_calls(&tc) => text_calls_to_native(&tc),
                 _ => Vec::new(),
@@ -1043,7 +1337,25 @@ pub async fn chat_turn_stream(
 
         // 幻觉防护：工具调用轮达到配置上限时不再执行（回合走收尾，附熔断说明，0=不设限）
         let loop_max = ctx.config.lock().unwrap().tool_loop_max;
-        let tool_capped = loop_max > 0 && tool_rounds >= loop_max as usize;
+        // 内容级查重：本轮回调集合签名与上一轮完全相同 → 疑似死循环，连续 3 次即熔断
+        // （轮次多但每次参数在变 = 正常探索，不触发；签名按工具名+排序后参数生成）
+        {
+            let mut sigs: Vec<String> = native_calls
+                .iter()
+                .map(|c| crate::repetition::call_signature(&c.name, &c.args))
+                .collect();
+            sigs.sort();
+            sigs.dedup();
+            let sig = sigs.join(";");
+            if !sig.is_empty() && sig == last_round_sig {
+                dup_repeats += 1;
+            } else {
+                dup_repeats = 0;
+            }
+            last_round_sig = sig;
+        }
+        let tool_capped =
+            (loop_max > 0 && tool_rounds >= loop_max as usize) || dup_repeats >= 2;
         if !native_calls.is_empty() && !tool_capped {
             tool_rounds += 1;
             // 全量执行全部工具调用（不静默丢弃超限调用），并发上限 16，结果仍按调用顺序回喂
@@ -1092,6 +1404,12 @@ pub async fn chat_turn_stream(
                     if let Some(obj) = result.as_object_mut() {
                         obj.remove("data_url");
                     }
+                }
+                // 自定义工具返回图片 → 推送对话 UI 显示（结果替换为回执说明，不回喂模型）
+                extract_tool_image(ctx, &target, &mut result);
+                // 写出可预览文件（html/md/svg）→ 前端预览卡片
+                if let Some(p) = result.get("path").and_then(|x| x.as_str()) {
+                    emit_preview_card(ctx, &target, p);
                 }
                 records.push(crate::ai::ToolCallRecord {
                     tool: call.name.clone(),
@@ -1183,8 +1501,8 @@ pub async fn chat_turn_stream(
         // 纯文本回复：存入会话并结束（同时去掉思考块残渣）
         let visible = strip_tool_json(&strip_think_blocks(&reply));
         let visible = if visible.is_empty() { reply.clone() } else { visible };
-        // 幻觉防护备注：工具熔断 / 词重复（标记同时作为 auto-drive 的暂停信号）
-        let visible = guard_suffix(ctx, &visible, tool_capped, tool_rounds, loop_max);
+        // 幻觉防护备注：工具熔断（轮次或相同调用连跑）/ 词重复（标记同时作为 auto-drive 的暂停信号）
+        let visible = guard_suffix(ctx, &visible, tool_capped, tool_rounds, loop_max, dup_repeats);
         {
             let mut msg = ChatMessage::assistant(visible);
             msg.thinking = opt_thinking(&round_thinking);
@@ -1224,12 +1542,26 @@ pub fn build_context(
     } else {
         session_id.to_string()
     };
-    let store = ctx.sessions.lock().unwrap();
-    let sess = store
-        .sessions
-        .iter()
-        .find(|s| s.id == target)
-        .ok_or("会话不存在")?;
+    // 锁序纪律：sessions 锁只用于取出目标会话与最近消息（克隆），立即释放后再调
+    // system_prompt / tools_manifest——它们内部要取 config/memories/tools 等锁，
+    // 跨锁持有 sessions 会与「config→sessions」顺序的调用方形成永久死锁
+    let recent = {
+        let store = ctx.sessions.lock().unwrap();
+        let sess = store
+            .sessions
+            .iter()
+            .find(|s| s.id == target)
+            .ok_or("会话不存在")?;
+        sess.messages
+            .iter()
+            .rev()
+            .take(24)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     // 预览提示词随协议选择（与 chat_turn 一致）：兼容模式用文本约定版，否则原生版
     let compat = ctx.config.lock().unwrap().compat_mode;
     let mut v = vec![ChatMessage::system(if compat {
@@ -1237,8 +1569,8 @@ pub fn build_context(
     } else {
         ai::system_prompt_native(ctx, Some(&target))
     })];
-    for m in sess.messages.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
-        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None });
+    for m in recent {
+        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None, ts: None });
     }
     Ok((v, ai::tools_manifest(ctx)))
 }

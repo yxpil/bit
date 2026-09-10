@@ -87,6 +87,8 @@ pub struct Ctx {
     pub sessions_disk_ts: Mutex<Option<std::time::SystemTime>>,
     /// 已接入的 MCP 服务器（Streamable HTTP）
     pub mcp: Mutex<Vec<crate::mcp::McpServer>>,
+    /// 本地插件列表（toolhomes/plugins/*/plugin.json）
+    pub plugins: Mutex<Vec<crate::plugins::Plugin>>,
     /// BIT 作为 MCP 服务器时分配的会话（session_id → 最后活跃时刻）。
     /// 内存态：进程重启即失效，客户端需重新 initialize
     pub mcp_sessions: Mutex<HashMap<String, std::time::Instant>>,
@@ -133,6 +135,14 @@ pub struct PendingApproval {
 }
 
 impl Ctx {
+    /// 图片缓存目录（数据目录下 images/）：模型生成图片 / 工具产图的统一落盘位置，
+    /// 系统提示词会把该路径告知模型作为工作区
+    pub fn image_dir(&self) -> PathBuf {
+        let d = self.data_dir.join("images");
+        fs::create_dir_all(&d).ok();
+        d
+    }
+
     pub fn load(app: tauri::AppHandle) -> Arc<Ctx> {
         // BIT_DATA_DIR：测试/E2E 用的数据目录覆盖（隔离环境验证默认配置），未设置走 Tauri 标准 app_data_dir
         let data_dir = match std::env::var("BIT_DATA_DIR") {
@@ -242,6 +252,8 @@ impl Ctx {
             sessions: Mutex::new(sessions),
             sessions_disk_ts: Mutex::new(None),
             mcp: Mutex::new(mcp),
+            // 本地插件列表（toolhomes/plugins/*/plugin.json，启动/重扫时刷新）
+            plugins: Mutex::new(Vec::new()),
             mcp_sessions: Mutex::new(HashMap::new()),
             interrupts: Mutex::new(HashMap::new()),
             turn_locks: Mutex::new(HashMap::new()),
@@ -315,7 +327,9 @@ impl Ctx {
         drop(tools);
         // 热加载：通知前端工具清单已变化（AI 注册/更新/删除/启停工具后页面即时刷新）
         use tauri::Emitter;
-        let _ = self.app.emit("tools-updated", ());
+        let _ = crate::worker::emit_ui(&self.app, "tools-updated", serde_json::json!({}));
+        // worker 模式下宿主保存工具后同步通知 worker 重读磁盘
+        crate::worker::notify_reload();
     }
 
     pub fn save_runtimes(&self) {
@@ -347,7 +361,7 @@ impl Ctx {
     }
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> {
     fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
 }
 

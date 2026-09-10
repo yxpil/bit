@@ -1,6 +1,6 @@
 [package]
 name = "bit"
-version = "0.6.3"
+version = "0.6.5"
 description = "BIT - Agent Tool Hub with audit and remote access"
 edition = "2021"
 
@@ -8,12 +8,17 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+# macos-private-api 与 tauri.conf.json 的 app.macOSPrivateApi=true 配套（官方要求）：
+# 该 feature 仅在 macOS 上产生实际效果，Windows/Linux 启用无副作用，
+# tauri-build 会合并解析 Cargo.toml 所有 target 的 features 与 conf 比对，因此统一声明。
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "protocol-asset"] }
 tauri-plugin-notification = "2"
 # 单实例保护：二次启动时唤起已有实例的主窗口而不是再开一个进程
 tauri-plugin-single-instance = "2"
 # 开机自动启动：写系统登录项（macOS LaunchAgent / Windows 注册表 Run / Linux autostart 目录）
 tauri-plugin-autostart = "2"
+# 全局快捷键：即使窗口隐藏/最小化也能用系统级热键唤出主界面
+tauri-plugin-global-shortcut = "2"
 # 守护进程：接力拉起前校验主程序二进制 sha256（防病毒换装借壳复活）
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -41,3 +46,9 @@ jieba-rs = "0.7"
 if-addrs = "0.13"
 qrcode = { version = "0.14", features = ["svg"] }
 ctrlc = "3"
+# 调试追踪：无锁 channel + 后台 flush，死锁诊断专用
+crossbeam-channel = "0.5"
+# 本机操控三件套（实验性，设置页开关）：截屏 + 鼠标/键盘合成输入
+screenshots = "0.8"
+enigo = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }

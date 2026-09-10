@@ -43,6 +43,8 @@ export default function AiSettingsPage({ onStats, stats }) {
   // 幻觉防护阈值：word_repeat_max=单回复词重复上限 / tool_loop_max=单回合工具轮上限（0=关闭）
   const [limits, setLimits] = useState({ word_repeat_max: 20, tool_loop_max: 20 });
   const [limitsSaved, setLimitsSaved] = useState(false);
+  const [toolEnv, setToolEnv] = useState({ tool_timeout_secs: 120, default_shell: "", available_shells: [] });
+  const [toolEnvSaved, setToolEnvSaved] = useState(false);
   // AI 行为设置：自动推进 / 审批模式 / 敏感词审核 / 兼容模式
   const [behavior, setBehavior] = useState({
     auto_drive: true,
@@ -65,6 +67,10 @@ export default function AiSettingsPage({ onStats, stats }) {
   const [systemPromptSaved, setSystemPromptSaved] = useState(false);
   // 开机自动启动：null=加载中；开启后登录系统即在后台驻留（托盘）
   const [autostart, setAutostart] = useState(null);
+  // 唤出主界面的全局快捷键：文本框编辑 + 保存即生效（空 = 关闭）；冲突时后端返回错误原因
+  const [hotkey, setHotkey] = useState("");
+  const [hotkeySaved, setHotkeySaved] = useState(false);
+  const [hotkeyErr, setHotkeyErr] = useState("");
   // 从提供方 API 拉取的模型列表（点击模型名直接填充）
   const [remoteModels, setRemoteModels] = useState(null);
   const [fetchingModels, setFetchingModels] = useState(false);
@@ -75,6 +81,10 @@ export default function AiSettingsPage({ onStats, stats }) {
   const [elevErr, setElevErr] = useState("");
   // 自动运行（后台自主循环：记忆总结 / 技能提炼 / 目标行动）——运行总览里的小圆钮
   const [autoRun, setAutoRun] = useState(false);
+  // 本机操控三件套开关（screen/mouse/keyboard）
+  const [deskTools, setDeskTools] = useState({ screen: false, mouse: false, keyboard: false });
+  // 写文件后轻量语法检查（json/js/py）：出错提醒模型与用户
+  const [syntaxCheck, setSyntaxCheck] = useState(true);
 
   const load = () =>
     api.listProviders().then((r) => setProviders(r.providers || [])).catch(() => {});
@@ -82,6 +92,16 @@ export default function AiSettingsPage({ onStats, stats }) {
     load();
     api.getAiParams().then((r) => setParams({ temperature: r?.temperature ?? null, reasoning_effort: r?.reasoning_effort || "" })).catch(() => {});
     api.getGuardLimits().then((r) => setLimits({ word_repeat_max: r?.word_repeat_max ?? 20, tool_loop_max: r?.tool_loop_max ?? 20 })).catch(() => {});
+    api
+      .getToolEnvSettings()
+      .then((r) =>
+        setToolEnv({
+          tool_timeout_secs: r?.tool_timeout_secs ?? 120,
+          default_shell: r?.default_shell || "",
+          available_shells: r?.available_shells || [],
+        })
+      )
+      .catch(() => {});
     api
       .getBehaviorSettings()
       .then((r) => {
@@ -101,6 +121,8 @@ export default function AiSettingsPage({ onStats, stats }) {
     api.getCustomPrompt().then((r) => setCustomPrompt(r?.custom_prompt || "")).catch(() => {});
     api.getSystemPrompt().then((r) => setSystemPrompt(r?.system_prompt || "")).catch(() => {});
     api.getAutostart().then((r) => setAutostart(!!r?.enabled)).catch(() => setAutostart(false));
+    api.getHotkey().then((r) => setHotkey(r?.hotkey || "")).catch(() => {});
+    api.getDesktopTools().then((r) => setDeskTools({ screen: !!r?.screen, mouse: !!r?.mouse, keyboard: !!r?.keyboard })).catch(() => {});
     api.getElevation().then((r) => setElevation({ active: !!r?.active, enabled: !!r?.enabled })).catch(() => setElevation({ active: false, enabled: false }));
   }, []);
 
@@ -149,6 +171,17 @@ export default function AiSettingsPage({ onStats, stats }) {
       api.setGuardLimits(next.word_repeat_max, next.tool_loop_max).then(() => {
         setLimitsSaved(true);
         setTimeout(() => setLimitsSaved(false), 1500);
+      }).catch(() => {});
+    }, 300);
+  };
+  const toolEnvRef = useRef(null);
+  const saveToolEnv = (next) => {
+    setToolEnv(next);
+    if (toolEnvRef.current) clearTimeout(toolEnvRef.current);
+    toolEnvRef.current = setTimeout(() => {
+      api.setToolEnvSettings(next.tool_timeout_secs, next.default_shell).then(() => {
+        setToolEnvSaved(true);
+        setTimeout(() => setToolEnvSaved(false), 1500);
       }).catch(() => {});
     }, 300);
   };
@@ -528,6 +561,56 @@ export default function AiSettingsPage({ onStats, stats }) {
         </div>
       </div>
 
+      {/* 工具环境：自定义工具超时 / 默认 shell */}
+      <div className="card flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">工具环境</p>
+            <p className="mt-0.5 text-xs text-neutral-500">
+              自定义工具的执行超时与 agent 执行命令所用的 shell；AI 代码环境统一收纳在数据目录 toolhomes（python venv / node_modules 自动就绪）
+            </p>
+          </div>
+          {toolEnvSaved && (
+            <span className="flex items-center gap-1 text-xs text-neutral-500">
+              <IconCheck size={14} />
+              {t("common.saved")}
+            </span>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="mb-1 block px-2 text-xs text-neutral-500">工具超时（秒）</label>
+            <input
+              className="field tabular-nums"
+              type="number"
+              min="10"
+              max="600"
+              value={toolEnv.tool_timeout_secs}
+              onChange={(e) =>
+                saveToolEnv({ ...toolEnv, tool_timeout_secs: Math.max(10, Math.min(600, parseInt(e.target.value, 10) || 120)) })
+              }
+            />
+            <p className="mt-1 px-2 text-[11px] text-neutral-400">默认 120，上限 600：鼠标/屏幕监听类长循环脚本建议调大</p>
+          </div>
+          <div>
+            <label className="mb-1 block px-2 text-xs text-neutral-500">默认 Shell</label>
+            <select
+              className="field"
+              value={toolEnv.default_shell}
+              onChange={(e) => saveToolEnv({ ...toolEnv, default_shell: e.target.value })}
+            >
+              <option value="">自动识别（推荐）</option>
+              {toolEnv.available_shells.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 px-2 text-[11px] text-neutral-400">留空自动选本机最顺手的（Windows 优先 pwsh，Unix 优先登录 shell）</p>
+          </div>
+        </div>
+      </div>
+
       {/* AI 行为设置 */}
       <div className="card flex flex-col gap-4">
         <p className="text-sm font-medium">AI 行为设置</p>
@@ -725,6 +808,46 @@ export default function AiSettingsPage({ onStats, stats }) {
         </div>
       </div>
 
+      {/* 本机操控三件套（实验性）：AI 可截屏看屏 / 控鼠标 / 打字按键 */}
+      <div className="card flex flex-col gap-3">
+        <div>
+          <p className="text-sm font-medium">{t("ai.desktopToolsTitle")}</p>
+          <p className="mt-0.5 text-xs text-neutral-500">{t("ai.desktopToolsDesc")}</p>
+        </div>
+        {[
+          ["screen", "ai.desktopScreen"],
+          ["mouse", "ai.desktopMouse"],
+          ["keyboard", "ai.desktopKeyboard"],
+        ].map(([key, label]) => (
+          <div key={key} className="flex items-center justify-between">
+            <p className="text-xs text-neutral-600 dark:text-neutral-400">{t(label)}</p>
+            <PillSwitch
+              checked={deskTools[key]}
+              onChange={(v) => {
+                const next = { ...deskTools, [key]: v };
+                setDeskTools(next);
+                api.setDesktopTools(next.screen, next.mouse, next.keyboard).catch(() => {});
+              }}
+            />
+          </div>
+        ))}
+      </div>
+
+      {/* 写文件语法检查：写入/编辑 json、js、py 后自动体检，出错提醒模型与用户 */}
+      <div className="card flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{t("ai.syntaxCheckTitle")}</p>
+          <p className="mt-0.5 text-xs text-neutral-500">{t("ai.syntaxCheckDesc")}</p>
+        </div>
+        <PillSwitch
+          checked={syntaxCheck}
+          onChange={(v) => {
+            setSyntaxCheck(v);
+            api.setSyntaxCheck(v).catch(() => {});
+          }}
+        />
+      </div>
+
       {/* 用户自定义提示词/人设：追加到 system prompt 开头 */}
       <div className="card flex flex-col gap-3">
         <div className="flex items-center justify-between">
@@ -786,6 +909,48 @@ export default function AiSettingsPage({ onStats, stats }) {
           onChange={toggleAutostart}
         />
       </div>
+
+      {/* 全局快捷键：唤出主界面（窗口隐藏/最小化时也能系统级唤出） */}
+      <div className="card flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">{t("ai.hotkeyTitle")}</p>
+          <p className="mt-0.5 text-xs text-neutral-500">{t("ai.hotkeyDesc")}</p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <input
+            value={hotkey}
+            onChange={(e) => setHotkey(e.target.value)}
+            placeholder="Alt+Shift+B"
+            className="w-40 rounded-full border border-neutral-200 bg-transparent px-3 py-1.5 text-center font-mono text-xs outline-none focus:border-neutral-400 dark:border-neutral-700"
+          />
+          {hotkey && (
+            <button
+              className="text-xs text-neutral-400 hover:text-red-500"
+              title={t("ai.hotkeyClear")}
+              onClick={() => {
+                setHotkey("");
+                api.setHotkey("").then(() => setHotkeySaved(true)).catch(() => {});
+                setTimeout(() => setHotkeySaved(false), 1500);
+              }}
+            >
+              {t("common.clear") || "清空"}
+            </button>
+          )}
+          <button
+            className="pill pill-hover text-xs"
+            onClick={() => {
+              setHotkeyErr("");
+              api.setHotkey(hotkey).then(() => {
+                setHotkeySaved(true);
+                setTimeout(() => setHotkeySaved(false), 1500);
+              }).catch((e) => setHotkeyErr(String(e)));
+            }}
+          >
+            {hotkeySaved ? "✓" : t("common.save") || "保存"}
+          </button>
+        </div>
+      </div>
+      {hotkeyErr && <p className="-mt-2 text-xs text-red-500 dark:text-red-400">{hotkeyErr}</p>}
 
       {/* 高权限模式：以管理员/root 身份重启（触发系统授权弹窗），提权后 AI 的 shell 等工具拥有管理员权限 */}
       <div className="card flex items-center justify-between gap-3">

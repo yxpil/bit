@@ -2,21 +2,6 @@
   "$schema": "https://schema.tauri.app/config/2",
   "app": {
     "macOSPrivateApi": true,
-    "windows": [
-      {
-        "title": "BIT",
-        "width": 1120,
-        "height": 740,
-        "minWidth": 920,
-        "minHeight": 620,
-        "center": true,
-        "decorations": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "transparent": true,
-        "shadow": true,
-        "visible": true
-      }
-    ]
+    "windows": []
   }
 }

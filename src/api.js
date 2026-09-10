@@ -33,6 +33,14 @@ export const api = {
   getGuardLimits: () => invoke("get_guard_limits"),
   setGuardLimits: (word_repeat_max, tool_loop_max) =>
     invoke("set_guard_limits", { wordRepeatMax: word_repeat_max, toolLoopMax: tool_loop_max }),
+  // 工具环境：自定义工具超时（秒）+ 默认 shell（空=自动识别，列表来自本机探测）
+  getToolEnvSettings: () => invoke("get_tool_env_settings"),
+  setToolEnvSettings: (tool_timeout_secs, default_shell) =>
+    invoke("set_tool_env_settings", { toolTimeoutSecs: tool_timeout_secs, defaultShell: default_shell }),
+  // 本地插件（toolhomes/plugins/*/plugin.json）
+  listPlugins: () => invoke("list_plugins"),
+  togglePlugin: (id, enabled) => invoke("toggle_plugin", { id, enabled }),
+  refreshPlugins: () => invoke("refresh_plugins"),
   // 用户自定义提示词/人设
   getCustomPrompt: () => invoke("get_custom_prompt"),
   setCustomPrompt: (custom_prompt) => invoke("set_custom_prompt", { customPrompt: custom_prompt }),
@@ -123,6 +131,15 @@ export const api = {
   getToolApproval: () => invoke("get_tool_approval"),
   getAutostart: () => invoke("get_autostart"),
   setAutostart: (enabled) => invoke("set_autostart", { enabled }),
+  // 全局快捷键：唤出主界面（空 = 关闭）
+  getHotkey: () => invoke("get_hotkey"),
+  setHotkey: (hotkey) => invoke("set_hotkey", { hotkey }),
+  // 本机操控三件套开关（screen/mouse/keyboard，实验性）
+  getDesktopTools: () => invoke("get_desktop_tools"),
+  setDesktopTools: (screen, mouse, keyboard) => invoke("set_desktop_tools", { screen, mouse, keyboard }),
+  // 写文件后轻量语法检查（json/js/py）：出错提醒模型与用户
+  getSyntaxCheck: () => invoke("get_syntax_check"),
+  setSyntaxCheck: (enabled) => invoke("set_syntax_check", { enabled }),
   getElevation: () => invoke("get_elevation"),
   setElevation: (enabled) => invoke("set_elevation", { enabled }),
   // 自动运行：后台自主循环（记忆总结 / 技能提炼 / 目标行动），AI 设置里的圆钮开关
