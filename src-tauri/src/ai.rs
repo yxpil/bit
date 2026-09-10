@@ -51,6 +51,10 @@ pub struct AiConfig {
     /// 由模型列表接口尽力获取，openai 兼容端适配多种常见字段，gemini 用 inputTokenLimit，claude 用家族默认
     #[serde(default)]
     pub model_context: std::collections::BTreeMap<String, u64>,
+    /// 回复长度上限（max_tokens）：None = 不限制（openai 兼容端不发该字段，由端点给默认最大；
+    /// Claude 协议必填该字段，退回 8192）。此前硬编码 8192，长回复（如整幅 SVG 卡片）会被截断
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl AiConfig {
@@ -679,8 +683,12 @@ async fn stream_claude<F: FnMut(TokenKind, &str) -> bool>(
     on_token: &mut F,
 ) -> Result<(String, TokenUsage), String> {
     let (system_txt, mut msgs) = claude_messages(messages, images);
+    // Claude 协议 max_tokens 必填：默认 8192，配置了 max_output_tokens 则跟随
     let mut body = serde_json::json!({
-        "model": p.model, "max_tokens": 8192, "messages": msgs, "stream": true
+        "model": p.model,
+        "max_tokens": params.max_output_tokens.filter(|&n| n > 0).unwrap_or(8192),
+        "messages": msgs,
+        "stream": true
     });
     apply_params("claude", &mut body, params);
     claude_apply_cache(&mut body, &system_txt, &mut msgs);
@@ -945,8 +953,12 @@ async fn chat_openai(
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
     // 只发送 role/content（图片挂到最后一条 user），剥离本地可视化用的 tool_calls 字段
     let msgs = openai_messages(messages, images);
-    let mut body = serde_json::json!({ "model": p.model, "messages": msgs, "max_tokens": 8192 });
+    let mut body = serde_json::json!({ "model": p.model, "messages": msgs });
     apply_params("openai", &mut body, params);
+    // 回复长度：默认不限制（不发 max_tokens，端点给默认最大）；配置了 max_output_tokens 才显式发送
+    if let Some(n) = params.max_output_tokens.filter(|&n| n > 0) {
+        body["max_tokens"] = serde_json::json!(n);
+    }
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", p.api_key))
@@ -1092,7 +1104,8 @@ async fn chat_claude(
     let (system_txt, mut msgs) = claude_messages(messages, images);
     let mut body = serde_json::json!({
         "model": p.model,
-        "max_tokens": 8192,
+        // Claude 协议 max_tokens 必填：默认 8192，配置了 max_output_tokens 则跟随
+        "max_tokens": params.max_output_tokens.filter(|&n| n > 0).unwrap_or(8192),
         "messages": msgs,
     });
     apply_params("claude", &mut body, params);
@@ -1506,7 +1519,7 @@ let word_lists: Vec<Vec<String>> = mem_items.iter().map(|(_, content)| cut(conte
     runtime_info.push_str(&format!(
         "\n## Media cache folder\n\
         - Images/videos/SVG generated or drawn are auto-saved under: {} — use it for intermediate media; to show a picture, output an \"image\" field (path/b64:/data:URL) from tool stdout\n\
-        - Diagrams (ER/architecture/sequence): output SVG directly in the reply — auto-rendered and saved as .svg",
+        - Diagrams (ER/architecture/sequence): ```mermaid fenced blocks render like GitHub; or output SVG directly — both auto-rendered",
         ctx.image_dir().display()
     ));
     if !goal_lines.is_empty() {
@@ -2184,13 +2197,16 @@ fn openai_native_body(
         .collect();
     let mut body = serde_json::json!({
         "model": p.model,
-        // DeepSeek 等默认 max_tokens=4096：长预告+工具调用易撞上限导致“话说一半没调用”，放宽到 8192
-        "max_tokens": 8192,
+        // DeepSeek 等默认 max_tokens=4096：长预告+工具调用易撞上限导致“话说一半没调用”。
+        // 默认不发该字段（端点给默认最大 = 不限制）；配置了 max_output_tokens 才显式发送
         "messages": msgs,
         "tools": tools,
         "tool_choice": "auto",
     });
     apply_params("openai", &mut body, params);
+    if let Some(n) = params.max_output_tokens.filter(|&n| n > 0) {
+        body["max_tokens"] = serde_json::json!(n);
+    }
     body
 }
 
@@ -2243,7 +2259,8 @@ fn claude_native_body(
         .collect();
     let mut body = serde_json::json!({
         "model": p.model,
-        "max_tokens": 8192,
+        // Claude 协议 max_tokens 必填：默认 8192，配置了 max_output_tokens 则跟随
+        "max_tokens": params.max_output_tokens.filter(|&n| n > 0).unwrap_or(8192),
         "messages": msgs,
         "tools": tools,
         "tool_choice": {"type": "auto"},

@@ -801,7 +801,14 @@ pub async fn chat_turn(
                     let payload = record_and_payload(ctx, &target, &r.usage);
                     crate::worker::emit_ui(&ctx.app, "chat-usage", json!({ "session": target, "usage": payload }));
                     // 原生模式只认协议字段里的调用；正文 JSON 解析是兼容模式（文本约定）的专属职责
-                    (r.content, r.calls)
+                    // 原生分支同样要提取回复里的 SVG 绘图：此前只有文本分支有，导致走原生
+                    // function calling（如 DeepSeek）时模型输出的 SVG 不渲染、只显示代码
+                    let mut content = r.content;
+                    let svg_note = deliver_svg_blocks(ctx, &target, &content);
+                    if !svg_note.is_empty() {
+                        content.push_str(&svg_note);
+                    }
+                    (content, r.calls)
                 }
                 Err(ai::NativeErr::Unsupported(e)) => {
                     // 端点拒绝 tools 参数：标准协议直接报错，不做自动降级/探测重试。
@@ -1210,7 +1217,13 @@ pub async fn chat_turn_stream(
                     payload["type"] = json!("usage");
                     emit(payload);
                     // 原生模式只认协议字段里的调用；正文 JSON 解析是兼容模式（文本约定）的专属职责
-                    (r.content, r.calls)
+                    // 原生分支同样要提取回复里的 SVG 绘图（与 chat_turn 同因：漏了导致原生模式下 SVG 不渲染）
+                    let mut content = r.content;
+                    let svg_note = deliver_svg_blocks(ctx, &target, &content);
+                    if !svg_note.is_empty() {
+                        content.push_str(&svg_note);
+                    }
+                    (content, r.calls)
                 }
                 Err(ai::NativeErr::Unsupported(e)) => {
                     // 端点拒绝 tools 参数：标准协议直接报错，不做自动降级。

@@ -1309,7 +1309,8 @@ export default function ChatPage({ onStats, visible }) {
               {t("chat.emptyHint")}
             </div>
           )}
-          <div className="flex flex-col gap-3">
+          {/* 消息列限宽居中：宽窗口下长文本行不拉满，保持可读（约 72 字符/行） */}
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-3">
             {(() => {
               // QQ 式时间分割线：相邻两条消息（带时间戳的）间隔 ≥5 分钟时，
               // 在后一条上方画一条居中时间线，方便回看历史定位时间点。
@@ -1712,7 +1713,8 @@ export default function ChatPage({ onStats, visible }) {
           )}
 
           {/* 底部 pb-12 为工具栏/发送按钮预留独立一行：textarea 只在自己的区域滚动，永不进入按钮行 */}
-          <div className="relative rounded-2xl border border-neutral-300 bg-white pb-12 transition-colors focus-within:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:focus-within:border-neutral-200">
+          {/* 与消息列同宽（max-w-3xl 居中），视觉对齐 */}
+          <div className="relative mx-auto w-full max-w-3xl rounded-2xl border border-neutral-300 bg-white pb-12 transition-colors focus-within:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:focus-within:border-neutral-200">
             {/* 工具栏：左下角 absolute 排成一行（外层按钮收进输入框内） */}
             <div className="pointer-events-auto absolute bottom-2 left-2 z-10 flex items-center gap-0.5">
             {/* 上下文预览 */}

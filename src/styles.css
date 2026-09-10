@@ -273,3 +273,14 @@ html.has-bg-image #root::after {
 html.dark.has-bg-image #root::after {
   background: rgba(0, 0, 0, 0.45);
 }
+
+/* Markdown 正文里的 SVG（模型直接输出的图表等）：约束不超容器宽，等比缩放 */
+.md svg {
+  max-width: 100%;
+  height: auto;
+}
+.md table {
+  display: block;
+  overflow-x: auto;
+  white-space: nowrap;
+}
