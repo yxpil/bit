@@ -316,6 +316,11 @@ impl Ctx {
             self.data_dir.join("ai_config.json"),
             serde_json::to_string_pretty(&*cfg).unwrap(),
         );
+        drop(cfg);
+        // 必须通知 worker 重读：worker 的 ai_config 是启动时一次性加载的，
+        // 漏通知会导致"设置里换了 provider，worker 还打旧端点"→ 旧端点限流/欠费时
+        // 每条消息先冒 429 失败气泡（worker 报错 → engine 回退 host 用新配置重跑成功）
+        crate::worker::notify_reload();
     }
 
     pub fn save_tools(&self) {

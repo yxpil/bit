@@ -1326,8 +1326,9 @@ export default function ChatPage({ onStats, visible }) {
                   : `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${hm}`;
               };
               return messages.map((m, i) => {
+                // 对话开头（此前没有带时间戳的消息）不画线；间隔 ≥5 分钟才画
                 const showDivider =
-                  m.ts && (lastTs === null || new Date(m.ts.replace(" ", "T")) - new Date(lastTs.replace(" ", "T")) >= 5 * 60 * 1000);
+                  m.ts && lastTs !== null && new Date(m.ts.replace(" ", "T")) - new Date(lastTs.replace(" ", "T")) >= 5 * 60 * 1000;
                 if (m.ts) lastTs = m.ts;
                 return (
                   <Fragment key={i}>
