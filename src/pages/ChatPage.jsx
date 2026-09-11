@@ -2340,8 +2340,33 @@ function MediaActions({ src, path, svgText, name }) {
   const [zoom, setZoom] = useState(false);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
+  // 灯箱变换：s=缩放倍率，x/y=平移偏移（滚轮缩放、拖拽平移、双击复位）
+  const [tf, setTf] = useState({ s: 1, x: 0, y: 0 });
+  const dragRef = useRef(null);
   const dataSrc = src || (svgText ? svgDataUrl(svgText) : "");
   const canReveal = !!path && !path.startsWith("data:");
+  const openLightbox = () => {
+    setTf({ s: 1, x: 0, y: 0 });
+    setZoom(true);
+  };
+  const onWheel = (e) => {
+    e.stopPropagation();
+    setTf((p) => {
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      return { ...p, s: Math.min(10, Math.max(0.2, p.s * factor)) };
+    });
+  };
+  const onDown = (e) => {
+    dragRef.current = { sx: e.clientX - tf.x, sy: e.clientY - tf.y };
+  };
+  const onMove = (e) => {
+    if (!dragRef.current) return;
+    const { sx, sy } = dragRef.current;
+    setTf((p) => ({ ...p, x: e.clientX - sx, y: e.clientY - sy }));
+  };
+  const onUp = () => {
+    dragRef.current = null;
+  };
   const dl = async () => {
     if (!dataSrc || busy) return;
     setBusy(true);
@@ -2357,7 +2382,7 @@ function MediaActions({ src, path, svgText, name }) {
   return (
     <div className="mt-1 flex items-center justify-end gap-3 text-[11px] text-neutral-400">
       {note && <span className="mr-auto max-w-56 truncate text-emerald-500" title={note}>{note}</span>}
-      <button type="button" className="hover:text-neutral-600 dark:hover:text-neutral-200" onClick={() => setZoom(true)}>
+      <button type="button" className="hover:text-neutral-600 dark:hover:text-neutral-200" onClick={openLightbox}>
         {t("chat.zoom")}
       </button>
       <button type="button" className="hover:text-neutral-600 dark:hover:text-neutral-200 disabled:opacity-50" disabled={busy || !dataSrc} onClick={dl}>
@@ -2370,20 +2395,41 @@ function MediaActions({ src, path, svgText, name }) {
       )}
       {zoom && (
         <div
-          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/75 p-6"
-          onClick={() => {
-            setZoom(false);
-            setNote("");
+          className="fixed inset-0 z-[120] flex select-none flex-col items-center justify-center gap-2 overflow-hidden bg-black/75 p-6"
+          onWheel={onWheel}
+          onMouseDown={onDown}
+          onMouseMove={onMove}
+          onMouseUp={onUp}
+          onMouseLeave={onUp}
+          onDoubleClick={() => setTf({ s: 1, x: 0, y: 0 })}
+          onDragStart={(e) => e.preventDefault()}
+          style={{ cursor: dragRef.current ? "grabbing" : "grab" }}
+          onClick={(e) => {
+            // 拖拽结束的 mouseup 不关闭：只有未发生拖拽时点击空白才关
+            if (!dragRef.current && Math.abs(tf.x) + Math.abs(tf.y) < 6 && e.target === e.currentTarget) {
+              setZoom(false);
+              setNote("");
+            }
           }}
         >
           {svgText ? (
             <div
-              className="max-h-full max-w-full overflow-auto rounded-xl bg-white p-5 dark:bg-neutral-900 [&_svg]:max-h-none"
+              className="max-h-full max-w-full rounded-xl bg-white p-5 dark:bg-neutral-900 [&_svg]:max-h-none"
+              style={{ transform: `translate(${tf.x}px, ${tf.y}px) scale(${tf.s})`, transformOrigin: "center center" }}
               dangerouslySetInnerHTML={{ __html: svgText }}
             />
           ) : (
-            <img src={dataSrc} alt="preview" className="max-h-full max-w-full rounded-xl object-contain" />
+            <img
+              src={dataSrc}
+              alt="preview"
+              className="max-h-full max-w-full rounded-xl object-contain"
+              style={{ transform: `translate(${tf.x}px, ${tf.y}px) scale(${tf.s})`, transformOrigin: "center center" }}
+              draggable={false}
+            />
           )}
+          <div className="rounded-full bg-black/50 px-3 py-1 text-[11px] text-neutral-300">
+            {Math.round(tf.s * 100)}% · 滚轮缩放 · 拖拽平移 · 双击复位 · 点空白关闭
+          </div>
         </div>
       )}
     </div>
