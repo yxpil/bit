@@ -479,10 +479,11 @@ fn deliver_generated_media(ctx: &Arc<Ctx>, target: &str, media: &[(ai::TokenKind
     }
 }
 
-/// mermaid 围栏归一化（存入历史前调用，前端才能稳定渲染成图）。修两类坏输出：
+/// mermaid 围栏归一化（存入历史前调用，前端才能稳定渲染成图）。修三类坏输出：
 ///   1. 无/通用语言标注的围栏但内容是图（首行 sequenceDiagram/flowchart...）→ 重标 ```mermaid
 ///   2. 围栏外散落的图头部段落 + 紧跟的无语言围栏 → 合并为完整 ```mermaid 块
-///      （模型常把 sequenceDiagram/actor/participant 头部写成普通段落，消息体却包进普通 ```）
+///   3. 整幅图裸文本输出（一个围栏都没有，真实事故）→ 按图行特征整体捕获成围栏
+/// 空行处理：向后看，下一非空行仍是图行（生命周期关键字或消息箭头）才跨过；散文立即收尾。
 /// 与前端 Markdown.jsx 的 rescueMermaid 同逻辑：这里治新输出，前端兜历史数据。
 fn looks_like_mermaid_head(line: &str) -> bool {
     const KW: &[&str] = &[
@@ -507,6 +508,24 @@ fn looks_like_mermaid_head(line: &str) -> bool {
             .any(|d2| d.starts_with(d2) && matches!(d.as_bytes().get(2), Some(b' ') | None));
     }
     false
+}
+
+/// 图体行特征：生命周期关键字开头，或行内含消息箭头
+fn looks_like_diagram_line(line: &str) -> bool {
+    const KW: &[&str] = &[
+        "autonumber", "participant", "actor", "note", "alt", "else", "opt", "loop", "par",
+        "and", "critical", "option", "break", "rect", "title", "legend", "end",
+    ];
+    let t = line.trim_start();
+    if KW.iter().any(|k| {
+        t.starts_with(k)
+            && matches!(t.as_bytes().get(k.len()), Some(b' ') | Some(b'\t') | None)
+    }) {
+        return true;
+    }
+    ["->>", "-->>", "-)", "--)", "-->", "-.", "=="]
+        .iter()
+        .any(|a| t.contains(a))
 }
 
 /// 解析围栏行的语言标注；非围栏行返回 None
@@ -540,25 +559,52 @@ fn normalize_mermaid_blocks(reply: &mut String) {
             i += 1;
             continue;
         }
-        // 围栏外散落的图头部段落 → 开合成围栏收拢
+        // 围栏外散落的图（头部或整幅裸图）→ 开合成围栏收拢
         if !in_fence && looks_like_mermaid_head(&line) {
             out.push("```mermaid".to_string());
             out.push(line);
             i += 1;
-            while i < lines.len() && !lines[i].trim().is_empty() && fence_label(&lines[i]).is_none() {
-                out.push(lines[i].clone());
+            let mut blank = 0usize;
+            while i < lines.len() {
+                let l = &lines[i];
+                if fence_label(l).is_some() {
+                    break; // 真实围栏：并入
+                }
+                if l.trim().is_empty() {
+                    // 空行：向后看，下一非空行仍是图行才跨过
+                    let mut j = i + 1;
+                    while j < lines.len() && lines[j].trim().is_empty() {
+                        j += 1;
+                    }
+                    if j >= lines.len() || !looks_like_diagram_line(&lines[j]) {
+                        break;
+                    }
+                    out.push(l.clone());
+                    blank += 1;
+                    if blank > 30 {
+                        break; // 安全阀
+                    }
+                    i += 1;
+                    continue;
+                }
+                if !looks_like_diagram_line(l) {
+                    break; // 散文开始：收尾
+                }
+                out.push(l.clone());
                 i += 1;
             }
-            // 紧跟真实围栏 → 并入其内容（跳过它自己的开/闭栏行）
-            if i < lines.len() && fence_label(&lines[i]).is_some() {
-                i += 1;
-                while i < lines.len() && fence_label(&lines[i]).is_none() {
-                    out.push(lines[i].clone());
-                    i += 1;
+            // 紧跟真实围栏（中间允许只有空行）→ 并入其内容（跳过它自己的开/闭栏行）
+            let mut j = i;
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j < lines.len() && fence_label(&lines[j]).is_some() {
+                let mut k = j + 1;
+                while k < lines.len() && fence_label(&lines[k]).is_none() {
+                    out.push(lines[k].clone());
+                    k += 1;
                 }
-                if i < lines.len() {
-                    i += 1;
-                }
+                i = if k < lines.len() { k + 1 } else { k };
             }
             out.push("```".to_string());
             changed = true;

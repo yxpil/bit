@@ -111,38 +111,53 @@ const MERMAID_FIRST_LINE =
   /^\s*(flowchart|sequenceDiagram|classDiagram|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|mindmap|timeline|quadrantChart|quadrant|requirementDiagram|gitGraph|graph\s+(TB|TD|BT|RL|LR)\b|C4(Context|Container|Component|Dynamic|Deployment)\b|sankey(-beta)?|xychart(-beta)?|block(-beta)?|zenuml)\b/;
 const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/;
 
-// 围栏外散落的 mermaid 头部段落 + 紧跟的无语言代码块 → 合并成完整 ```mermaid 围栏。
-// 场景：模型输出图时把 sequenceDiagram/actor/participant 头部写成了普通段落，
-// 消息体却包进普通 ``` 块——两半分开都无法通过 parse，合起来才是完整的图。
-// 在 ReactMarkdown 之前做纯文本变换，空行即截断（截坏的由 parse 闸门兜底回退源码）。
+// 图体行特征：生命周期关键字或消息箭头（->>、-->>、-)、--)、-->、-.-、==）
+const DIAGRAM_LINE =
+  /^\s*(autonumber\b|participant\s|actor\s|note\s|alt\b|else\b|opt\b|loop\b|par\b|and\b|critical\b|option\b|break\b|rect\b|title\s|legend\s|end\b)|->>|-->>|-\)|--\)|-->|-\.|==/;
+
+// 围栏外散落的 mermaid 段落 → 合并成完整 ```mermaid 围栏（真实事故：模型把整幅
+// 时序图当普通文本输出，一行围栏都没有）。捕获规则：
+//   头部段落逐行收；空行向后看——下一非空行仍是图行才跨过；出现散文立即收尾；
+//   紧跟（中间只允许空行）的无语言围栏把内容并进来。截坏的由 parse 闸门兜底回退源码。
 function rescueMermaid(src) {
   const lines = src.split("\n");
   const out = [];
   let inFence = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (FENCE_RE.test(line)) {
-      inFence = !inFence;
-      out.push(line);
-      continue;
-    }
+    if (FENCE_RE.test(line)) { inFence = !inFence; out.push(line); continue; }
     if (!inFence && MERMAID_FIRST_LINE.test(line)) {
       out.push("```mermaid");
       out.push(line);
       i++;
-      // 收头部段落直到空行 / 真实围栏 / 文本结束
-      while (i < lines.length && lines[i].trim() !== "" && !FENCE_RE.test(lines[i])) {
-        out.push(lines[i]);
+      let blank = 0;
+      while (i < lines.length) {
+        const l = lines[i];
+        if (FENCE_RE.test(l)) break; // 真实围栏：并入
+        if (l.trim() === "") {
+          // 空行：向后看，下一非空行仍是图行才继续（否则在此收尾）
+          let j = i + 1;
+          while (j < lines.length && lines[j].trim() === "") j++;
+          if (j >= lines.length || !DIAGRAM_LINE.test(lines[j])) break;
+          out.push(l);
+          blank++;
+          if (blank > 30) break; // 安全阀
+          i++;
+          continue;
+        }
+        if (!DIAGRAM_LINE.test(l)) break; // 散文开始：收尾
+        out.push(l);
         i++;
       }
-      // 紧跟真实围栏 → 把它的内容并进来（跳过自己的开/闭围栏行）
-      if (i < lines.length && FENCE_RE.test(lines[i])) {
-        i++;
-        while (i < lines.length && !FENCE_RE.test(lines[i])) {
-          out.push(lines[i]);
-          i++;
+      // 紧跟真实围栏（中间允许只有空行）→ 并入其内容（跳过它自己的开/闭栏行）
+      {
+        let j = i;
+        while (j < lines.length && lines[j].trim() === "") j++;
+        if (j < lines.length && FENCE_RE.test(lines[j])) {
+          let k = j + 1;
+          while (k < lines.length && !FENCE_RE.test(lines[k])) { out.push(lines[k]); k++; }
+          i = k < lines.length ? k + 1 : k; // 跳过闭合围栏
         }
-        if (i < lines.length) i++; // 跳过闭合围栏
       }
       out.push("```");
       continue;
@@ -187,7 +202,13 @@ export default function Markdown({ children }) {
           // 行内代码 / 代码块（mermaid 特判渲染成图）
           code: ({ node, inline, className, children, ...p }) => {
             const lang = /language-(\w+)/.exec(className || "")?.[1];
-            const text = String(children);
+            // 防御性扁平化：children 理论上恒为 string，但插件组合可能混入元素节点，
+            // String([obj]) 会产出字面量 "[object Object]"——只保留字符串片段
+            const text = Array.isArray(children)
+              ? children.filter((c) => typeof c === "string").join("")
+              : typeof children === "string"
+                ? children
+                : "";
             if (!inline && lang === "mermaid") return <Mermaid code={text.trim()} dark={dark} />;
             // 无/通用语言标注 + 首行像 mermaid → 当图渲染（救历史消息里没标语言的图代码）
             const firstLine = text.split("\n", 1)[0];
