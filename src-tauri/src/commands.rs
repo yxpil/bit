@@ -32,7 +32,8 @@ pub fn save_file_as(path: String, suggested_name: Option<String>) -> Result<Opti
     let file = rfd::FileDialog::new()
         .set_title("保存为")
         .set_file_name(&suggested_name.unwrap_or(default_name));
-    let Some(dest) = file.pick_file() else {
+    // save_file = 原生「另存为」对话框；pick_file 是打开样式（下载按钮弹出选择框像上传，实锤）
+    let Some(dest) = file.save_file() else {
         return Ok(None);
     };
     // data URL（截图/生成图内嵌 b64）：解码后写盘；普通路径直接复制
