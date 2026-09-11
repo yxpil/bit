@@ -154,7 +154,7 @@ export default function TitleBar() {
   return (
     <div
       data-tauri-drag-region
-      className="flex h-9 shrink-0 select-none items-center gap-1 px-3"
+      className="flex h-7 shrink-0 select-none items-center gap-1 px-4"
       style={isMac ? { paddingLeft: 76 } : undefined}
     >
       {/* 页眉仪表盘（可拖动） */}
@@ -212,21 +212,21 @@ export default function TitleBar() {
           <button
             onClick={minimize}
             aria-label={t("title.minimize")}
-            className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+            className="flex h-6 w-6 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
           >
             <IconMinus size={13} />
           </button>
           <button
             onClick={toggleMax}
             aria-label={t("title.maximize")}
-            className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+            className="flex h-6 w-6 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
           >
             <IconSquare size={12} />
           </button>
           <button
             onClick={close}
             aria-label={t("common.close")}
-            className="flex h-7 w-7 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-red-600 hover:text-white"
+            className="flex h-6 w-6 items-center justify-center rounded-full text-neutral-500 transition-colors hover:bg-red-600 hover:text-white"
           >
             <IconX size={14} />
           </button>

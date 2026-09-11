@@ -38,7 +38,7 @@ const TAG_COLORS = [
 ];
 
 // AI 对话：多会话分组 + 工具调用可视化
-export default function ChatPage({ onStats, visible }) {
+export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSidebar }) {
   const { t } = useLang();
   const [sessions, setSessions] = useState([]);
   const [activeId, setActiveId] = useState("");
@@ -54,6 +54,7 @@ export default function ChatPage({ onStats, visible }) {
   const [selSet, setSelSet] = useState(() => new Set()); // 多选模式下勾选的会话 id
   const [colorFor, setColorFor] = useState(null); // 正在打彩色标签的会话 id（null=无）
   const [batchHint, setBatchHint] = useState(""); // 多选/删除的临时反馈文字
+  // 会话侧栏折叠状态与切换由 App（最左侧功能栏按钮）持有，经 props 下发
   const dragRef = useRef(null); // {x, y, id, armed} 右滑手势起点
   const swipedRef = useRef(null); // 刚完成右滑的会话 id（抑制随后的 click）
   const hintTimer = useRef(null);
@@ -606,6 +607,13 @@ export default function ChatPage({ onStats, visible }) {
     return () => window.removeEventListener("bit-new-session", h);
   }, []);
 
+  // 图标栏「多选」按钮 → 切换会话多选模式（跨组件事件；侧栏折叠已改为 props 直连）
+  useEffect(() => {
+    const hMulti = () => (multiMode ? exitMulti() : enterMulti());
+    window.addEventListener("bit-toggle-multi", hMulti);
+    return () => window.removeEventListener("bit-toggle-multi", hMulti);
+  });
+
   // 后台 shell / 子代理等面板请求：打开指定会话
   useEffect(() => {
     const h = (e) => {
@@ -1067,53 +1075,43 @@ export default function ChatPage({ onStats, visible }) {
   const visibleMessages = messages.filter((m) => m.role !== "system");
 
   return (
-    <div className="relative flex h-full gap-3">
+    <div className="relative flex h-full gap-2">
       {/* 拖拽文件 / 文件夹提示遮罩 */}
       {dragOver && (
         <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center rounded-xl border-2 border-dashed border-neutral-400 bg-neutral-500/10 dark:border-neutral-500">
           <div className="card px-6 py-4 text-sm font-medium">{t("chat.dropHint")}</div>
         </div>
       )}
-      {/* 会话侧栏：纯文字列表（仪表盘已上移页眉） */}
-      <div className="flex w-52 shrink-0 flex-col gap-1.5">
-        {/* 会话操作条：默认提供「多选」；多选态下可 全选 / 批量删除 / 完成 */}
-        <div className="flex shrink-0 flex-wrap items-center gap-1 px-1">
-          {!multiMode ? (
+      {/* 会话侧栏：纯文字列表，可折叠（收起/展开入口在最左侧功能栏） */}
+      {sidebarOpen && (
+      <div className="anim-rise flex w-52 shrink-0 flex-col gap-1.5">
+        {/* 会话操作条：收起/多选入口已移至最左侧功能栏；这里仅多选态下显示 全选 / 批量删除 / 完成 */}
+        {multiMode && (
+          <div className="flex shrink-0 flex-wrap items-center gap-1 px-1">
             <button
-              onClick={enterMulti}
-              title={`${t("chat.multi")} · ${t("chat.colorSwipeHint")}`}
-              className="flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
+              onClick={toggleSelectAll}
+              className="rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
             >
-              <IconCheck size={12} />
-              {t("chat.multi")}
+              {allSelected ? t("chat.unselectAll") : t("common.selectAll")}
             </button>
-          ) : (
-            <>
-              <button
-                onClick={toggleSelectAll}
-                className="rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
-              >
-                {allSelected ? t("chat.unselectAll") : t("common.selectAll")}
-              </button>
-              <button
-                onClick={batchDelete}
-                disabled={selSet.size === 0}
-                title={t("common.deleteSelected")}
-                className="flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-red-500 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <IconTrash size={11} />
-                {t("common.deleteSelected")}
-                {selSet.size > 0 && `(${selSet.size})`}
-              </button>
-              <button
-                onClick={exitMulti}
-                className="ml-auto rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
-              >
-                {t("chat.multiDone")}
-              </button>
-            </>
-          )}
-        </div>
+            <button
+              onClick={batchDelete}
+              disabled={selSet.size === 0}
+              title={t("common.deleteSelected")}
+              className="flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-red-500 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <IconTrash size={11} />
+              {t("common.deleteSelected")}
+              {selSet.size > 0 && `(${selSet.size})`}
+            </button>
+            <button
+              onClick={exitMulti}
+              className="ml-auto rounded-full px-2 py-1 text-[11px] font-medium text-neutral-500 transition-colors hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
+            >
+              {t("chat.multiDone")}
+            </button>
+          </div>
+        )}
         {multiMode && (
           <p
             className={`px-1 text-[10px] leading-snug ${
@@ -1300,17 +1298,18 @@ export default function ChatPage({ onStats, visible }) {
           })}
         </div>
       </div>
+      )}
 
       {/* 对话主区：无标题行，主体完全留给消息 */}
-      <div className="flex min-w-0 flex-1 flex-col gap-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
         <div className="card flex-1 overflow-y-auto">
           {messages.length === 0 && !busy && (
             <div className="flex h-full items-center justify-center px-6 text-center text-sm text-neutral-400">
               {t("chat.emptyHint")}
             </div>
           )}
-          {/* 消息列限宽居中：宽窗口下长文本行不拉满，保持可读（约 72 字符/行） */}
-          <div className="mx-auto flex w-full max-w-3xl flex-col gap-3">
+          {/* 消息列随容器宽度自适应：不设固定限宽，宽窗口下气泡自然拉满卡片宽度 */}
+          <div className="flex w-full flex-col gap-3 px-1">
             {(() => {
               // QQ 式时间分割线：相邻两条消息（带时间戳的）间隔 ≥5 分钟时，
               // 在后一条上方画一条居中时间线，方便回看历史定位时间点。
@@ -1713,8 +1712,7 @@ export default function ChatPage({ onStats, visible }) {
           )}
 
           {/* 底部 pb-12 为工具栏/发送按钮预留独立一行：textarea 只在自己的区域滚动，永不进入按钮行 */}
-          {/* 与消息列同宽（max-w-3xl 居中），视觉对齐 */}
-          <div className="relative mx-auto w-full max-w-3xl rounded-2xl border border-neutral-300 bg-white pb-12 transition-colors focus-within:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:focus-within:border-neutral-200">
+          <div className="relative rounded-2xl border border-neutral-300 bg-white pb-12 transition-colors focus-within:border-neutral-900 dark:border-neutral-700 dark:bg-neutral-950 dark:focus-within:border-neutral-200">
             {/* 工具栏：左下角 absolute 排成一行（外层按钮收进输入框内） */}
             <div className="pointer-events-auto absolute bottom-2 left-2 z-10 flex items-center gap-0.5">
             {/* 上下文预览 */}

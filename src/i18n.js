@@ -262,6 +262,7 @@ const dict = {
     "chat.busyPlaceholder": "本对话执行中，可切换其他对话继续…",
     "chat.inputPlaceholder": "输入消息，Enter 换行，Ctrl+Enter 发送",
     "chat.dropHint": "松开鼠标，插入文件 / 文件夹链接",
+    "chat.collapseSidebar": "收起",
     // 文件卡片（智能体 send_file 发来的文件）
     "filecard.open": "打开",
     "filecard.reveal": "所在文件夹",
@@ -754,6 +755,7 @@ const dict = {
     "chat.busyPlaceholder": "This conversation is running — switch to another to continue…",
     "chat.inputPlaceholder": "Type a message — Enter for newline, Ctrl+Enter to send",
     "chat.dropHint": "Release to insert file / folder links",
+    "chat.collapseSidebar": "Collapse",
     // File cards (files sent by the agent via send_file)
     "filecard.open": "Open",
     "filecard.reveal": "Reveal in folder",

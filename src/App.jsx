@@ -28,6 +28,8 @@ import {
   IconInfo,
   IconPlus,
   IconShirt,
+  IconCheck,
+  IconChevronLeft,
 } from "./components/Icons.jsx";
 
 // 调色盘预设：null = 恢复默认黑白
@@ -204,6 +206,14 @@ export default function App() {
   }, []);
 
   const refresh = () => api.overview().then(setStats).catch(() => {});
+
+  // 会话侧栏折叠状态（提升到这里：折叠按钮需要随状态切换图标方向）
+  const [chatSidebar, setChatSidebar] = useState(() => localStorage.getItem("bit.chatSidebar") !== "0");
+  const toggleChatSidebar = () =>
+    setChatSidebar((v) => {
+      localStorage.setItem("bit.chatSidebar", v ? "0" : "1");
+      return !v;
+    });
   useEffect(() => {
     refresh();
   }, [tab]);
@@ -216,13 +226,13 @@ export default function App() {
       <button
         onClick={() => setTab(k)}
         title={t(label)}
-        className={`mx-auto flex h-10 w-10 items-center justify-center rounded-full transition-all duration-200 hover:scale-105 active:scale-95 ${
+        className={`mx-auto flex h-9 w-9 items-center justify-center rounded-full transition-all duration-200 hover:scale-105 active:scale-95 ${
           active
             ? "accent-solid shadow-sm"
             : "text-neutral-500 hover:bg-neutral-900/5 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/5 dark:hover:text-white"
         }`}
       >
-        <Icon size={18} />
+        <Icon size={20} />
       </button>
     );
   };
@@ -235,9 +245,20 @@ export default function App() {
         window.dispatchEvent(new CustomEvent("bit-new-session"));
       }}
       title={t("chat.newChat")}
-      className="mx-auto flex h-10 w-10 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-200/60 hover:text-neutral-900 dark:hover:bg-neutral-800/60 dark:hover:text-white"
+      className="mx-auto flex h-9 w-9 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-200/60 hover:text-neutral-900 dark:hover:bg-neutral-800/60 dark:hover:text-white"
     >
-      <IconPlus size={16} />
+      <IconPlus size={18} />
+    </button>
+  );
+
+  // 图标栏小按钮：向 ChatPage 派发跨组件事件（会话侧栏收起 / 会话多选），仅对话页显示
+  const RailMiniBtn = ({ onClick, title, children }) => (
+    <button
+      onClick={onClick}
+      title={title}
+      className="mx-auto flex h-9 w-9 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-200/60 hover:text-neutral-900 dark:hover:bg-neutral-800/60 dark:hover:text-white"
+    >
+      {children}
     </button>
   );
 
@@ -275,11 +296,34 @@ export default function App() {
 
       <div className="flex min-h-0 flex-1">
         {/* 图标侧栏：无分隔线，与窗口背景融为一体 */}
-        <aside className="flex w-14 shrink-0 flex-col items-center gap-1 py-3">
+        <aside className="flex w-12 shrink-0 flex-col items-center gap-1 px-1.5 py-2">
           {/* 导航：对话主功能置顶，其余分组 */}
-          <nav className="flex w-full flex-1 flex-col gap-1 px-1.5 pt-1">
+          <nav className="flex w-full flex-1 flex-col gap-0.5 pt-1">
             <NavItem k={PRIMARY} />
             <NewChatBtn />
+            {tab === PRIMARY && (
+              <>
+                {/* 折叠/展开：图标随侧栏状态翻转（180° 旋转过渡），展开时朝左=收起，收起时朝右=展开 */}
+                <RailMiniBtn
+                  onClick={toggleChatSidebar}
+                  title={t("chat.collapseSidebar")}
+                >
+                  <IconChevronLeft
+                    size={18}
+                    className={`transition-transform duration-300 ${chatSidebar ? "" : "rotate-180"}`}
+                  />
+                </RailMiniBtn>
+                {/* 多选入口只在会话侧栏展开时显示（先展开才能操作会话列表） */}
+                {chatSidebar && (
+                  <RailMiniBtn
+                    onClick={() => window.dispatchEvent(new CustomEvent("bit-toggle-multi"))}
+                    title={t("chat.multi")}
+                  >
+                    <IconCheck size={18} />
+                  </RailMiniBtn>
+                )}
+              </>
+            )}
             <div className="mx-auto my-2 h-px w-6 bg-neutral-200 dark:bg-neutral-800" />
             {SECONDARY.map((k) => (
               <NavItem key={k} k={k} />
@@ -287,15 +331,15 @@ export default function App() {
           </nav>
 
           {/* 栏底：明暗切换 / 语言 / 关于 */}
-          <div className="relative flex w-full flex-col gap-0.5 px-1.5">
+          <div className="relative flex w-full flex-col gap-0.5">
             <RailBtn onClick={toggle} title={t(isDark ? "app.switchLight" : "app.switchDark")}>
-              {isDark ? <IconSun size={17} /> : <IconMoon size={17} />}
+              {isDark ? <IconSun size={19} /> : <IconMoon size={19} />}
             </RailBtn>
             <RailBtn onClick={toggleLang} title={lang === "zh" ? "切换到 English" : "Switch to 中文"}>
               <span className="text-xs font-semibold">{lang === "zh" ? "EN" : "中"}</span>
             </RailBtn>
             <RailBtn onClick={() => setShowAbout(true)} title={t("app.about")}>
-              <IconInfo size={17} />
+              <IconInfo size={19} />
             </RailBtn>
           </div>
         </aside>
@@ -306,10 +350,16 @@ export default function App() {
           {Object.entries(PAGES).map(([k, { page: Page }]) => (
             <div
               key={k}
-              className={`h-full overflow-auto ${k === PRIMARY ? "p-3" : "p-6"}`}
+              className={`h-full ${k === PRIMARY ? "overflow-hidden px-2 pb-3 pt-2" : "overflow-auto p-6"}`}
               style={{ display: tab === k ? "block" : "none" }}
             >
-              <Page onStats={refresh} stats={stats} visible={tab === k} />
+              <Page
+                onStats={refresh}
+                stats={stats}
+                visible={tab === k}
+                sidebarOpen={chatSidebar}
+                onToggleSidebar={toggleChatSidebar}
+              />
             </div>
           ))}
         </main>

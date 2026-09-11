@@ -253,6 +253,12 @@ export const IconEdit = (p) => (
   </I>
 );
 
+export const IconChevronLeft = (p) => (
+  <I {...p}>
+    <path d="M15 18l-6-6 6-6" />
+  </I>
+);
+
 export const IconChevronDown = (p) => (
   <I {...p}>
     <path d="M6 9l6 6 6-6" />
