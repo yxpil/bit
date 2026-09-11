@@ -2343,6 +2343,20 @@ function MediaActions({ src, path, svgText, name }) {
   // 灯箱变换：s=缩放倍率，x/y=平移偏移（滚轮缩放、拖拽平移、双击复位）
   const [tf, setTf] = useState({ s: 1, x: 0, y: 0 });
   const dragRef = useRef(null);
+  const closeLightbox = () => {
+    setZoom(false);
+    setNote("");
+    setTf({ s: 1, x: 0, y: 0 });
+  };
+  // Esc 关闭灯箱（点空白/×之外的可靠途径）
+  useEffect(() => {
+    if (!zoom) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") closeLightbox();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoom]);
   const dataSrc = src || (svgText ? svgDataUrl(svgText) : "");
   const canReveal = !!path && !path.startsWith("data:");
   const openLightbox = () => {
@@ -2407,11 +2421,18 @@ function MediaActions({ src, path, svgText, name }) {
           onClick={(e) => {
             // 拖拽结束的 mouseup 不关闭：只有未发生拖拽时点击空白才关
             if (!dragRef.current && Math.abs(tf.x) + Math.abs(tf.y) < 6 && e.target === e.currentTarget) {
-              setZoom(false);
-              setNote("");
+              closeLightbox();
             }
           }}
         >
+          <button
+            type="button"
+            className="absolute right-4 top-4 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-black/50 text-lg text-neutral-200 hover:bg-black/70 hover:text-white"
+            onClick={closeLightbox}
+            title="关闭 (Esc)"
+          >
+            ×
+          </button>
           {svgText ? (
             <div
               className="max-h-full max-w-full rounded-xl bg-white p-5 dark:bg-neutral-900 [&_svg]:max-h-none"
