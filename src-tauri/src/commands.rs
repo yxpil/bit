@@ -1737,11 +1737,25 @@ pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> 
         .iter()
         .enumerate()
         .map(|(i, m)| {
+            // 工具调用轮次的 assistant 消息正文为空：预览改展示调用摘要，避免"AI 记录空白"
+            let preview = if m.content.is_empty() && !m.tool_calls.is_empty() {
+                m.tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let args: String = tc.params.to_string().chars().take(120).collect();
+                        let mark = if tc.ok { "" } else { " ✗" };
+                        format!("⚙ {}({args}){mark}", tc.tool)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                m.content.chars().take(500).collect::<String>()
+            };
             json!({
                 "index": i,
                 "role": m.role,
                 "content": m.content,
-                "preview": m.content.chars().take(500).collect::<String>(),
+                "preview": preview,
             })
         })
         .collect();

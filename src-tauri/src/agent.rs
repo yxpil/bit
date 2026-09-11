@@ -1588,7 +1588,7 @@ pub fn build_context(
         ai::system_prompt_native(ctx, Some(&target))
     })];
     for m in recent {
-        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None, ts: None, diagram: None });
+        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: m.tool_calls.clone(), thinking: None, ts: None, diagram: None });
     }
     Ok((v, ai::tools_manifest(ctx)))
 }
