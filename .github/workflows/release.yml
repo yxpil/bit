@@ -193,6 +193,11 @@ jobs:
       - name: UI 冒烟测试（防黑屏包上传）
         shell: pwsh
         run: node e2e/smoke-ui.cjs src-tauri/target/aarch64-pc-windows-msvc/release/BIT.exe
+      - name: 打包便携版（裸 BIT.exe zip，对齐 x64；Compress-Archive 需 pwsh）
+        shell: pwsh
+        run: |
+          $VERSION = node -p "require('./src-tauri/tauri.conf.json').version"
+          Compress-Archive -Path src-tauri/target/aarch64-pc-windows-msvc/release/BIT.exe -DestinationPath "BIT_$VERSION_aarch64-portable.zip" -Force
       - name: 上传到 Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -207,6 +212,7 @@ jobs:
           mv "$NSIS_DIR/BIT_${VERSION}_arm64-setup.exe" "$NSIS_DIR/BIT_${VERSION}_aarch64-setup.exe"
           gh release upload "$TAG" \
             "$NSIS_DIR/BIT_${VERSION}_aarch64-setup.exe" \
+            "BIT_${VERSION}_aarch64-portable.zip" \
             --clobber --repo "$GITHUB_REPOSITORY"
 
   macos:
