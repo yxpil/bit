@@ -73,7 +73,15 @@ function Mermaid({ code, dark }) {
           mermaidInited = true;
           mermaidInitedDark = dark;
         }
-        // 排进串行链：前一个渲染成功/失败都继续，保证同一时刻只有一个 render 在跑
+        // 第一步：自己先用 parse 验证（suppressErrors：不抛异常、无 DOM 副作用）。
+        // 验证不过 = 不是合法的图，直接回退源码，绝不进 render——render 的错误路径
+        // 会往 body 里插错误节点（"syntax error in text" 把页面顶上去的就是它）。
+        const valid = await mermaid.parse(code, { suppressErrors: true });
+        if (!valid) {
+          if (alive) setErr(true);
+          return;
+        }
+        // 第二步：验证通过才排进串行链渲染
         const run = () => mermaid.render(`mmd-${++mermaidSeq}`, code);
         const task = mermaidChain.then(run, run);
         mermaidChain = task.catch(() => {});
@@ -84,6 +92,8 @@ function Mermaid({ code, dark }) {
           setErr(false);
         }
       } catch {
+        // 兜底清理：mermaid render 失败时可能在 body 残留 #dmermaid-*/#dmmd-* 错误节点
+        document.querySelectorAll("[id^='dmermaid'], [id^='dmmd-']").forEach((n) => n.remove());
         if (alive) setErr(true);
       }
     })();
