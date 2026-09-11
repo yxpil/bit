@@ -91,6 +91,58 @@ fn shell_command(pref: &str, command: &str, cwd: Option<&str>) -> tokio::process
     c
 }
 
+/// 解析出的默认 shell 是否为 PowerShell 系（裸 `&` 语义判断需要）
+fn shell_is_ps(pref: &str) -> bool {
+    let (prog, _) = match crate::toolenv::resolve_shell(pref) {
+        Ok(v) => v,
+        Err(_) => return true, // 两次解析都失败时的兜底就是 powershell
+    };
+    prog.rsplit(['/', '\\'])
+        .next()
+        .map(|b| b == "pwsh" || b == "powershell")
+        .unwrap_or(false)
+}
+
+/// PowerShell 裸 `&` 检测（引号感知）。`a & b` 在 PS 里是后台 Job 操作符：
+/// 前序命令输出进 Job 表丢失、退出码恒 0（假成功）。合法用法需排除：
+/// `&&`（逻辑与）、`2>&1` / `&>`（重定向）、语句开头的调用操作符（`& script.ps1`）。
+/// 判定：引号外的 `&`，所在语句段已有内容，且其后是空白/串尾 → Job 操作符。
+fn ps_bare_ampersand(cmd: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut seg_has_content = false; // 自 ; | ( { 或串首以来是否已出现非空白
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => quote = Some(c),
+                ';' | '|' | '(' | '{' | '\n' => seg_has_content = false,
+                '&' => {
+                    let prev = if i > 0 { chars[i - 1] } else { '\0' };
+                    let next = chars.get(i + 1).copied().unwrap_or('\0');
+                    let is_chain = prev == '&' || next == '&';
+                    let is_redirect = prev == '>' || next == '>';
+                    if !is_chain && !is_redirect && seg_has_content {
+                        return true;
+                    }
+                    if next == '&' {
+                        i += 1; // && 的第二个 & 无需复判
+                    }
+                }
+                c if c.is_whitespace() => {}
+                _ => seg_has_content = true,
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn emit(ctx: &Arc<crate::state::Ctx>, phase: &str, job: &ShellJob, extra: Option<serde_json::Value>) {
     use tauri::Emitter;
     let mut payload = json!({
@@ -129,6 +181,12 @@ pub async fn run(
     }
     // 快照默认 shell 后立即释放配置锁（锁序纪律：不跨 spawn 持锁）
     let pref = { ctx.config.lock().unwrap().default_shell.clone() };
+    // PS 裸 `&` 前置检测：Job 操作符会静默丢输出 + 假成功（code=0），提前告知 AI 正确写法
+    let amp_warning = if shell_is_ps(&pref) && ps_bare_ampersand(command) {
+        Some("PowerShell 语义警告：命令含裸 `&`（后台 Job 操作符），前序命令的输出会丢失且退出码恒为 0。多条命令请用 `;` 串联；需要 cmd 的 `&` 语义请用 cmd /c \"...\" 包裹。".to_string())
+    } else {
+        None
+    };
     let mut cmd = shell_command(&pref, command, cwd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -161,11 +219,15 @@ pub async fn run(
             .wait_with_output()
             .await
             .map_err(|e| format!("Failed to collect command output: {e}"))?;
-        return Ok(json!({
+        let mut result = json!({
             "code": out.status.code(),
             "stdout": crate::registry::safe_trunc(&String::from_utf8_lossy(&out.stdout), 60000),
             "stderr": crate::registry::safe_trunc(&String::from_utf8_lossy(&out.stderr), 60000),
-        }));
+        });
+        if let (Some(obj), Some(w)) = (result.as_object_mut(), amp_warning) {
+            obj.insert("warning".into(), json!(w));
+        }
+        return Ok(result);
     }
 
     // 长命令：转后台
@@ -193,7 +255,7 @@ pub async fn run(
     tauri::async_runtime::spawn(async move {
         finish(c2, j2).await;
     });
-    Ok(json!({
+    let mut bg_result = json!({
         "status": "background",
         "job_id": job.id,
         "note": if force_background {
@@ -207,7 +269,44 @@ pub async fn run(
                 FRONT_WINDOW_MS, job.id
             )
         },
-    }))
+    });
+    if let (Some(obj), Some(w)) = (bg_result.as_object_mut(), amp_warning) {
+        obj.insert("warning".into(), json!(w));
+    }
+    Ok(bg_result)
+}
+
+#[cfg(test)]
+mod amp_tests {
+    use super::ps_bare_ampersand;
+
+    #[test]
+    fn bare_ampersand_detected() {
+        // 典型踩坑写法：裸 & 分隔多条命令
+        assert!(ps_bare_ampersand("echo one & echo two"));
+        assert!(ps_bare_ampersand("echo one &echo two"));
+        assert!(ps_bare_ampersand("echo one &"));
+        assert!(ps_bare_ampersand("echo one&echo two"));
+    }
+
+    #[test]
+    fn legitimate_ampersand_not_flagged() {
+        // 逻辑与
+        assert!(!ps_bare_ampersand("cmd /c \"exit 0\" && echo ok"));
+        assert!(!ps_bare_ampersand("exit 1 || echo fallback"));
+        // 重定向
+        assert!(!ps_bare_ampersand("node app.js 2>&1"));
+        assert!(!ps_bare_ampersand("foo &> log.txt"));
+        // 调用操作符（语句开头）
+        assert!(!ps_bare_ampersand("& \"C:\\my script.ps1\""));
+        assert!(!ps_bare_ampersand("echo a; & \"x.ps1\""));
+        // 引号内的 &（cmd /c 包裹、字符串字面量）
+        assert!(!ps_bare_ampersand("cmd /c \"echo one & echo two\""));
+        assert!(!ps_bare_ampersand("echo \"a & b\""));
+        assert!(!ps_bare_ampersand("echo 'a & b'"));
+        // 无 & 的普通命令
+        assert!(!ps_bare_ampersand("echo hello"));
+    }
 }
 
 /// 进程树终止：shell 壳（pwsh/cmd）被杀后，它启动的孙进程会变成孤儿继续运行，

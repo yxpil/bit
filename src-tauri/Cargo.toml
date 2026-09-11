@@ -36,6 +36,7 @@ futures-util = "0.3"
 calamine = "0.36"
 scraper = "0.20"
 base64 = "0.22"
+rfd = "0.15" # 原生保存对话框（图片/图表另存为）
 zip = "2"
 quick-xml = "0.42"
 # 页眉仪表盘：本进程内存占用查询

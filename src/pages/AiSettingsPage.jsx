@@ -35,6 +35,7 @@ export default function AiSettingsPage({ onStats, stats }) {
   const { t } = useLang();
   const [providers, setProviders] = useState([]);
   const [form, setForm] = useState(EMPTY); // 新增 / 编辑用同一张表单
+  const [showForm, setShowForm] = useState(false); // 表单以悬浮弹窗呈现，平时不占页面空间
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   // 模型采样参数：temperature null=默认；reasoning_effort ""=默认 / low / medium / high
@@ -81,8 +82,8 @@ export default function AiSettingsPage({ onStats, stats }) {
   const [elevErr, setElevErr] = useState("");
   // 自动运行（后台自主循环：记忆总结 / 技能提炼 / 目标行动）——运行总览里的小圆钮
   const [autoRun, setAutoRun] = useState(false);
-  // 本机操控三件套开关（screen/mouse/keyboard）
-  const [deskTools, setDeskTools] = useState({ screen: false, mouse: false, keyboard: false });
+  // 本机操控开关（screen/mouse/keyboard/draw_diagram/view_image，默认全关）
+  const [deskTools, setDeskTools] = useState({ screen: false, mouse: false, keyboard: false, diagram: false, viewimage: false });
   // 写文件后轻量语法检查（json/js/py）：出错提醒模型与用户
   const [syntaxCheck, setSyntaxCheck] = useState(true);
 
@@ -122,7 +123,7 @@ export default function AiSettingsPage({ onStats, stats }) {
     api.getSystemPrompt().then((r) => setSystemPrompt(r?.system_prompt || "")).catch(() => {});
     api.getAutostart().then((r) => setAutostart(!!r?.enabled)).catch(() => setAutostart(false));
     api.getHotkey().then((r) => setHotkey(r?.hotkey || "")).catch(() => {});
-    api.getDesktopTools().then((r) => setDeskTools({ screen: !!r?.screen, mouse: !!r?.mouse, keyboard: !!r?.keyboard })).catch(() => {});
+    api.getDesktopTools().then((r) => setDeskTools({ screen: !!r?.screen, mouse: !!r?.mouse, keyboard: !!r?.keyboard, diagram: !!r?.diagram, viewimage: !!r?.viewimage })).catch(() => {});
     api.getElevation().then((r) => setElevation({ active: !!r?.active, enabled: !!r?.enabled })).catch(() => setElevation({ active: false, enabled: false }));
   }, []);
 
@@ -293,6 +294,7 @@ export default function AiSettingsPage({ onStats, stats }) {
         await api.addProvider(form.name, form.protocol, form.base_url, form.api_key, form.model);
       }
       setForm(EMPTY);
+      setShowForm(false);
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
       await load();
@@ -314,6 +316,7 @@ export default function AiSettingsPage({ onStats, stats }) {
     setRemoteModels(null);
     setFetchModelsErr("");
     setError("");
+    setShowForm(true);
   };
 
   const remove = async (id) => {
@@ -363,6 +366,19 @@ export default function AiSettingsPage({ onStats, stats }) {
             <span className={`chip ${stats.remote?.enabled ? "border-emerald-500/50 text-emerald-600 dark:text-emerald-400" : ""}`}>
               {stats.remote?.enabled ? `${t("ai.remoteOn")}${stats.remote.addr}` : t("ai.remoteOff")}
             </span>
+            <button
+              type="button"
+              onClick={() => {
+                setForm(EMPTY);
+                setError("");
+                setRemoteModels(null);
+                setFetchModelsErr("");
+                setShowForm(true);
+              }}
+              className="pill pill-hover text-xs"
+            >
+              + {t("ai.addProvider")}
+            </button>
             <PillSwitch
               size="sm"
               checked={autoRun}
@@ -818,6 +834,8 @@ export default function AiSettingsPage({ onStats, stats }) {
           ["screen", "ai.desktopScreen"],
           ["mouse", "ai.desktopMouse"],
           ["keyboard", "ai.desktopKeyboard"],
+          ["diagram", "ai.desktopDiagram"],
+          ["viewimage", "ai.desktopViewimage"],
         ].map(([key, label]) => (
           <div key={key} className="flex items-center justify-between">
             <p className="text-xs text-neutral-600 dark:text-neutral-400">{t(label)}</p>
@@ -826,7 +844,7 @@ export default function AiSettingsPage({ onStats, stats }) {
               onChange={(v) => {
                 const next = { ...deskTools, [key]: v };
                 setDeskTools(next);
-                api.setDesktopTools(next.screen, next.mouse, next.keyboard).catch(() => {});
+                api.setDesktopTools(next.screen, next.mouse, next.keyboard, next.diagram, next.viewimage).catch(() => {});
               }}
             />
           </div>
@@ -972,20 +990,29 @@ export default function AiSettingsPage({ onStats, stats }) {
         />
       </div>
 
-      {/* 新增 / 编辑表单 */}
-      <form onSubmit={submit} className="card flex flex-col gap-4">
+      {/* 新增 / 编辑表单：悬浮弹窗（点遮罩关闭），平时不占页面空间 */}
+      {showForm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={() => {
+            setForm(EMPTY);
+            setShowForm(false);
+          }}
+        >
+      <form onClick={(e) => e.stopPropagation()} onSubmit={submit} className="card flex max-h-[85vh] w-full max-w-lg flex-col gap-4 overflow-y-auto shadow-xl">
         <div className="flex items-center justify-between">
           <p className="text-sm font-medium">{editing ? t("ai.editProvider") : t("ai.addProvider")}</p>
-          {editing && (
-            <button
-              type="button"
-              onClick={() => setForm(EMPTY)}
-              className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-white"
-            >
-              <IconX size={13} />
-              {t("ai.cancelEdit")}
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => {
+              setForm(EMPTY);
+              setShowForm(false);
+            }}
+            className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-900 dark:hover:text-white"
+          >
+            <IconX size={13} />
+            {editing ? t("ai.cancelEdit") : t("common.close")}
+          </button>
         </div>
 
         {/* 主流模型预设：点选一键填充 */}
@@ -1126,6 +1153,8 @@ export default function AiSettingsPage({ onStats, stats }) {
           </button>
         </div>
       </form>
+        </div>
+      )}
 
       {/* AI 自主能力说明 */}
       <div className="card text-xs leading-relaxed text-neutral-500">

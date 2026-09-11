@@ -27,7 +27,7 @@ import PillSwitch from "../components/PillSwitch.jsx";
 import ToolCallCard from "../components/ToolCallCard.jsx";
 import PendingToolCard from "../components/PendingToolCard.jsx";
 import FileCard from "../components/FileCard.jsx";
-import Markdown from "../components/Markdown.jsx";
+import Markdown, { Mermaid } from "../components/Markdown.jsx";
 import { useShellJobs } from "../hooks/useShellJobs.js";
 
 // 对话彩色标签调色板（十六进制色值）
@@ -63,6 +63,9 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
   const [liveMap, setLiveMap] = useState({}); // { sessionId: { text, cards } }
   // 缓存命中率统计（会话累计，由后端 usage/chat-usage 事件推送）
   const [usageMap, setUsageMap] = useState({}); // { sessionId: { requests, prompt_tokens, cache_read_tokens, completion_tokens, hit_rate } }
+  // 生成速度（tok/s）：流式期间由 delta/think 增量实时估算，回合结束即清空
+  const [speedMap, setSpeedMap] = useState({}); // { sessionId: tokensPerSecond }
+  const speedRef = useRef({}); // { sessionId: { start, tokens } }
   const bottom = useRef(null);
   const activeRef = useRef(""); // 事件回调里判断用户当前正在看哪个会话
 
@@ -142,7 +145,7 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
     const unImage = listen("chat-image", (e) => {
       const p = e.payload || {};
       if (p.session && p.session === activeRef.current && p.data_url) {
-        setMessages((msgs) => [...msgs, { role: "assistant", content: "", image: p.data_url }]);
+        setMessages((msgs) => [...msgs, { role: "assistant", content: "", image: p.data_url, image_path: p.path || "" }]);
       }
     });
     // 模型生成的视频（体积大不传 data URL）：用落盘路径经 asset 协议加载播放
@@ -150,6 +153,14 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
       const p = e.payload || {};
       if (p.session && p.session === activeRef.current && p.path) {
         setMessages((msgs) => [...msgs, { role: "assistant", content: "", video: p.path }]);
+      }
+    });
+    // draw_diagram 工具的图：独立结构化图卡片（diagram 字段），不走 markdown 围栏/文本流。
+    // 服务端同步落历史同款字段——事件气泡与回合结束的历史覆盖内容一致，不会闪没
+    const unMermaid = listen("chat-mermaid", (e) => {
+      const p = e.payload || {};
+      if (p.session && p.session === activeRef.current && p.code) {
+        setMessages((msgs) => [...msgs, { role: "assistant", content: "", diagram: { code: p.code, title: p.title, path: p.path } }]);
       }
     });
     // AI 写出可预览文件（html/md/svg）：追加"点击预览"卡片气泡
@@ -172,6 +183,7 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
       unUsage.then((f) => f());
       unImage.then((f) => f());
       unVideo.then((f) => f());
+      unMermaid.then((f) => f());
       unPreview.then((f) => f());
       unSyntax.then((f) => f());
     };
@@ -391,6 +403,7 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
     }
   };
   const usage = usageMap[activeId] || null;
+  const speed = speedMap[activeId] || null; // 本会话流式生成速度（tok/s），非流式期间为 null
   const usageKnown = !!usage?.prompt_tokens;
 
   useEffect(() => {
@@ -825,6 +838,15 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
     runTask(sid, item);
   };
 
+  // 速度估算：CJK 字符 ≈1 token，其余每 4 字符 ≈1 token；每收到增量就刷新一次 tok/s
+  const bumpSpeed = (sid, text) => {
+    const t = speedRef.current[sid];
+    if (!t || !text) return;
+    for (const ch of text) t.tokens += ch.codePointAt(0) > 0x2e7f ? 1 : 0.25;
+    const secs = (performance.now() - t.start) / 1000;
+    if (secs > 0.2) setSpeedMap((m) => ({ ...m, [sid]: t.tokens / secs }));
+  };
+
   // 实际执行一次对话任务（流式），结束时自动续发该会话的等待队列。
   // busy 标记统一在此设置：无论是直接发送还是队列续发，执行期间新消息都会正确排队
   const runTask = async (sid, item) => {
@@ -846,16 +868,19 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
           case "round_start":
             // 新一轮开始：清空本轮实时文本，保留此前已完成轮次的工具卡片；
             // 思考过程跨轮累积（落库的是整个回合的思考，实时面板保持一致）
+            speedRef.current[sid] = { start: performance.now(), tokens: 0 }; // 速度表重新计时
             setLiveMap((m) => ({ ...m, [sid]: { text: "", think: m[sid]?.think || "", cards: m[sid]?.cards || [] } }));
             break;
           case "think":
-            // 思考过程增量（reasoning/thinking）：实时展示
+            // 思考过程增量（reasoning/thinking）：实时展示（同时计入速度估算——思考也是输出 token）
+            bumpSpeed(sid, ev.text);
             setLiveMap((m) => ({
               ...m,
               [sid]: { text: m[sid]?.text || "", think: (m[sid]?.think || "") + (ev.text || ""), cards: m[sid]?.cards || [] },
             }));
             break;
           case "delta":
+            bumpSpeed(sid, ev.text);
             setLiveMap((m) => ({
               ...m,
               [sid]: { text: (m[sid]?.text || "") + (ev.text || ""), think: m[sid]?.think || "", cards: m[sid]?.cards || [] },
@@ -942,6 +967,12 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
       endLive();
     } finally {
       runningRef.current.delete(sid);
+      delete speedRef.current[sid]; // 速度表随任务结束清零（页眉不再显示 tok/s）
+      setSpeedMap((m) => {
+        const n = { ...m };
+        delete n[sid];
+        return n;
+      });
       setBusyMap((m) => {
         const n = { ...m };
         delete n[sid];
@@ -1481,6 +1512,7 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
                       ? `${t("chat.cacheHit")} ${Math.round((usage.hit_rate || 0) * 100)}%`
                       : t("chat.cacheUnknown")
                   }`}
+                {speed != null && ` · ${Math.round(speed)} tok/s`}
               </span>
               {(ctxPct >= 1 || compressing) && (
                 <button
@@ -2077,7 +2109,7 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
             </div>
             </div>
 
-            {/* 多行输入：随内容自动增高，超出后内部滚动；Enter 换行，Ctrl/Shift/Cmd+Enter 发送 */}
+            {/* 多行输入：随内容自动增高，超出后内部滚动；Enter 发送，Shift+Enter 换行 */}
             <textarea
               ref={inputRef}
               rows={1}
@@ -2093,12 +2125,8 @@ export default function ChatPage({ onStats, visible, sidebarOpen, onToggleSideba
               onChange={(e) => setInput(e.target.value)}
               onPaste={onPasteInput}
               onKeyDown={(e) => {
-                // Enter 直接换行便于拼接长消息；Ctrl+Enter / Shift+Enter 发送；中文输入法选词回车不发送
-                if (
-                  e.key === "Enter" &&
-                  (e.ctrlKey || e.shiftKey || e.metaKey) &&
-                  !e.nativeEvent.isComposing
-                ) {
+                // Enter 发送；Shift+Enter 换行；中文输入法选词回车不发送（isComposing 保护）
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   send();
                 }
@@ -2302,8 +2330,87 @@ function ThinkPanel({ text, openDefault = false, streaming = false }) {
 
 // 单条消息气泡：user / assistant，assistant 可携带工具调用卡片
 // send_file 成功的调用渲染为文件卡片（如同收文件），不出工具卡
+// ── 图片/图表媒体操作条：预览（灯箱放大）/ 下载（另存为）/ 打开位置 ──
+// src: 显示源（data:URL 或 asset 路径）；path: 本地源文件路径（无则没有"打开位置"）
+// svgText: 图表的 SVG 文本（下载/预览直接用它，不需要落盘文件）
+function svgDataUrl(svg) {
+  return "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svg)));
+}
+function MediaActions({ src, path, svgText, name }) {
+  const [zoom, setZoom] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const dataSrc = src || (svgText ? svgDataUrl(svgText) : "");
+  const canReveal = !!path && !path.startsWith("data:");
+  const dl = async () => {
+    if (!dataSrc || busy) return;
+    setBusy(true);
+    setNote("");
+    try {
+      const saved = await api.saveFileAs(canReveal ? path : dataSrc, name);
+      if (saved) setNote(t("chat.savedTo") + saved);
+    } catch (e) {
+      setNote(String(e));
+    }
+    setBusy(false);
+  };
+  return (
+    <div className="mt-1 flex items-center justify-end gap-3 text-[11px] text-neutral-400">
+      {note && <span className="mr-auto max-w-56 truncate text-emerald-500" title={note}>{note}</span>}
+      <button type="button" className="hover:text-neutral-600 dark:hover:text-neutral-200" onClick={() => setZoom(true)}>
+        {t("chat.zoom")}
+      </button>
+      <button type="button" className="hover:text-neutral-600 dark:hover:text-neutral-200 disabled:opacity-50" disabled={busy || !dataSrc} onClick={dl}>
+        {busy ? "…" : t("chat.saveAs")}
+      </button>
+      {canReveal && (
+        <button type="button" className="hover:text-neutral-600 dark:hover:text-neutral-200" onClick={() => api.openPath(path, true).catch(() => {})}>
+          {t("chat.openLocation")}
+        </button>
+      )}
+      {zoom && (
+        <div
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/75 p-6"
+          onClick={() => {
+            setZoom(false);
+            setNote("");
+          }}
+        >
+          {svgText ? (
+            <div
+              className="max-h-full max-w-full overflow-auto rounded-xl bg-white p-5 dark:bg-neutral-900 [&_svg]:max-h-none"
+              dangerouslySetInnerHTML={{ __html: svgText }}
+            />
+          ) : (
+            <img src={dataSrc} alt="preview" className="max-h-full max-w-full rounded-xl object-contain" />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 独立图卡片：Mermaid 渲染 + 标题 + 媒体操作条（下载的是渲染好的 SVG）
+function DiagramCard({ diagram, dark }) {
+  const [svgText, setSvgText] = useState("");
+  if (!diagram || !diagram.code) return null;
+  return (
+    <div className="overflow-hidden rounded-2xl border border-neutral-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-900">
+      {diagram.title && (
+        <div className="mb-2 text-center text-xs font-semibold text-neutral-500">{diagram.title}</div>
+      )}
+      <Mermaid code={diagram.code} dark={dark} onSvg={setSvgText} />
+      <MediaActions
+        svgText={svgText}
+        name={`${(diagram.title || "diagram").replace(/[\\/:*?"<>|]/g, "_")}.svg`}
+      />
+    </div>
+  );
+}
+
 function MessageBubble({ message, onPreview }) {
   const isUser = message.role === "user";
+  const dark = typeof document !== "undefined" && document.documentElement.classList.contains("dark");
   // 后台 shell 结束时由宿主注入的说明消息（用户没说话，别渲染成用户的气泡）。
   // 三种结束都带 [后台任务…] 前缀：完成 / 已手动停止 / 超时终止
   const isBgDone =
@@ -2346,8 +2453,15 @@ function MessageBubble({ message, onPreview }) {
       )}
       {message.thinking && message.thinking.trim() && <ThinkPanel text={message.thinking} />}
       {message.image && (
-        <div className="overflow-hidden rounded-2xl border border-neutral-200 dark:border-neutral-800">
-          <img src={message.image} alt="tool output" className="max-h-96 w-auto max-w-full" />
+        <div>
+          <div className="overflow-hidden rounded-2xl border border-neutral-200 dark:border-neutral-800">
+            <img src={message.image} alt="tool output" className="max-h-96 w-auto max-w-full" />
+          </div>
+          <MediaActions
+            src={message.image}
+            path={message.image_path}
+            name={message.image_path ? message.image_path.split(/[\\/]/).pop() : "image.png"}
+          />
         </div>
       )}
       {message.video && (
@@ -2355,6 +2469,7 @@ function MessageBubble({ message, onPreview }) {
           <video src={convertFileSrc(message.video)} controls className="max-h-96 w-auto max-w-full" />
         </div>
       )}
+      {message.diagram && <DiagramCard diagram={message.diagram} dark={dark} />}
       {message.preview && (
         <button
           type="button"

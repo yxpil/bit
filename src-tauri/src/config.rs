@@ -52,6 +52,12 @@ pub struct Config {
     pub tool_mouse: bool,
     #[serde(default)]
     pub tool_keyboard: bool,
+    /// 画图工具闸门（draw_diagram）：默认关闭，与三件套同一张设置卡片；打开即生效（配置保存已修复）
+    #[serde(default)]
+    pub tool_diagram: bool,
+    /// 图片查看闸门（view_image）：默认关闭，模型不主动看本机图片
+    #[serde(default)]
+    pub tool_viewimage: bool,
     /// 幻觉防护：单个词在一条回复里出现次数达到该值即判定为幻觉循环（0=关闭）
     #[serde(default = "default_word_repeat_max")]
     pub word_repeat_max: u32,
@@ -221,6 +227,8 @@ impl Default for Config {
         Self {
             // 远程访问默认关闭：仅当用户在设置里主动开启后才监听端口
             remote_enabled: false,
+            tool_diagram: false,
+            tool_viewimage: false,
             host: "127.0.0.1".into(),
             port: 8600,
             client_key: generate_client_key(),
@@ -283,10 +291,37 @@ impl Config {
     }
 
     pub fn save(&self, dir: &Path) {
-        let _ = fs::write(
-            dir.join("config.json"),
-            serde_json::to_string_pretty(self).unwrap(),
-        );
+        // 原子写 + 重试：直接 fs::write 在文件被并发占用时会静默失败（let _ 吞掉错误），
+        // 表现为"设置开关不保存"。先写临时文件再 rename，rename 被占用则短暂重试，
+        // 全部失败时回退直接覆盖并把错误打到 stderr（不再无痕迹丢失）
+        let path = dir.join("config.json");
+        let body = match serde_json::to_string_pretty(self) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[config] serialize failed: {e}");
+                crate::worker::notify_reload();
+                return;
+            }
+        };
+        let tmp = dir.join("config.json.tmp");
+        let mut ok = fs::write(&tmp, &body).is_ok();
+        if ok {
+            ok = false;
+            for _ in 0..4 {
+                if fs::rename(&tmp, &path).is_ok() {
+                    ok = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+        }
+        if !ok {
+            if fs::write(&path, &body).is_ok() {
+                eprintln!("[config] rename retry exhausted, fallback direct write ok");
+            } else {
+                eprintln!("[config] SAVE FAILED — settings may be lost (file locked?)");
+            }
+        }
         // agent worker 模式：宿主改配置后通知 worker 重读（worker 进程内调用为空操作）
         crate::worker::notify_reload();
     }
@@ -447,6 +482,8 @@ impl Config {
             "screen" => self.tool_screen,
             "mouse" => self.tool_mouse,
             "keyboard" => self.tool_keyboard,
+            "draw_diagram" => self.tool_diagram,
+            "view_image" => self.tool_viewimage,
             _ => true,
         }
     }

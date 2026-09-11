@@ -195,8 +195,25 @@ export default function ToolsPage({ onStats }) {
     onStats?.();
   };
 
-  // 暂停 / 启用工具：暂停后 AI 与远程都不能调用，但保留定义
+  // 暂停 / 启用工具：暂停后 AI 与远程都不能调用，但保留定义。
+  // 闸门关着（设置页本机操控开关）时点击 = 直接把闸门打开，两层状态一次点清
+  const GATE_NAMES = ["screen", "mouse", "keyboard", "draw_diagram", "view_image"];
   const toggle = async (t) => {
+    if (t.gate_enabled === false && GATE_NAMES.includes(t.name)) {
+      const cur = await api.getDesktopTools();
+      const key = { screen: "screen", mouse: "mouse", keyboard: "keyboard", draw_diagram: "diagram", view_image: "viewimage" }[t.name];
+      const next = {
+        screen: !!cur.screen,
+        mouse: !!cur.mouse,
+        keyboard: !!cur.keyboard,
+        diagram: !!cur.diagram,
+        viewimage: !!cur.viewimage,
+        ...{ [key]: true },
+      };
+      await api.setDesktopTools(next.screen, next.mouse, next.keyboard, next.diagram, next.viewimage);
+      await reload();
+      return;
+    }
     await api.setToolEnabled(t.id, !(t.enabled ?? true));
     await reload();
     onStats?.();
@@ -669,16 +686,25 @@ export default function ToolsPage({ onStats }) {
           {tools.map((tool) => {
             const k = kindTag(tool.kind);
             const on = tool.enabled ?? true;
+            // gate_enabled：设置页"本机操控"闸门（screen/mouse/keyboard/draw_diagram/view_image）。
+            // 关闭时工具对 AI 不可见——此处同步呈现为停用，避免与设置页状态分裂
+            const gated = tool.gate_enabled === false;
+            const effOn = on && !gated;
             return (
               <div
                 key={tool.id}
                 className="flex items-center gap-3 border-b border-neutral-200/50 px-4 py-3 last:border-0 dark:border-neutral-800/50"
               >
-                <div className={`min-w-0 flex-1 transition-opacity ${on ? "" : "opacity-45"}`}>
+                <div className={`min-w-0 flex-1 transition-opacity ${effOn ? "" : "opacity-45"}`}>
                   <div className="flex items-center gap-2">
                     <span className="font-semibold">{tool.name}</span>
                     <span className={`chip ${k.cls}`}>{k.text}</span>
                     <span className="chip">{tool.created_by}</span>
+                    {gated && (
+                      <span className="chip text-amber-600 dark:text-amber-400" title={t("tools.gatedTip")}>
+                        {t("tools.gated")}
+                      </span>
+                    )}
                     {/* 质量徽章：近期成功率（≥80% 绿 / 50-80% 灰 / <50% 黄），悬停看最近失败原因 */}
                     {stats[tool.id]?.recent_n > 0 &&
                       (() => {
@@ -711,9 +737,9 @@ export default function ToolsPage({ onStats }) {
                 </div>
                 <div className="flex w-16 justify-center">
                   <PillSwitch
-                    checked={on}
+                    checked={effOn}
                     onChange={() => toggle(tool)}
-                    title={on ? t("tools.enabledTitle") : t("tools.pausedTitle")}
+                    title={gated ? t("tools.gatedTip") : effOn ? t("tools.enabledTitle") : t("tools.pausedTitle")}
                   />
                 </div>
                 <div className="flex w-8 justify-center">

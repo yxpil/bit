@@ -447,6 +447,7 @@ fn main() {
             commands::register_script_tool,
             commands::remove_tool,
             commands::set_tool_enabled,
+            commands::save_file_as,
             commands::invoke_tool,
             commands::list_runtimes,
             commands::refresh_runtimes,

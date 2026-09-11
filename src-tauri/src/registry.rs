@@ -310,6 +310,20 @@ pub fn builtin_tools() -> Vec<ToolDef> {
         // 注册进内置清单，但对模型可见性由 config.tool_gate 控制（设置页开关，默认关——
         // 关闭时不下发 schema 省 token，调用也会被直接拒绝）
         mk(
+            "builtin.draw_diagram",
+            "draw_diagram",
+            "Draw a diagram (flowchart / sequence / ER / class / state / git graph / gantt / pie / architecture...): pass mermaid code, it renders as a picture in the chat. Prefer this over writing diagram syntax in your reply",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "description": "Mermaid diagram source, first line is the diagram keyword (e.g. `flowchart TD`, `sequenceDiagram`, `erDiagram`)" },
+                    "title": { "type": "string", "description": "Short caption shown above the diagram (optional)" }
+                },
+                "required": ["code"]
+            }),
+            "draw_diagram",
+        ),
+        mk(
             "builtin.screen",
             "screen",
             "Capture the screen (full or a region) and show the screenshot to yourself via view_image. Use display index for multi-monitor",
@@ -571,6 +585,56 @@ pub fn stop_subagent(ctx: &Arc<crate::state::Ctx>, sid: &str) -> bool {
     }
 }
 
+/// 递归把形如 JSON 的字符串值还原为真实结构（脚本类工具的宽松入参）。
+/// 仅处理以 `[` / `{` 开头的字符串（数字/布尔等标量字符串是合法业务值，不碰）；
+/// 嵌套对象/数组同样递归；parse 失败或截断的残串原样保留，绝不因修复尝试报错
+fn relax_json_strings(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => {
+            let t = s.trim_start();
+            if t.starts_with('[') || t.starts_with('{') {
+                serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s))
+            } else {
+                Value::String(s)
+            }
+        }
+        Value::Array(a) => Value::Array(a.into_iter().map(relax_json_strings).collect()),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, relax_json_strings(v))).collect()),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod relax_tests {
+    use super::relax_json_strings;
+    use serde_json::json;
+
+    #[test]
+    fn array_string_restored() {
+        // 实测缺陷：模型把数组 stringify 成 "[10, 20]"，脚本侧逐字符迭代
+        let p = relax_json_strings(json!({ "nums": "[3, 11, 7, \"5.5\"]", "echo": "param-probe" }));
+        assert_eq!(p["nums"], json!([3, 11, 7, "5.5"]));
+        assert_eq!(p["echo"], json!("param-probe")); // 普通字符串不动
+    }
+
+    #[test]
+    fn nested_and_scalar_strings_untouched() {
+        let p = relax_json_strings(json!({ "cfg": "{\"a\":1}", "list": ["[1,2]", "5.5", 3] }));
+        assert_eq!(p["cfg"], json!({"a": 1}));
+        assert_eq!(p["list"][0], json!([1, 2]));
+        assert_eq!(p["list"][1], json!("5.5")); // 非 [/{ 开头的标量串保留
+        assert_eq!(p["list"][2], json!(3));
+    }
+
+    #[test]
+    fn broken_json_kept_as_string() {
+        let p = relax_json_strings(json!({ "x": "[1,2" , "y": "{not json}" }));
+        assert_eq!(p["x"], json!("[1,2"));
+        assert_eq!(p["y"], json!("{not json}"));
+    }
+}
+
 /// 执行工具：内置实现或转发到 Agent 回调端点
 /// `session`：发起调用的会话 id（用于长任务感知主会话中断，可为 None）
 pub async fn invoke(
@@ -592,6 +656,15 @@ pub async fn invoke(
     if !tool.enabled {
         return Err(format!("Tool `{}` is paused; enable it on the Tools page first", tool.name));
     }
+
+    // 脚本类工具（Interpreter/Script）入参宽松反序列化：部分模型/网关对无 schema 的
+    // 自由参数会把数组/对象 stringify 成 "[10, 20]" 这类字符串（实测缺陷），脚本侧逐字符
+    // 迭代直接踩坑。这里把形如 JSON 的字符串值 parse 回真实结构；parse 失败保持原样
+    let params = if matches!(tool.kind, ToolKind::Interpreter { .. } | ToolKind::Script { .. }) {
+        relax_json_strings(params)
+    } else {
+        params
+    };
 
     // 工具质量评估：计时并记录成功/失败/耗时/失败原因（所有调用路径统一收口）
     let t0 = std::time::Instant::now();
@@ -821,6 +894,9 @@ async fn builtin_invoke(
         }
         // ── 2.6 看图：读取本地图片，data_url 由 agent 循环注入下一轮请求（视觉模型） ──
         "view_image" => {
+            if !ctx.config.lock().unwrap().tool_gate("view_image") {
+                return Err("view_image is disabled: enable it in 设置 → AI 行为设置 → 本机操控（图片查看开关）".into());
+            }
             let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
             let note = params.get("note").and_then(|v| v.as_str()).unwrap_or("");
             let p = std::path::Path::new(path);
@@ -855,6 +931,53 @@ async fn builtin_invoke(
                 "note": note,
                 // agent 循环会把 data_url 抽出注入下一轮请求，并把本结果脱敏后再回喂模型
                 "data_url": format!("data:{mime};base64,{b64}"),
+            }))
+        }
+        // ── 2.10 draw_diagram：画图工具。代码走 JSON 通道抵达（天然完整，不存在 markdown
+        // 围栏断裂/裸文本问题），转发 chat-mermaid 事件由前端渲染成图卡片。源码落盘 images/ 留档
+        "draw_diagram" => {
+            if !ctx.config.lock().unwrap().tool_gate("draw_diagram") {
+                return Err("draw_diagram is disabled: enable it in 设置 → AI 行为设置 → 本机操控（图表绘制开关）".into());
+            }
+            let code = params
+                .get("code")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("Missing parameter: code (mermaid diagram source)")?;
+            if code.len() > 200 * 1024 {
+                return Err("Diagram code too large (limit 200 KB)".into());
+            }
+            let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(session) = session else {
+                return Err("draw_diagram requires a chat session to deliver the diagram to".into());
+            };
+            let dir = ctx.image_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S%3f");
+            let path = dir.join(format!("diag_{ts}.mmd"));
+            let _ = std::fs::write(&path, code);
+            let path_str = path.to_string_lossy().to_string();
+            crate::worker::emit_ui(
+                &ctx.app,
+                "chat-mermaid",
+                serde_json::json!({ "session": session, "code": code, "title": title, "path": path_str }),
+            );
+            // 独立图卡片：不进 markdown 围栏/文本流，作为消息的结构化 diagram 字段落历史，
+            // 前端按字段专用渲染（同 image/video/preview 卡片模式），历史回看同样出图
+            let mut msg = crate::ai::ChatMessage::assistant("");
+            msg.diagram = Some(serde_json::json!({ "code": code, "title": title, "path": path_str }));
+            let mut store = ctx.sessions.lock().unwrap();
+            if let Some(sess) = store.get_mut(session) {
+                sess.messages.push(msg);
+                sess.touch();
+            }
+            drop(store);
+            crate::session::persist(ctx);
+            Ok(serde_json::json!({
+                "delivered": true,
+                "path": path_str,
+                "note": "Diagram delivered to the user in the chat UI. The user has seen it; do NOT redraw or re-explain the diagram syntax in your reply text.",
             }))
         }
         // ── 2.7 screen：截屏（desktop_ctl 跨平台实现；截图自动显示给用户并落盘）──

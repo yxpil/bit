@@ -398,7 +398,12 @@ fn extract_tool_image(ctx: &Arc<Ctx>, target: &str, result: &mut serde_json::Val
             }
         }
     };
-    crate::worker::emit_ui(&ctx.app, "chat-image", json!({ "session": target, "data_url": data_url }));
+    // path：本地文件才有（data:URL 内嵌图没有），供前端"打开位置/另存为"直取源文件
+    crate::worker::emit_ui(
+        &ctx.app,
+        "chat-image",
+        json!({ "session": target, "data_url": data_url, "path": if img.starts_with("data:") { "" } else { img.as_str() } }),
+    );
     if let Some(o) = result.as_object_mut() {
         o.insert("image".into(), json!("(image delivered to the user in the chat UI)"));
     }
@@ -476,175 +481,6 @@ fn deliver_generated_media(ctx: &Arc<Ctx>, target: &str, media: &[(ai::TokenKind
         String::new()
     } else {
         format!("\n\n[{} media file(s) delivered to the user and saved to: {}]", notes.len(), notes.join(", "))
-    }
-}
-
-/// mermaid 围栏归一化（存入历史前调用，前端才能稳定渲染成图）。修三类坏输出：
-///   1. 无/通用语言标注的围栏但内容是图（首行 sequenceDiagram/flowchart...）→ 重标 ```mermaid
-///   2. 围栏外散落的图头部段落 + 紧跟的无语言围栏 → 合并为完整 ```mermaid 块
-///   3. 整幅图裸文本输出（一个围栏都没有，真实事故）→ 按图行特征整体捕获成围栏
-/// 空行处理：向后看，下一非空行仍是图行（生命周期关键字或消息箭头）才跨过；散文立即收尾。
-/// 与前端 Markdown.jsx 的 rescueMermaid 同逻辑：这里治新输出，前端兜历史数据。
-fn looks_like_mermaid_head(line: &str) -> bool {
-    const KW: &[&str] = &[
-        "flowchart", "sequenceDiagram", "classDiagram", "stateDiagram", "erDiagram", "journey",
-        "gantt", "pie", "mindmap", "timeline", "quadrantChart", "quadrant", "requirementDiagram",
-        "gitGraph", "C4Context", "C4Container", "C4Component", "C4Dynamic", "C4Deployment",
-        "sankey", "xychart", "block", "zenuml",
-    ];
-    let t = line.trim_start();
-    let word_bounded = |prefix: &str| {
-        t.starts_with(prefix)
-            && matches!(t.as_bytes().get(prefix.len()), Some(b' ') | Some(b'\t') | None)
-    };
-    if KW.iter().any(|k| word_bounded(k)) {
-        return true;
-    }
-    // graph TB/TD/BT/RL/LR（flowchart 旧语法）
-    if let Some(rest) = t.strip_prefix("graph") {
-        let d = rest.trim_start();
-        return ["TB", "TD", "BT", "RL", "LR"]
-            .iter()
-            .any(|d2| d.starts_with(d2) && matches!(d.as_bytes().get(2), Some(b' ') | None));
-    }
-    false
-}
-
-/// 图体行特征：生命周期关键字开头、行内含消息箭头或 ER 关系箭头
-fn looks_like_diagram_line(line: &str) -> bool {
-    const KW: &[&str] = &[
-        "autonumber", "participant", "actor", "note", "alt", "else", "opt", "loop", "par",
-        "and", "critical", "option", "break", "rect", "title", "legend", "end",
-    ];
-    let t = line.trim_start();
-    if KW.iter().any(|k| {
-        t.starts_with(k)
-            && matches!(t.as_bytes().get(k.len()), Some(b' ') | Some(b'\t') | None)
-    }) {
-        return true;
-    }
-    ["->>", "-->>", "-)", "--)", "-->", "-.", "==", "--o{", "--|{", "|o--", "|--"]
-        .iter()
-        .any(|a| t.contains(a))
-}
-
-/// erDiagram 实体块开头（USER {）：块内属性行无箭头特征，需整块照收
-fn is_entity_open(line: &str) -> bool {
-    let t = line.trim_start();
-    if let Some(open) = t.strip_suffix("{") {
-        let name = open.trim();
-        return !name.is_empty()
-            && !name.contains([' ', '\t', '{', '}', '`', '*', '"'])
-            && name.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"');
-    }
-    false
-}
-
-/// 解析围栏行的语言标注；非围栏行返回 None
-fn fence_label(line: &str) -> Option<&str> {
-    let t = line.trim_start();
-    let body = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~"))?;
-    Some(body.trim())
-}
-
-fn normalize_mermaid_blocks(reply: &mut String) {
-    let lines: Vec<String> = reply.lines().map(|s| s.to_string()).collect();
-    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 8);
-    let mut in_fence = false;
-    let mut changed = false;
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].clone();
-        if let Some(label) = fence_label(&line) {
-            let opening = !in_fence; // 必须在翻转前判向：开栏才可能重标
-            in_fence = !in_fence;
-            // 无/通用语言标注的开栏且下一行是图头 → 重标为 mermaid
-            if opening && matches!(label, "" | "text" | "txt" | "diag") {
-                let next = lines.get(i + 1).map(|s| s.trim()).unwrap_or("");
-                if looks_like_mermaid_head(next) {
-                    out.push("```mermaid".to_string());
-                    changed = true;
-                    i += 1;
-                    continue;
-                }
-            }
-            out.push(line);
-            i += 1;
-            continue;
-        }
-        // 围栏外散落的图（头部或整幅裸图）→ 开合成围栏收拢
-        if !in_fence && looks_like_mermaid_head(&line) {
-            out.push("```mermaid".to_string());
-            out.push(line);
-            i += 1;
-            let mut blank = 0usize;
-            let mut in_entity = false;
-            while i < lines.len() {
-                let l = &lines[i];
-                if fence_label(l).is_some() {
-                    break; // 真实围栏：并入
-                }
-                if l.trim().is_empty() {
-                    // 空行：向后看，下一非空行仍是图行/实体块才跨过
-                    let mut j = i + 1;
-                    while j < lines.len() && lines[j].trim().is_empty() {
-                        j += 1;
-                    }
-                    if j >= lines.len()
-                        || (!looks_like_diagram_line(&lines[j]) && !is_entity_open(&lines[j]) && !in_entity)
-                    {
-                        break;
-                    }
-                    out.push(l.clone());
-                    blank += 1;
-                    if blank > 30 {
-                        break; // 安全阀
-                    }
-                    i += 1;
-                    continue;
-                }
-                if in_entity {
-                    if l.contains('}') {
-                        in_entity = false; // 实体块闭合
-                    }
-                    out.push(l.clone());
-                    i += 1;
-                    continue;
-                }
-                if !looks_like_diagram_line(l) {
-                    if is_entity_open(l) {
-                        in_entity = true; // 实体块开始，直到 "}" 前整块照收
-                        out.push(l.clone());
-                        i += 1;
-                        continue;
-                    }
-                    break; // 散文开始：收尾
-                }
-                out.push(l.clone());
-                i += 1;
-            }
-            // 紧跟真实围栏（中间允许只有空行）→ 并入其内容（跳过它自己的开/闭栏行）
-            let mut j = i;
-            while j < lines.len() && lines[j].trim().is_empty() {
-                j += 1;
-            }
-            if j < lines.len() && fence_label(&lines[j]).is_some() {
-                let mut k = j + 1;
-                while k < lines.len() && fence_label(&lines[k]).is_none() {
-                    out.push(lines[k].clone());
-                    k += 1;
-                }
-                i = if k < lines.len() { k + 1 } else { k };
-            }
-            out.push("```".to_string());
-            changed = true;
-            continue;
-        }
-        out.push(line);
-        i += 1;
-    }
-    if changed {
-        *reply = out.join("\n");
     }
 }
 
@@ -925,7 +761,7 @@ pub async fn chat_turn(
         let mut v = vec![ChatMessage::system(sys)];
         // 只取最近若干条，且剥离 tool_calls（模型请求只需 role/content）
         for (role, content) in history {
-            v.push(ChatMessage { role, content, tool_calls: Vec::new(), thinking: None, ts: None });
+            v.push(ChatMessage { role, content, tool_calls: Vec::new(), thinking: None, ts: None, diagram: None });
         }
         v
     };
@@ -973,7 +809,6 @@ pub async fn chat_turn(
                     // 原生分支同样要提取回复里的 SVG 绘图：此前只有文本分支有，导致走原生
                     // function calling（如 DeepSeek）时模型输出的 SVG 不渲染、只显示代码
                     let mut content = r.content;
-                    normalize_mermaid_blocks(&mut content);
                     let svg_note = deliver_svg_blocks(ctx, &target, &content);
                     if !svg_note.is_empty() {
                         content.push_str(&svg_note);
@@ -1035,7 +870,6 @@ pub async fn chat_turn(
                 reply.push_str(&gen_note);
             }
             // 回复里的 SVG 绘图（ER图/架构图/时序图）：落盘 + 推送渲染
-            normalize_mermaid_blocks(&mut reply);
             let svg_note = deliver_svg_blocks(ctx, &target, &reply);
             if !svg_note.is_empty() {
                 reply.push_str(&svg_note);
@@ -1323,7 +1157,7 @@ pub async fn chat_turn_stream(
         };
         let mut v = vec![ChatMessage::system(sys)];
         for (role, content) in history {
-            v.push(ChatMessage { role, content, tool_calls: Vec::new(), thinking: None, ts: None });
+            v.push(ChatMessage { role, content, tool_calls: Vec::new(), thinking: None, ts: None, diagram: None });
         }
         v
     };
@@ -1390,7 +1224,6 @@ pub async fn chat_turn_stream(
                     // 原生模式只认协议字段里的调用；正文 JSON 解析是兼容模式（文本约定）的专属职责
                     // 原生分支同样要提取回复里的 SVG 绘图（与 chat_turn 同因：漏了导致原生模式下 SVG 不渲染）
                     let mut content = r.content;
-                    normalize_mermaid_blocks(&mut content);
                     let svg_note = deliver_svg_blocks(ctx, &target, &content);
                     if !svg_note.is_empty() {
                         content.push_str(&svg_note);
@@ -1507,7 +1340,6 @@ pub async fn chat_turn_stream(
                 reply.push_str(&gen_note);
             }
             // 回复里的 SVG 绘图（ER图/架构图/时序图）：落盘 + 推送渲染
-            normalize_mermaid_blocks(&mut reply);
             let svg_note = deliver_svg_blocks(ctx, &target, &reply);
             if !svg_note.is_empty() {
                 reply.push_str(&svg_note);
@@ -1756,7 +1588,7 @@ pub fn build_context(
         ai::system_prompt_native(ctx, Some(&target))
     })];
     for m in recent {
-        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None, ts: None });
+        v.push(ChatMessage { role: m.role.clone(), content: m.content.clone(), tool_calls: Vec::new(), thinking: None, ts: None, diagram: None });
     }
     Ok((v, ai::tools_manifest(ctx)))
 }
@@ -2163,98 +1995,6 @@ fn parse_tool_calls(reply: &str) -> Option<Vec<serde_json::Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// E2E：真实事故样本（sessions.json 里挖出的裸文本时序图）必须被归一化成单个完整 mermaid 围栏
-    #[test]
-    fn test_normalize_bare_diagram_real_case() {
-        // 注意：普通字符串里行尾 `\` 续行会吞掉下一行行首空格，用原始字符串保留缩进
-        let raw = r#"给你画一个通用的示例时序图（用户登录 + 鉴权流程），直接可渲染：
-
-sequenceDiagram
-  autonumber
-  participant U as 用户
-  participant C as 客户端
-  participant G as 网关/API
-  participant A as 认证服务
-  participant D as 数据库
-
-  U->>C: 输入账号密码
-  C->>G: POST /login {user, pwd}
-  G->>A: 转发登录请求
-  A->>D: 查询用户记录
-  D-->>A: 返回 salt + hash
-  A->>A: 校验密码哈希
-
-  alt 校验通过
-    A-->>G: 签发 token (JWT)
-    G-->>C: 200 OK + token
-  else 校验失败
-    A-->>G: 401 认证失败
-  end
-
-如果你要的是**特定业务**的时序图，把参与者名称告诉我。"#;
-        let mut s = raw.to_string();
-        normalize_mermaid_blocks(&mut s);
-        // 恰好一对围栏，且整幅图都在里面，散文留在外面
-        assert_eq!(s.matches("```mermaid").count(), 1, "应只有一个 mermaid 开栏:\n{}", s);
-        assert_eq!(s.matches("```").count(), 2, "围栏应成对:\n{}", s);
-        assert!(s.contains("  U->>C: 输入账号密码"), "图体应带缩进在围栏内:\n{}", s);
-        assert!(s.contains("  end"), "alt/else/end 应在围栏内:\n{}", s);
-        assert!(s.ends_with("把参与者名称告诉我。"), "散文应留在围栏外:\n{}", s);
-        // 幂等：归一化结果再跑一遍不变
-        let once = s.clone();
-        normalize_mermaid_blocks(&mut s);
-        assert_eq!(s, once, "归一化应幂等");
-    }
-
-    /// E2E：真实 ER 图事故（|o--o{ 关系箭头 + 实体属性行）必须整幅收进围栏
-    #[test]
-    fn test_normalize_bare_er_diagram_real_case() {
-        let raw = r#"先给你画一个**通用电商系统**的 ER 图作示例（用户 / 商品 / 订单这条主线）：
-
-erDiagram
-    USER      ||--o{ ADDRESS    : "收货地址"
-    USER      ||--o{ ORDER      : "下单"
-    CATEGORY  |o--o{ CATEGORY   : "父分类"
-    ORDER     ||--|{ ORDER_ITEM : "包含明细"
-
-    USER {
-        bigint   id PK
-        string   username
-    }
-
-N）；`|o--o{` = 右侧可关联。要不要我按你的实际业务改一版？"#;
-        let mut s = raw.to_string();
-        normalize_mermaid_blocks(&mut s);
-        assert_eq!(s.matches("```mermaid").count(), 1, "应只有一个 mermaid 开栏:\n{}", s);
-        assert_eq!(s.matches("```").count(), 2, "围栏应成对:\n{}", s);
-        assert!(s.contains("||--o{ ADDRESS"), "ER 关系行应在围栏内:\n{}", s);
-        assert!(s.contains("bigint   id PK"), "实体属性行应在围栏内:\n{}", s);
-        assert!(s.contains("要不要我按你的实际业务改一版？"), "散文应留在围栏外:\n{}", s);
-        // 散文里的 |o--o{ 反引号片段不被误认为图（它在围栏外，正常保留）
-        let once = s.clone();
-        normalize_mermaid_blocks(&mut s);
-        assert_eq!(s, once, "归一化应幂等");
-    }
-
-    /// E2E：无语言围栏（内容是图）→ 重标；头部段落+无语言围栏 → 合并；普通散文不动
-    #[test]
-    fn test_normalize_fence_relabel_and_merge() {
-        // 无语言围栏重标
-        let mut s = "如下：\n\n```\nsequenceDiagram\nU->>S: hi\n```\n".to_string();
-        normalize_mermaid_blocks(&mut s);
-        assert!(s.contains("```mermaid\nsequenceDiagram"), "应重标为 mermaid:\n{}", s);
-        // 头部段落 + 空行 + 无语言围栏 → 合并成单块
-        let mut s = "时序图：\n\nsequenceDiagram\nautonumber\nactor U as 用户\n\n```\nU->>S: 请求\nS-->>U: 响应\nalt ok\nA->>B: x\nelse bad\nA->>B: y\nend\n```\n".to_string();
-        normalize_mermaid_blocks(&mut s);
-        assert_eq!(s.matches("```mermaid").count(), 1, "应合并为单块:\n{}", s);
-        assert_eq!(s.matches("```").count(), 2, "围栏应成对:\n{}", s);
-        assert!(s.contains("U->>S: 请求"), "围栏体应并入:\n{}", s);
-        // 普通散文提到 graph TB 不能误伤
-        let mut s = "这个 graph TB 的话题很有意思，我们聊聊别的吧。\n\n今天天气不错。".to_string();
-        normalize_mermaid_blocks(&mut s);
-        assert!(!s.contains("```"), "散文不应被加围栏:\n{}", s);
-    }
 
     #[test]
     fn test_parse_standard_array() {

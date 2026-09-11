@@ -84,17 +84,21 @@ pub struct ChatMessage {
     /// 本地落库时间（前端回看历史时画 QQ 式时间分割线；仅对话页可见，模型请求用不到）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<String>,
+    /// draw_diagram 产出的独立图卡片（{code,title,path}）：不走 markdown 围栏，前端专用渲染；
+    /// 模型请求时同样剥离（模型已知图已送达，重发正文即可）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagram: Option<serde_json::Value>,
 }
 
 impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        ChatMessage { role: "user".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: Some(now_ts()) }
+        ChatMessage { role: "user".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: Some(now_ts()), diagram: None }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        ChatMessage { role: "assistant".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: Some(now_ts()) }
+        ChatMessage { role: "assistant".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: Some(now_ts()), diagram: None }
     }
     pub fn system(content: impl Into<String>) -> Self {
-        ChatMessage { role: "system".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: None }
+        ChatMessage { role: "system".into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: None, diagram: None }
     }
 }
 
@@ -1515,19 +1519,16 @@ let word_lists: Vec<Vec<String>> = mem_items.iter().map(|(_, content)| cut(conte
     if !runtime_ids.is_empty() {
         runtime_info.push_str(&format!("\n## Local interpreters\n{}", runtime_ids.join(", ")));
     }
-    // 媒体缓存目录：绘画/视频模型产图、SVG 图表的统一落盘位置（路径动态注入）。恒定 2 行
+    // 媒体缓存目录：绘画/视频模型产图、SVG 图表的统一落盘位置（路径动态注入）。恒定 1 行。
+    // draw_diagram 提示随闸门开关拼接：闸门关闭时绝不出现，避免模型看到不存在的工具
+    let diagram_hint = if ctx.config.lock().unwrap().tool_gate("draw_diagram") {
+        " Diagrams: use the `draw_diagram` tool"
+    } else {
+        ""
+    };
     runtime_info.push_str(&format!(
         "\n## Media cache folder\n\
-        - Images/videos/SVG generated or drawn are auto-saved under: {} — use it for intermediate media; to show a picture, output an \"image\" field (path/b64:/data:URL) from tool stdout\n\
-        - Diagrams MUST use this exact format (one diagram = one complete fenced block):\n\
-        \x60\x60\x60mermaid\n\
-        sequenceDiagram\n\
-        \x20 participant U as User\n\
-        \x20 participant S as Server\n\
-        \x20 U->>S: request\n\
-        \x20 S-->>U: response\n\
-        \x60\x60\x60\n\
-        First line is the diagram keyword (sequenceDiagram / flowchart TD / erDiagram / classDiagram / gitGraph ...); ALL lines of the diagram stay inside that one block. NEVER write diagram syntax as plain text; NEVER split header and body into separate blocks. Or output SVG directly — both auto-rendered",
+        - Images/videos/SVG generated or drawn are auto-saved under: {} — use it for intermediate media; to show a picture, output an \"image\" field (path/b64:/data:URL) from tool stdout.{diagram_hint}",
         ctx.image_dir().display()
     ));
     if !goal_lines.is_empty() {

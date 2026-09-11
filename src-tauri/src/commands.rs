@@ -10,6 +10,45 @@ fn ctx<'a>(state: State<'a, Arc<Ctx>>) -> Arc<Ctx> {
     state.inner().clone()
 }
 
+/// 另存为：原生保存对话框 + 复制文件。path 支持本地路径或 data:URL（内嵌图）。
+/// 返回保存到的路径（取消返回 None）
+#[tauri::command]
+pub fn save_file_as(path: String, suggested_name: Option<String>) -> Result<Option<String>, String> {
+    // data:URL 无实体源文件，跳过存在性检查
+    if !path.starts_with("data:") {
+        let src = std::path::PathBuf::from(&path);
+        if !src.exists() {
+            return Err(format!("文件不存在: {}", path));
+        }
+    }
+    let default_name = if path.starts_with("data:") {
+        "image.png".to_string()
+    } else {
+        std::path::PathBuf::from(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "image.png".into())
+    };
+    let file = rfd::FileDialog::new()
+        .set_title("保存为")
+        .set_file_name(&suggested_name.unwrap_or(default_name));
+    let Some(dest) = file.pick_file() else {
+        return Ok(None);
+    };
+    // data URL（截图/生成图内嵌 b64）：解码后写盘；普通路径直接复制
+    if let Some(rest) = path.strip_prefix("data:") {
+        let b64 = rest.split(',').next_back().unwrap_or_default();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+    } else {
+        std::fs::copy(&path, &dest).map_err(|e| e.to_string())?;
+    }
+    Ok(Some(dest.to_string_lossy().to_string()))
+}
+
 pub fn estimate_context_tokens(ctx: &Arc<Ctx>, session_id: &str, convo: &[crate::ai::ChatMessage]) -> usize {
     let _ = session_id;
     // 兼容模式（文本约定）下工具清单以压缩形式内联在系统提示词里，已计入 convo_chars；
@@ -94,7 +133,20 @@ pub fn get_overview(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
 
 #[tauri::command]
 pub fn list_tools(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
-    json!({ "tools": ctx(state).tools.lock().unwrap().clone() })
+    let ctx = ctx(state);
+    // gate_enabled：设置页"本机操控"闸门状态。工具页据此把被闸门关掉的工具同步显示为停用，
+    // 避免"设置里关了、工具页还显示运行中"的状态分裂
+    let cfg = ctx.config.lock().unwrap().clone();
+    let tools = ctx.tools.lock().unwrap().clone();
+    let list: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| {
+            let mut v = serde_json::to_value(t).unwrap_or_else(|_| json!({}));
+            v["gate_enabled"] = json!(cfg.tool_gate(&t.name));
+            v
+        })
+        .collect();
+    json!({ "tools": list })
 }
 
 #[tauri::command]
@@ -564,7 +616,7 @@ pub fn set_tool_env_settings(
     Ok(json!({ "ok": true }))
 }
 
-/// 本机操控三件套开关（screen / mouse / keyboard）：设置页工具权限卡片。
+/// 本机操控开关（screen / mouse / keyboard / draw_diagram / view_image）：设置页卡片。
 /// 开启后模型可见并可调用（experimental；macOS 需 TCC 授权）
 #[tauri::command]
 pub fn set_desktop_tools(
@@ -572,6 +624,8 @@ pub fn set_desktop_tools(
     screen: bool,
     mouse: bool,
     keyboard: bool,
+    diagram: bool,
+    viewimage: bool,
 ) -> Result<serde_json::Value, String> {
     let ctx = ctx(state);
     {
@@ -579,6 +633,8 @@ pub fn set_desktop_tools(
         cfg.tool_screen = screen;
         cfg.tool_mouse = mouse;
         cfg.tool_keyboard = keyboard;
+        cfg.tool_diagram = diagram;
+        cfg.tool_viewimage = viewimage;
     }
     ctx.save_config();
     crate::audit::record(
@@ -586,13 +642,13 @@ pub fn set_desktop_tools(
         "local-user",
         "desktop.tools",
         "set",
-        json!({ "screen": screen, "mouse": mouse, "keyboard": keyboard }),
+        json!({ "screen": screen, "mouse": mouse, "keyboard": keyboard, "diagram": diagram, "viewimage": viewimage }),
         true,
     );
     Ok(json!({ "ok": true }))
 }
 
-/// 读取本机操控三件套开关状态
+/// 读取本机操控开关状态
 #[tauri::command]
 pub fn get_desktop_tools(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
     let ctx = ctx(state);
@@ -601,6 +657,8 @@ pub fn get_desktop_tools(state: State<'_, Arc<Ctx>>) -> serde_json::Value {
         "screen": cfg.tool_screen,
         "mouse": cfg.tool_mouse,
         "keyboard": cfg.tool_keyboard,
+        "diagram": cfg.tool_diagram,
+        "viewimage": cfg.tool_viewimage,
     })
 }
 

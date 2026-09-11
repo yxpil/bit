@@ -175,7 +175,7 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage { role: role.into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: None }
+        ChatMessage { role: role.into(), content: content.into(), tool_calls: Vec::new(), thinking: None, ts: None, diagram: None }
     }
 
     fn session_with(messages: Vec<ChatMessage>) -> Session {

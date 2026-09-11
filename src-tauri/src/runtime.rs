@@ -282,7 +282,16 @@ pub fn remove(ctx: &Arc<crate::state::Ctx>, id: &str) -> Result<(), String> {
 }
 
 pub fn get(ctx: &Arc<crate::state::Ctx>, id: &str) -> Option<Runtime> {
-    ctx.runtimes.lock().unwrap().iter().find(|r| r.id == id).cloned()
+    let list = ctx.runtimes.lock().unwrap();
+    if let Some(rt) = list.iter().find(|r| r.id == id) {
+        return Some(rt.clone());
+    }
+    // 别名兜底：Windows 的 py launcher 常见但不在候选表里（python/python3 已注册），
+    // AI 传 runtime="py" 时解析到同语言的 Python 运行时，避免探测表与真实机器脱节
+    if id == "py" {
+        return list.iter().find(|r| r.lang == "py").cloned();
+    }
+    None
 }
 
 /// 暂停 / 启用某个解释器。暂停后 AI 不能用它执行代码或注册工具。

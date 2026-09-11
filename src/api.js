@@ -109,6 +109,8 @@ export const api = {
   extractFile: (filename, data) => invoke("extract_file", { filename, data }),
   // 用系统默认程序打开文件；reveal=true 时打开所在文件夹并定位
   openPath: (path, reveal) => invoke("open_path", { path, reveal: !!reveal }),
+  // 另存为：原生保存对话框，path 支持本地路径或 data:URL；返回保存路径（取消 null）
+  saveFileAs: (path, suggestedName) => invoke("save_file_as", { path, suggestedName: suggestedName || null }),
   // 抓取网页正文，返回 { title, text }
   fetchWebpage: (url) => invoke("fetch_webpage", { url }),
   // 端口冲突检测：返回 { available, addr, reason? }
@@ -134,9 +136,9 @@ export const api = {
   // 全局快捷键：唤出主界面（空 = 关闭）
   getHotkey: () => invoke("get_hotkey"),
   setHotkey: (hotkey) => invoke("set_hotkey", { hotkey }),
-  // 本机操控三件套开关（screen/mouse/keyboard，实验性）
+  // 本机操控开关（screen/mouse/keyboard/draw_diagram/view_image，实验性；默认全关）
   getDesktopTools: () => invoke("get_desktop_tools"),
-  setDesktopTools: (screen, mouse, keyboard) => invoke("set_desktop_tools", { screen, mouse, keyboard }),
+  setDesktopTools: (screen, mouse, keyboard, diagram, viewimage) => invoke("set_desktop_tools", { screen, mouse, keyboard, diagram, viewimage }),
   // 写文件后轻量语法检查（json/js/py）：出错提醒模型与用户
   getSyntaxCheck: () => invoke("get_syntax_check"),
   setSyntaxCheck: (enabled) => invoke("set_syntax_check", { enabled }),

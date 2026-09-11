@@ -54,14 +54,19 @@ let mermaidInited = false;
 let mermaidInitedDark = null;
 const mermaidSvgCache = new Map(); // key: `${dark ? "d" : "l"}:${code}` -> svg
 let mermaidChain = Promise.resolve(); // 渲染串行链
-function Mermaid({ code, dark }) {
+// 供外部（如 draw_diagram 独立图卡片）直接渲染 mermaid 源码用
+// onSvg：渲染成功后把 SVG 文本回调给父组件（图卡片的下载/预览用）
+export function Mermaid({ code, dark, onSvg }) {
   const cacheKey = `${dark ? "d" : "l"}:${code}`;
   const [svg, setSvg] = useState(() => mermaidSvgCache.get(cacheKey) || "");
   const [err, setErr] = useState(false);
+  const onSvgRef = useRef(onSvg);
+  onSvgRef.current = onSvg;
   useEffect(() => {
     if (mermaidSvgCache.has(cacheKey)) {
       setSvg(mermaidSvgCache.get(cacheKey));
       setErr(false);
+      onSvgRef.current?.(mermaidSvgCache.get(cacheKey));
       return;
     }
     let alive = true;
@@ -71,7 +76,9 @@ function Mermaid({ code, dark }) {
     const timer = setTimeout(() => {
       (async () => {
         try {
+          console.error("[mmd-step] 开始: code长度", code.length);
           const mermaid = (await import("mermaid")).default;
+          console.error("[mmd-step] import 完成");
           if (!mermaidInited || mermaidInitedDark !== dark) {
             mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "strict" });
             mermaidInited = true;
@@ -81,6 +88,7 @@ function Mermaid({ code, dark }) {
           // 验证不过 = 不是合法的图，直接回退源码，绝不进 render——render 的错误路径
           // 会往 body 里插错误节点（"syntax error in text" 把页面顶上去的就是它）。
           const valid = await mermaid.parse(code, { suppressErrors: true });
+          console.error("[mmd-step] parse:", valid ? "OK" : "FAIL");
           if (!valid) {
             if (alive) setErr(true);
             return;
@@ -90,12 +98,18 @@ function Mermaid({ code, dark }) {
           const task = mermaidChain.then(run, run);
           mermaidChain = task.catch(() => {});
           const out = await task;
-          if (alive) {
-            mermaidSvgCache.set(cacheKey, out);
-            setSvg(out);
+          // mermaid v10.6+/v11+/v12 的 render 返回 { svg, bindFunctions } 对象（v9 及以下才是字符串）；
+          // 不取 .svg 的话对象会被 DOM 强转成字面量 "[object Object]" —— 这就是该 bug 的真正根源
+          const svgText = typeof out === "string" ? out : out?.svg || "";
+          console.error("[mmd-step] render:", svgText ? "OK(" + svgText.length + "字符)" : "空");
+          if (alive && svgText) {
+            mermaidSvgCache.set(cacheKey, svgText);
+            setSvg(svgText);
             setErr(false);
+            onSvgRef.current?.(svgText);
           }
         } catch {
+          console.error("[mmd-step] 异常:", new Error().stack?.split("\n")[1]?.trim());
           // 兜底清理：mermaid render 失败时可能在 body 残留 #dmermaid-*/#dmmd-* 错误节点
           document.querySelectorAll("[id^='dmermaid'], [id^='dmmd-']").forEach((n) => n.remove());
           if (alive) setErr(true);
@@ -221,41 +235,41 @@ export default function Markdown({ children }) {
             />
           ),
           hr: ({ node, ...p }) => <hr className="my-2 border-neutral-200 dark:border-neutral-800" {...p} />,
-          // 行内代码 / 代码块（mermaid 特判渲染成图）
-          code: ({ node, inline, className, children, ...p }) => {
-            const lang = /language-(\w+)/.exec(className || "")?.[1];
-            // 防御性扁平化：children 理论上恒为 string，但插件组合可能混入元素节点，
-            // String([obj]) 会产出字面量 "[object Object]"——只保留字符串片段
-            const text = Array.isArray(children)
-              ? children.filter((c) => typeof c === "string").join("")
-              : typeof children === "string"
-                ? children
-                : "";
-            if (!inline && lang === "mermaid") return <Mermaid code={text.trim()} dark={dark} />;
-            // 无/通用语言标注 + 首行像 mermaid → 当图渲染（救历史消息里没标语言的图代码）
+          // 行内代码：一律按行内渲染。注意 react-markdown v9+ 已移除 code 的 inline 属性，
+          // 块级代码的判定（含 mermaid 特判）统一收敛到下面的 pre 组件——
+          // 此前 inline 恒为 undefined，行内代码 `pie`/`flowchart TD` 等会被误渲染成图
+          code: ({ node, className, children, ...p }) => (
+            <code
+              className={`rounded bg-neutral-200/70 px-1 py-0.5 font-mono text-[0.85em] dark:bg-neutral-800 ${className || ""}`}
+              {...p}
+            >
+              {children}
+            </code>
+          ),
+          pre: ({ node, children, ...p }) => {
+            // 块级代码唯一可靠入口：pre 的直接子元素就是 code 组件渲染出的元素
+            const child = Array.isArray(children) ? children[0] : children;
+            const cp = child?.props || {};
+            const lang = /language-(\w+)/.exec(cp.className || "")?.[1];
+            // 防御性扁平化：只保留字符串片段（插件组合可能混入元素节点）
+            const raw = Array.isArray(cp.children)
+              ? cp.children.filter((c) => typeof c === "string").join("")
+              : cp.children;
+            const text = typeof raw === "string" ? raw : "";
             const firstLine = text.split("\n", 1)[0];
-            if (!inline && (!lang || /^(text|txt|diag)$/i.test(lang)) && MERMAID_FIRST_LINE.test(firstLine)) {
+            // mermaid 代码块（标注 mermaid，或无/通用标注但首行像图 → 救历史消息）
+            if (text && (lang === "mermaid" || !lang || /^(text|txt|diag)$/i.test(lang)) && MERMAID_FIRST_LINE.test(firstLine)) {
               return <Mermaid code={text.trim()} dark={dark} />;
             }
-            return inline ? (
-              <code
-                className="rounded bg-neutral-200/70 px-1 py-0.5 font-mono text-[0.85em] dark:bg-neutral-800"
+            return (
+              <pre
+                className="my-1.5 overflow-x-auto rounded-lg bg-neutral-100 p-2.5 text-[0.85em] leading-relaxed dark:bg-black/40 [&_code]:bg-transparent [&_code]:px-0 [&_code]:py-0"
                 {...p}
               >
                 {children}
-              </code>
-            ) : (
-              <code className="font-mono text-[0.85em]" {...p}>
-                {children}
-              </code>
+              </pre>
             );
           },
-          pre: ({ node, ...p }) => (
-            <pre
-              className="my-1.5 overflow-x-auto rounded-lg bg-neutral-100 p-2.5 text-[0.85em] leading-relaxed dark:bg-black/40"
-              {...p}
-            />
-          ),
           // 表格（GFM）
           table: ({ node, ...p }) => (
             <div className="my-1.5 overflow-x-auto">
