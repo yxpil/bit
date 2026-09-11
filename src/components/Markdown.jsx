@@ -44,24 +44,51 @@ const sanitizeSchema = {
 };
 
 // mermaid 图渲染：动态 import（不进主包），失败时回退显示源码
+// 三个关键约束（违反任一都会出现"合法的图随机报 syntax error / 渲染好的图过一会儿变回文字"）：
+//   1. initialize 只做一次（主题变化时除外）——渲染中途重初始化会重置全局解析状态
+//   2. render 串行执行——mermaid 全局状态非并发安全，并发 render 会互相打断报 parse error
+//   3. 成功结果按 code+主题 缓存——流式输出/消息重渲染导致组件重挂载时直接复用，
+//      不再触碰 mermaid 全局状态（这是"图出来后又集体变回文字"的根治手段）
 let mermaidSeq = 0;
+let mermaidInited = false;
+let mermaidInitedDark = null;
+const mermaidSvgCache = new Map(); // key: `${dark ? "d" : "l"}:${code}` -> svg
+let mermaidChain = Promise.resolve(); // 渲染串行链
 function Mermaid({ code, dark }) {
-  const [svg, setSvg] = useState("");
+  const cacheKey = `${dark ? "d" : "l"}:${code}`;
+  const [svg, setSvg] = useState(() => mermaidSvgCache.get(cacheKey) || "");
   const [err, setErr] = useState(false);
   useEffect(() => {
+    if (mermaidSvgCache.has(cacheKey)) {
+      setSvg(mermaidSvgCache.get(cacheKey));
+      setErr(false);
+      return;
+    }
     let alive = true;
     (async () => {
       try {
         const mermaid = (await import("mermaid")).default;
-        mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "strict" });
-        const { svg } = await mermaid.render(`mmd-${++mermaidSeq}`, code);
-        if (alive) { setSvg(svg); setErr(false); }
+        if (!mermaidInited || mermaidInitedDark !== dark) {
+          mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "strict" });
+          mermaidInited = true;
+          mermaidInitedDark = dark;
+        }
+        // 排进串行链：前一个渲染成功/失败都继续，保证同一时刻只有一个 render 在跑
+        const run = () => mermaid.render(`mmd-${++mermaidSeq}`, code);
+        const task = mermaidChain.then(run, run);
+        mermaidChain = task.catch(() => {});
+        const out = await task;
+        if (alive) {
+          mermaidSvgCache.set(cacheKey, out);
+          setSvg(out);
+          setErr(false);
+        }
       } catch {
         if (alive) setErr(true);
       }
     })();
     return () => { alive = false; };
-  }, [code, dark]);
+  }, [cacheKey]);
   if (err) return <pre className="my-1.5 overflow-x-auto rounded-lg bg-neutral-100 p-2.5 text-[0.85em] dark:bg-black/40"><code className="font-mono text-[0.85em]">{code}</code></pre>;
   if (!svg) return <div className="my-1.5 text-xs text-neutral-400">mermaid 渲染中…</div>;
   // securityLevel strict + sanitize 同源：mermaid 输出的 svg 已自净，这里再用 img 承载双保险
