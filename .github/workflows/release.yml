@@ -351,7 +351,10 @@ jobs:
     needs: ensure-release
     if: github.event_name == 'push' || inputs.include_exotic != false
     continue-on-error: true
-    runs-on: ubuntu-latest
+    # aarch64 用 ARM 原生 runner（ubuntu-24.04-arm）跑 alpine 容器：
+    # QEMU 用户态模拟下 Alpine edge 的 rustc（Scudo 分配器）会 SIGBUS 崩溃
+    # （rustc --version 都起不来，exit 135 Bus error），原生执行无此问题
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -372,12 +375,6 @@ jobs:
           npm ci
           npm run lint
           npm run build
-      - name: 安装 QEMU 模拟器（aarch64）
-        if: matrix.arch == 'aarch64'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user-static
-          ls /proc/sys/fs/binfmt_misc/ | grep -qx "qemu-aarch64"
       - name: 容器内构建（alpine ${{ matrix.arch }}）
         run: |
           VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
