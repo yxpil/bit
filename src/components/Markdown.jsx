@@ -65,43 +65,48 @@ function Mermaid({ code, dark }) {
       return;
     }
     let alive = true;
-    (async () => {
-      try {
-        const mermaid = (await import("mermaid")).default;
-        if (!mermaidInited || mermaidInitedDark !== dark) {
-          mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "strict" });
-          mermaidInited = true;
-          mermaidInitedDark = dark;
-        }
-        // 第一步：自己先用 parse 验证（suppressErrors：不抛异常、无 DOM 副作用）。
-        // 验证不过 = 不是合法的图，直接回退源码，绝不进 render——render 的错误路径
-        // 会往 body 里插错误节点（"syntax error in text" 把页面顶上去的就是它）。
-        const valid = await mermaid.parse(code, { suppressErrors: true });
-        if (!valid) {
+    // 防抖：流式输出时每个增量都会换新 code，不防抖会每个 delta 都跑一次
+    // parse+render——图没写完时 parse 必失败 → 频繁回退源码 = 视觉上一闪一闪。
+    // 静默期稳定显示源码（与错误回退同一样式，视觉零跳动），停笔 450ms 才真正渲染。
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const mermaid = (await import("mermaid")).default;
+          if (!mermaidInited || mermaidInitedDark !== dark) {
+            mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "strict" });
+            mermaidInited = true;
+            mermaidInitedDark = dark;
+          }
+          // 第一步：自己先用 parse 验证（suppressErrors：不抛异常、无 DOM 副作用）。
+          // 验证不过 = 不是合法的图，直接回退源码，绝不进 render——render 的错误路径
+          // 会往 body 里插错误节点（"syntax error in text" 把页面顶上去的就是它）。
+          const valid = await mermaid.parse(code, { suppressErrors: true });
+          if (!valid) {
+            if (alive) setErr(true);
+            return;
+          }
+          // 第二步：验证通过才排进串行链渲染
+          const run = () => mermaid.render(`mmd-${++mermaidSeq}`, code);
+          const task = mermaidChain.then(run, run);
+          mermaidChain = task.catch(() => {});
+          const out = await task;
+          if (alive) {
+            mermaidSvgCache.set(cacheKey, out);
+            setSvg(out);
+            setErr(false);
+          }
+        } catch {
+          // 兜底清理：mermaid render 失败时可能在 body 残留 #dmermaid-*/#dmmd-* 错误节点
+          document.querySelectorAll("[id^='dmermaid'], [id^='dmmd-']").forEach((n) => n.remove());
           if (alive) setErr(true);
-          return;
         }
-        // 第二步：验证通过才排进串行链渲染
-        const run = () => mermaid.render(`mmd-${++mermaidSeq}`, code);
-        const task = mermaidChain.then(run, run);
-        mermaidChain = task.catch(() => {});
-        const out = await task;
-        if (alive) {
-          mermaidSvgCache.set(cacheKey, out);
-          setSvg(out);
-          setErr(false);
-        }
-      } catch {
-        // 兜底清理：mermaid render 失败时可能在 body 残留 #dmermaid-*/#dmmd-* 错误节点
-        document.querySelectorAll("[id^='dmermaid'], [id^='dmmd-']").forEach((n) => n.remove());
-        if (alive) setErr(true);
-      }
-    })();
-    return () => { alive = false; };
+      })();
+    }, 450);
+    return () => { alive = false; clearTimeout(timer); };
   }, [cacheKey]);
-  if (err) return <pre className="my-1.5 overflow-x-auto rounded-lg bg-neutral-100 p-2.5 text-[0.85em] dark:bg-black/40"><code className="font-mono text-[0.85em]">{code}</code></pre>;
-  if (!svg) return <div className="my-1.5 text-xs text-neutral-400">mermaid 渲染中…</div>;
-  // securityLevel strict + sanitize 同源：mermaid 输出的 svg 已自净，这里再用 img 承载双保险
+  // 渲染中/失败统一显示源码（同一样式）：流式期间无闪烁，渲染成功后无感替换为图
+  if (!svg) return <pre className="my-1.5 overflow-x-auto rounded-lg bg-neutral-100 p-2.5 text-[0.85em] dark:bg-black/40"><code className="font-mono text-[0.85em]">{code}</code></pre>;
+  // securityLevel strict + sanitize 同源：mermaid 输出的 svg 已自净，这里再用 div 承载双保险
   return <div className="my-2 overflow-x-auto" dangerouslySetInnerHTML={{ __html: svg }} />;
 }
 
