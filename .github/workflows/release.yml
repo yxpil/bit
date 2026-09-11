@@ -253,6 +253,9 @@ jobs:
             case $T in aarch64*) DMGARCH=aarch64;; *) DMGARCH=x64;; esac
             APP="src-tauri/target/$T/release/bundle/macos/BIT.app"
             DMGDIR="src-tauri/target/$T/release/bundle/dmg"
+            # --bundles app 模式下 bundler 不创建 dmg 目录，hdiutil 输出路径父目录缺失会直接报
+            # "No such file or directory"（v0.6.15 实锤），先补目录
+            mkdir -p "$DMGDIR"
             STAGE=$(mktemp -d)
             cp -R "$APP" "$STAGE/BIT.app"
             ln -s /Applications "$STAGE/Applications"
