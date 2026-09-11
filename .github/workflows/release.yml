@@ -229,8 +229,10 @@ jobs:
           npm ci
           # 前端静态检查（no-undef 闸门）
           npm run lint
-          npx tauri build --target aarch64-apple-darwin
-          npx tauri build --target x86_64-apple-darwin
+          # --bundles app：只打 .app，跳过 tauri 自带的 bundle_dmg（hdiutil 偶发
+          # 挂死导致整个 job 失败）；dmg 在下方"重打 dmg"步骤用 hdiutil 手工生成
+          npx tauri build --target aarch64-apple-darwin --bundles app
+          npx tauri build --target x86_64-apple-darwin --bundles app
       - name: UI 冒烟测试（无头启动验证前端渲染树完整挂载，防黑屏包上传；Runner 为 arm64，冒烟 arm64 产物）
         run: node e2e/smoke-ui.cjs src-tauri/target/aarch64-apple-darwin/release/bit
       - name: 补全 ad-hoc bundle 签名（避免 Gatekeeper 报"已损坏"）
