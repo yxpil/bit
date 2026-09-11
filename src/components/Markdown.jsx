@@ -109,6 +109,48 @@ function Mermaid({ code, dark }) {
 // 里（没标 mermaid），只认标记会永远显示源码。按首行关键字保守判定，防误伤普通脚本。
 const MERMAID_FIRST_LINE =
   /^\s*(flowchart|sequenceDiagram|classDiagram|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|mindmap|timeline|quadrantChart|quadrant|requirementDiagram|gitGraph|graph\s+(TB|TD|BT|RL|LR)\b|C4(Context|Container|Component|Dynamic|Deployment)\b|sankey(-beta)?|xychart(-beta)?|block(-beta)?|zenuml)\b/;
+const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/;
+
+// 围栏外散落的 mermaid 头部段落 + 紧跟的无语言代码块 → 合并成完整 ```mermaid 围栏。
+// 场景：模型输出图时把 sequenceDiagram/actor/participant 头部写成了普通段落，
+// 消息体却包进普通 ``` 块——两半分开都无法通过 parse，合起来才是完整的图。
+// 在 ReactMarkdown 之前做纯文本变换，空行即截断（截坏的由 parse 闸门兜底回退源码）。
+function rescueMermaid(src) {
+  const lines = src.split("\n");
+  const out = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (FENCE_RE.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (!inFence && MERMAID_FIRST_LINE.test(line)) {
+      out.push("```mermaid");
+      out.push(line);
+      i++;
+      // 收头部段落直到空行 / 真实围栏 / 文本结束
+      while (i < lines.length && lines[i].trim() !== "" && !FENCE_RE.test(lines[i])) {
+        out.push(lines[i]);
+        i++;
+      }
+      // 紧跟真实围栏 → 把它的内容并进来（跳过自己的开/闭围栏行）
+      if (i < lines.length && FENCE_RE.test(lines[i])) {
+        i++;
+        while (i < lines.length && !FENCE_RE.test(lines[i])) {
+          out.push(lines[i]);
+          i++;
+        }
+        if (i < lines.length) i++; // 跳过闭合围栏
+      }
+      out.push("```");
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
 
 export default function Markdown({ children }) {
   const dark = typeof document !== "undefined" && document.documentElement.classList.contains("dark");
@@ -188,7 +230,7 @@ export default function Markdown({ children }) {
           ),
         }}
       >
-        {children || ""}
+        {rescueMermaid(children || "")}
       </ReactMarkdown>
     </div>
   );
