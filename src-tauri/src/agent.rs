@@ -544,9 +544,10 @@ fn normalize_mermaid_blocks(reply: &mut String) {
     while i < lines.len() {
         let line = lines[i].clone();
         if let Some(label) = fence_label(&line) {
+            let opening = !in_fence; // 必须在翻转前判向：开栏才可能重标
             in_fence = !in_fence;
             // 无/通用语言标注的开栏且下一行是图头 → 重标为 mermaid
-            if !in_fence && matches!(label, "" | "text" | "txt" | "diag") {
+            if opening && matches!(label, "" | "text" | "txt" | "diag") {
                 let next = lines.get(i + 1).map(|s| s.trim()).unwrap_or("");
                 if looks_like_mermaid_head(next) {
                     out.push("```mermaid".to_string());
@@ -2133,6 +2134,68 @@ fn parse_tool_calls(reply: &str) -> Option<Vec<serde_json::Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E2E：真实事故样本（sessions.json 里挖出的裸文本时序图）必须被归一化成单个完整 mermaid 围栏
+    #[test]
+    fn test_normalize_bare_diagram_real_case() {
+        // 注意：普通字符串里行尾 `\` 续行会吞掉下一行行首空格，用原始字符串保留缩进
+        let raw = r#"给你画一个通用的示例时序图（用户登录 + 鉴权流程），直接可渲染：
+
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant C as 客户端
+  participant G as 网关/API
+  participant A as 认证服务
+  participant D as 数据库
+
+  U->>C: 输入账号密码
+  C->>G: POST /login {user, pwd}
+  G->>A: 转发登录请求
+  A->>D: 查询用户记录
+  D-->>A: 返回 salt + hash
+  A->>A: 校验密码哈希
+
+  alt 校验通过
+    A-->>G: 签发 token (JWT)
+    G-->>C: 200 OK + token
+  else 校验失败
+    A-->>G: 401 认证失败
+  end
+
+如果你要的是**特定业务**的时序图，把参与者名称告诉我。"#;
+        let mut s = raw.to_string();
+        normalize_mermaid_blocks(&mut s);
+        // 恰好一对围栏，且整幅图都在里面，散文留在外面
+        assert_eq!(s.matches("```mermaid").count(), 1, "应只有一个 mermaid 开栏:\n{}", s);
+        assert_eq!(s.matches("```").count(), 2, "围栏应成对:\n{}", s);
+        assert!(s.contains("  U->>C: 输入账号密码"), "图体应带缩进在围栏内:\n{}", s);
+        assert!(s.contains("  end"), "alt/else/end 应在围栏内:\n{}", s);
+        assert!(s.ends_with("把参与者名称告诉我。"), "散文应留在围栏外:\n{}", s);
+        // 幂等：归一化结果再跑一遍不变
+        let once = s.clone();
+        normalize_mermaid_blocks(&mut s);
+        assert_eq!(s, once, "归一化应幂等");
+    }
+
+    /// E2E：无语言围栏（内容是图）→ 重标；头部段落+无语言围栏 → 合并；普通散文不动
+    #[test]
+    fn test_normalize_fence_relabel_and_merge() {
+        // 无语言围栏重标
+        let mut s = "如下：\n\n```\nsequenceDiagram\nU->>S: hi\n```\n".to_string();
+        normalize_mermaid_blocks(&mut s);
+        assert!(s.contains("```mermaid\nsequenceDiagram"), "应重标为 mermaid:\n{}", s);
+        // 头部段落 + 空行 + 无语言围栏 → 合并成单块
+        let mut s = "时序图：\n\nsequenceDiagram\nautonumber\nactor U as 用户\n\n```\nU->>S: 请求\nS-->>U: 响应\nalt ok\nA->>B: x\nelse bad\nA->>B: y\nend\n```\n".to_string();
+        normalize_mermaid_blocks(&mut s);
+        assert_eq!(s.matches("```mermaid").count(), 1, "应合并为单块:\n{}", s);
+        assert_eq!(s.matches("```").count(), 2, "围栏应成对:\n{}", s);
+        assert!(s.contains("U->>S: 请求"), "围栏体应并入:\n{}", s);
+        // 普通散文提到 graph TB 不能误伤
+        let mut s = "这个 graph TB 的话题很有意思，我们聊聊别的吧。\n\n今天天气不错。".to_string();
+        normalize_mermaid_blocks(&mut s);
+        assert!(!s.contains("```"), "散文不应被加围栏:\n{}", s);
+    }
 
     #[test]
     fn test_parse_standard_array() {
