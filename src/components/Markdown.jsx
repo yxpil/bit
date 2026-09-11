@@ -111,9 +111,11 @@ const MERMAID_FIRST_LINE =
   /^\s*(flowchart|sequenceDiagram|classDiagram|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|mindmap|timeline|quadrantChart|quadrant|requirementDiagram|gitGraph|graph\s+(TB|TD|BT|RL|LR)\b|C4(Context|Container|Component|Dynamic|Deployment)\b|sankey(-beta)?|xychart(-beta)?|block(-beta)?|zenuml)\b/;
 const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})/;
 
-// 图体行特征：生命周期关键字或消息箭头（->>、-->>、-)、--)、-->、-.-、==）
+// 图体行特征：生命周期关键字、消息箭头（->>、-->>、-)、--)、-->、-.-、==）、
+// ER 关系箭头（||--o{、|o--o{、||--|{ 等）或实体块开头（USER {）
 const DIAGRAM_LINE =
-  /^\s*(autonumber\b|participant\s|actor\s|note\s|alt\b|else\b|opt\b|loop\b|par\b|and\b|critical\b|option\b|break\b|rect\b|title\s|legend\s|end\b)|->>|-->>|-\)|--\)|-->|-\.|==/;
+  /^\s*(autonumber\b|participant\s|actor\s|note\s|alt\b|else\b|opt\b|loop\b|par\b|and\b|critical\b|option\b|break\b|rect\b|title\s|legend\s|end\b)|->>|-->>|-\)|--\)|-->|-\.|==|--o\{|--\|\{|\|o--|\|--/;
+const ENTITY_OPEN = /^\s*[\w"']+\s*\{\s*$/; // erDiagram 实体块开头：USER {
 
 // 围栏外散落的 mermaid 段落 → 合并成完整 ```mermaid 围栏（真实事故：模型把整幅
 // 时序图当普通文本输出，一行围栏都没有）。捕获规则：
@@ -131,21 +133,36 @@ function rescueMermaid(src) {
       out.push(line);
       i++;
       let blank = 0;
+      let inEntity = false; // erDiagram 实体块内：属性行（bigint id PK）没有箭头特征，整块照收
       while (i < lines.length) {
         const l = lines[i];
         if (FENCE_RE.test(l)) break; // 真实围栏：并入
         if (l.trim() === "") {
-          // 空行：向后看，下一非空行仍是图行才继续（否则在此收尾）
+          // 空行：向后看，下一非空行仍是图行/实体块才继续（否则在此收尾）
           let j = i + 1;
           while (j < lines.length && lines[j].trim() === "") j++;
-          if (j >= lines.length || !DIAGRAM_LINE.test(lines[j])) break;
+          if (j >= lines.length || (!DIAGRAM_LINE.test(lines[j]) && !ENTITY_OPEN.test(lines[j]) && !inEntity)) break;
           out.push(l);
           blank++;
           if (blank > 30) break; // 安全阀
           i++;
           continue;
         }
-        if (!DIAGRAM_LINE.test(l)) break; // 散文开始：收尾
+        if (inEntity) {
+          out.push(l);
+          if (l.includes("}")) inEntity = false; // 实体块闭合
+          i++;
+          continue;
+        }
+        if (!DIAGRAM_LINE.test(l)) {
+          if (ENTITY_OPEN.test(l)) {
+            inEntity = true; // 实体块开始，直到 "}" 前整块照收
+            out.push(l);
+            i++;
+            continue;
+          }
+          break; // 散文开始：收尾
+        }
         out.push(l);
         i++;
       }

@@ -16,6 +16,7 @@ const cases = {
   "无语言围栏(自动识别)": "```\nsequenceDiagram\nU->>S: hi\n```\n",
   "普通代码块不受影响": "```python\nprint('hello')\n```\n",
   "散文不动": "这个 graph TB 的话题很有意思。\n\n今天天气不错。",
+  "真实ER事故(裸文本+实体块)": "先给你画一个**通用电商系统**的 ER 图作示例：\n\nerDiagram\n    USER      ||--o{ ADDRESS    : \"收货地址\"\n    USER      ||--o{ ORDER      : \"下单\"\n    CATEGORY  |o--o{ CATEGORY   : \"父分类\"\n    ORDER     ||--|{ ORDER_ITEM : \"包含明细\"\n\n    USER {\n        bigint   id PK\n        string   username\n    }\n\nN）；`|o--o{` = 右侧可关联。要不要我按你的实际业务改一版？",
 };
 
 let fail = 0;
