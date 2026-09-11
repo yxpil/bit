@@ -95,6 +95,11 @@ function Mermaid({ code, dark }) {
   return <div className="my-2 overflow-x-auto" dangerouslySetInnerHTML={{ __html: svg }} />;
 }
 
+// 无语言标注代码块的 mermaid 自动识别：历史消息里模型常把图代码包在普通 ```
+// 里（没标 mermaid），只认标记会永远显示源码。按首行关键字保守判定，防误伤普通脚本。
+const MERMAID_FIRST_LINE =
+  /^\s*(flowchart|sequenceDiagram|classDiagram|stateDiagram(-v2)?|erDiagram|journey|gantt|pie|mindmap|timeline|quadrantChart|quadrant|requirementDiagram|gitGraph|graph\s+(TB|TD|BT|RL|LR)\b|C4(Context|Container|Component|Dynamic|Deployment)\b|sankey(-beta)?|xychart(-beta)?|block(-beta)?|zenuml)\b/;
+
 export default function Markdown({ children }) {
   const dark = typeof document !== "undefined" && document.documentElement.classList.contains("dark");
   return (
@@ -130,7 +135,13 @@ export default function Markdown({ children }) {
           // 行内代码 / 代码块（mermaid 特判渲染成图）
           code: ({ node, inline, className, children, ...p }) => {
             const lang = /language-(\w+)/.exec(className || "")?.[1];
-            if (!inline && lang === "mermaid") return <Mermaid code={String(children).trim()} dark={dark} />;
+            const text = String(children);
+            if (!inline && lang === "mermaid") return <Mermaid code={text.trim()} dark={dark} />;
+            // 无/通用语言标注 + 首行像 mermaid → 当图渲染（救历史消息里没标语言的图代码）
+            const firstLine = text.split("\n", 1)[0];
+            if (!inline && (!lang || /^(text|txt|diag)$/i.test(lang)) && MERMAID_FIRST_LINE.test(firstLine)) {
+              return <Mermaid code={text.trim()} dark={dark} />;
+            }
             return inline ? (
               <code
                 className="rounded bg-neutral-200/70 px-1 py-0.5 font-mono text-[0.85em] dark:bg-neutral-800"
