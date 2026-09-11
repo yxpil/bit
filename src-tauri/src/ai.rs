@@ -1519,7 +1519,7 @@ let word_lists: Vec<Vec<String>> = mem_items.iter().map(|(_, content)| cut(conte
     runtime_info.push_str(&format!(
         "\n## Media cache folder\n\
         - Images/videos/SVG generated or drawn are auto-saved under: {} — use it for intermediate media; to show a picture, output an \"image\" field (path/b64:/data:URL) from tool stdout\n\
-        - Diagrams (ER/architecture/sequence): ```mermaid fenced blocks render like GitHub; or output SVG directly — both auto-rendered",
+        - Diagrams (flowchart/sequence/ER/architecture): output the ENTIRE diagram as ONE ```mermaid fenced code block (first line is the keyword, e.g. `sequenceDiagram`). NEVER write diagram syntax as plain text, NEVER split header/body across blocks. Or output SVG directly — both auto-rendered",
         ctx.image_dir().display()
     ));
     if !goal_lines.is_empty() {

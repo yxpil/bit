@@ -479,6 +479,99 @@ fn deliver_generated_media(ctx: &Arc<Ctx>, target: &str, media: &[(ai::TokenKind
     }
 }
 
+/// mermaid 围栏归一化（存入历史前调用，前端才能稳定渲染成图）。修两类坏输出：
+///   1. 无/通用语言标注的围栏但内容是图（首行 sequenceDiagram/flowchart...）→ 重标 ```mermaid
+///   2. 围栏外散落的图头部段落 + 紧跟的无语言围栏 → 合并为完整 ```mermaid 块
+///      （模型常把 sequenceDiagram/actor/participant 头部写成普通段落，消息体却包进普通 ```）
+/// 与前端 Markdown.jsx 的 rescueMermaid 同逻辑：这里治新输出，前端兜历史数据。
+fn looks_like_mermaid_head(line: &str) -> bool {
+    const KW: &[&str] = &[
+        "flowchart", "sequenceDiagram", "classDiagram", "stateDiagram", "erDiagram", "journey",
+        "gantt", "pie", "mindmap", "timeline", "quadrantChart", "quadrant", "requirementDiagram",
+        "gitGraph", "C4Context", "C4Container", "C4Component", "C4Dynamic", "C4Deployment",
+        "sankey", "xychart", "block", "zenuml",
+    ];
+    let t = line.trim_start();
+    let word_bounded = |prefix: &str| {
+        t.starts_with(prefix)
+            && matches!(t.as_bytes().get(prefix.len()), Some(b' ') | Some(b'\t') | None)
+    };
+    if KW.iter().any(|k| word_bounded(k)) {
+        return true;
+    }
+    // graph TB/TD/BT/RL/LR（flowchart 旧语法）
+    if let Some(rest) = t.strip_prefix("graph") {
+        let d = rest.trim_start();
+        return ["TB", "TD", "BT", "RL", "LR"]
+            .iter()
+            .any(|d2| d.starts_with(d2) && matches!(d.as_bytes().get(2), Some(b' ') | None));
+    }
+    false
+}
+
+/// 解析围栏行的语言标注；非围栏行返回 None
+fn fence_label(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let body = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~"))?;
+    Some(body.trim())
+}
+
+fn normalize_mermaid_blocks(reply: &mut String) {
+    let lines: Vec<String> = reply.lines().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 8);
+    let mut in_fence = false;
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].clone();
+        if let Some(label) = fence_label(&line) {
+            in_fence = !in_fence;
+            // 无/通用语言标注的开栏且下一行是图头 → 重标为 mermaid
+            if !in_fence && matches!(label, "" | "text" | "txt" | "diag") {
+                let next = lines.get(i + 1).map(|s| s.trim()).unwrap_or("");
+                if looks_like_mermaid_head(next) {
+                    out.push("```mermaid".to_string());
+                    changed = true;
+                    i += 1;
+                    continue;
+                }
+            }
+            out.push(line);
+            i += 1;
+            continue;
+        }
+        // 围栏外散落的图头部段落 → 开合成围栏收拢
+        if !in_fence && looks_like_mermaid_head(&line) {
+            out.push("```mermaid".to_string());
+            out.push(line);
+            i += 1;
+            while i < lines.len() && !lines[i].trim().is_empty() && fence_label(&lines[i]).is_none() {
+                out.push(lines[i].clone());
+                i += 1;
+            }
+            // 紧跟真实围栏 → 并入其内容（跳过它自己的开/闭栏行）
+            if i < lines.len() && fence_label(&lines[i]).is_some() {
+                i += 1;
+                while i < lines.len() && fence_label(&lines[i]).is_none() {
+                    out.push(lines[i].clone());
+                    i += 1;
+                }
+                if i < lines.len() {
+                    i += 1;
+                }
+            }
+            out.push("```".to_string());
+            changed = true;
+            continue;
+        }
+        out.push(line);
+        i += 1;
+    }
+    if changed {
+        *reply = out.join("\n");
+    }
+}
+
 /// 提取并保存回复里的 SVG 绘图（ER 图/架构图/时序图等模型常用 ```svg / ```xml 代码块输出）：
 /// 每块落盘 diagram_<ts>.svg + 以 data URL 推送 chat-image 气泡（浏览器原生渲染 SVG）。
 /// 返回追加给模型的备注（告知文件路径）；无 SVG 块时返回空串
@@ -804,6 +897,7 @@ pub async fn chat_turn(
                     // 原生分支同样要提取回复里的 SVG 绘图：此前只有文本分支有，导致走原生
                     // function calling（如 DeepSeek）时模型输出的 SVG 不渲染、只显示代码
                     let mut content = r.content;
+                    normalize_mermaid_blocks(&mut content);
                     let svg_note = deliver_svg_blocks(ctx, &target, &content);
                     if !svg_note.is_empty() {
                         content.push_str(&svg_note);
@@ -865,6 +959,7 @@ pub async fn chat_turn(
                 reply.push_str(&gen_note);
             }
             // 回复里的 SVG 绘图（ER图/架构图/时序图）：落盘 + 推送渲染
+            normalize_mermaid_blocks(&mut reply);
             let svg_note = deliver_svg_blocks(ctx, &target, &reply);
             if !svg_note.is_empty() {
                 reply.push_str(&svg_note);
@@ -1219,6 +1314,7 @@ pub async fn chat_turn_stream(
                     // 原生模式只认协议字段里的调用；正文 JSON 解析是兼容模式（文本约定）的专属职责
                     // 原生分支同样要提取回复里的 SVG 绘图（与 chat_turn 同因：漏了导致原生模式下 SVG 不渲染）
                     let mut content = r.content;
+                    normalize_mermaid_blocks(&mut content);
                     let svg_note = deliver_svg_blocks(ctx, &target, &content);
                     if !svg_note.is_empty() {
                         content.push_str(&svg_note);
@@ -1335,6 +1431,7 @@ pub async fn chat_turn_stream(
                 reply.push_str(&gen_note);
             }
             // 回复里的 SVG 绘图（ER图/架构图/时序图）：落盘 + 推送渲染
+            normalize_mermaid_blocks(&mut reply);
             let svg_note = deliver_svg_blocks(ctx, &target, &reply);
             if !svg_note.is_empty() {
                 reply.push_str(&svg_note);
