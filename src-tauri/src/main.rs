@@ -10,7 +10,23 @@ mod commands;
 mod config;
 mod crash;
 mod delegation;
+// 本机操控三件套：依赖 enigo（Linux 需要 libxdo）。musl / exotic 架构 / 无 GUI 目标
+// 用 --no-default-features 编译时替换为 stub，保证链接通过、工具返回明确错误
+#[cfg(feature = "desktop-ctl")]
 mod desktop_ctl;
+#[cfg(not(feature = "desktop-ctl"))]
+mod desktop_ctl {
+    type Ctx = std::sync::Arc<crate::state::Ctx>;
+    pub fn screenshot(_ctx: &Ctx, _d: usize, _r: Option<(u32, u32, u32, u32)>) -> Result<String, String> {
+        Err("此构建未编译本机操控能力（no-GUI/musl 目标）".into())
+    }
+    pub fn mouse(_a: &str, _p: &serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("此构建未编译本机操控能力（no-GUI/musl 目标）".into())
+    }
+    pub fn keyboard(_a: &str, _p: &serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("此构建未编译本机操控能力（no-GUI/musl 目标）".into())
+    }
+}
 mod extract;
 mod goal;
 mod guardian;
@@ -209,6 +225,11 @@ fn main() {
                 let ctx = state::Ctx::load(app.handle().clone());
                 crash::install(&ctx.data_dir);
                 trace::init(&ctx.data_dir);
+                // 后台 shell 续跑 worker：shell 工具在 worker 进程内执行，作业登记在本进程，
+                // DONE_TX 若不初始化，finish() 里的 JobDone 会被静默丢弃——表现为
+                // 「命令跑完 / 被停止都不向会话汇报」。worker 内 chat_auto 直接本地执行，
+                // UI 事件经 emit_ui 转发回宿主，聊天界面照常实时更新。
+                crate::shellbg::init(&ctx);
                 audit::record(&ctx, "host", "worker.start", "agent-worker", serde_json::json!({}), true);
                 let wctx = ctx.clone();
                 tauri::async_runtime::spawn(async move {

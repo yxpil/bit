@@ -1,6 +1,6 @@
 [package]
 name = "bit"
-version = "0.6.8"
+version = "0.6.9"
 description = "BIT - Agent Tool Hub with audit and remote access"
 edition = "2021"
 
@@ -49,6 +49,12 @@ ctrlc = "3"
 # 调试追踪：无锁 channel + 后台 flush，死锁诊断专用
 crossbeam-channel = "0.5"
 # 本机操控三件套（实验性，设置页开关）：截屏 + 鼠标/键盘合成输入
-screenshots = "0.8"
-enigo = "0.2"
-image = { version = "0.25", default-features = false, features = ["png"] }
+# enigo 在 Linux 依赖 libxdo（Alpine musl 无包、exotic 架构容器缺失）导致链接失败，
+# 因此做成可选 feature：musl/exotic/无 GUI 目标用 --no-default-features 编译即可跳过
+screenshots = { version = "0.8", optional = true }
+enigo = { version = "0.2", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+[features]
+default = ["desktop-ctl"]
+desktop-ctl = ["dep:screenshots", "dep:enigo", "dep:image"]

@@ -88,7 +88,12 @@ async function preflight() {
 
     try { proc.kill("SIGKILL"); } catch {}
     await sleep(300);
-    fs.rmSync(dir, { recursive: true, force: true });
+    // 清理临时目录：慢 runner（如 arm）上 BIT 的 toolhomes venv 可能还有写入尾巴，
+    // 立即 rm 会 ENOTEMPTY —— 重试几次；清理失败不应推翻已通过的冒烟结论
+    for (let i = 0; i < 5; i++) {
+      try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }); break; }
+      catch { await sleep(500 * (i + 1)); }
+    }
 
     if (ok) {
       console.log("SMOKE PASS: ui.mounted in audit log — frontend render tree mounted");
