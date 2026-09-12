@@ -261,6 +261,17 @@ fn is_safe_tool(tool: &str) -> bool {
             .any(|k| lower.starts_with(k))
 }
 
+/// 「只沉淀、无产出」的工具：结果回灌不会带来新信息，只会诱发一轮"已保存"式
+/// 的重复生成。整轮调用全部属于此类时直接结束回合，省一次模型请求。
+/// 判定看参数：skill 的 save 才是沉淀，search 是真检索需要回灌
+fn is_silent_tool(name: &str, params: &serde_json::Value) -> bool {
+    match name {
+        "add_memory" => true,
+        "skill" => params.get("action").and_then(|v| v.as_str()).unwrap_or("search") == "save",
+        _ => false,
+    }
+}
+
 /// 执行 AI 输出的单个工具调用（含 AI 自写插件能力）。
 /// session_id 用于审批等待期间响应会话中断；外部调用（远程/自动驾驶）传 None
 pub async fn execute_tool_call(
@@ -975,6 +986,21 @@ pub async fn chat_turn(
             }
             crate::session::persist(ctx);
 
+            // 沉淀型回合（全部调用只记录无产出）：回灌只会诱发重复生成，直接结束回合
+            if calls.iter().all(|c| is_silent_tool(&c.name, &c.args)) {
+                clear_interrupt(ctx, &target, &iflag);
+                let out = ctx
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == target)
+                    .map(|s| s.messages.clone())
+                    .unwrap_or_default();
+                return Ok(out);
+            }
+
             // 把结果回喂给模型：原生模式按协议回传（tool 消息/tool_result/functionResponse），
             // 文本模式拼 feedback 用户消息（仅用于本轮请求，不落库为可见气泡）
             if native_mode {
@@ -1456,6 +1482,22 @@ pub async fn chat_turn_stream(
 
             // 通知前端：本轮是工具调用 → 丢弃流式文本，改渲染工具卡片
             emit(json!({ "type": "tools", "visible": visible, "calls": records }));
+
+            // 沉淀型回合（全部调用只记录无产出）：回灌只会诱发重复生成，直接结束回合
+            if calls.iter().all(|c| is_silent_tool(&c.name, &c.args)) {
+                clear_interrupt(ctx, &target, &iflag);
+                let out = ctx
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == target)
+                    .map(|s| s.messages.clone())
+                    .unwrap_or_default();
+                emit(json!({ "type": "final", "messages": out.clone(), "silent_save": true }));
+                return Ok(out);
+            }
 
             // 回喂：原生模式按协议回传，文本模式拼 feedback 用户消息
             if native_mode {

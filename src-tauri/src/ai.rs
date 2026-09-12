@@ -199,16 +199,38 @@ pub async fn chat_with_images(
         cfg.clone()
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client_for(&p.base_url, 120).map_err(|e| e.to_string())?;
 
     match p.protocol.as_str() {
         "gemini" => chat_gemini(&client, &p, messages, images, &params).await,
         "claude" => chat_claude(&client, &p, messages, images, &params).await,
         _ => chat_openai(&client, &p, messages, images, &params).await,
     }
+}
+
+/// base_url 是否指向本机
+pub fn is_loopback_base(base: &str) -> bool {
+    let rest = match base.trim() {
+        s if s.starts_with("http://") => &s[7..],
+        s if s.starts_with("https://") => &s[8..],
+        _ => return false,
+    };
+    let host = rest.split(['/']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host); // 剥 user:pass@
+    let host = host.split(':').next().unwrap_or(host); // 剥端口
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// 统一 HTTP 客户端：系统代理照常生效（远程 AI 端点可能必须走代理），
+/// 但环回地址一律直连——代理客户端（Watt/Clash 等）只写注册表未运行时，
+/// 死代理会把发往本机服务（LM Studio/Ollama/MCP/debug/测试桩）的请求整个吞掉
+pub fn http_client_for(base: &str, timeout_secs: u64) -> reqwest::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs));
+    if is_loopback_base(base) {
+        b = b.no_proxy();
+    }
+    b.build()
 }
 
 /// 流式被调用方中止的哨兵错误（中断会话时立即断开 SSE 读取，不回退非流式）
@@ -341,10 +363,7 @@ pub async fn chat_stream_with_images<F: FnMut(TokenKind, &str) -> bool>(
         let cfg = ctx.ai_config.lock().unwrap();
         cfg.clone()
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = http_client_for(&p.base_url, 180).map_err(|e| e.to_string())?;
 
     let res = match p.protocol.as_str() {
         "gemini" => stream_gemini(&client, &p, messages, images, &params, &mut on_token).await,
@@ -445,6 +464,9 @@ fn openai_messages(messages: &[ChatMessage], images: &[String]) -> Vec<serde_jso
                     parts.push(serde_json::json!({ "type": "image_url", "image_url": { "url": url } }));
                 }
                 serde_json::json!({ "role": m.role, "content": parts })
+            } else if m.role == "system" {
+                // 隐式前缀缓存协议：剥离静态/动态分界标记（OpenAI/DeepSeek 不认）
+                serde_json::json!({ "role": m.role, "content": strip_dynamic_mark(&m.content) })
             } else {
                 serde_json::json!({ "role": m.role, "content": m.content })
             }
@@ -496,7 +518,7 @@ fn gemini_contents(messages: &[ChatMessage], images: &[String]) -> (String, Vec<
         match m.role.as_str() {
             "system" => {
                 if !system_txt.is_empty() { system_txt.push_str("\n\n"); }
-                system_txt.push_str(&m.content);
+                system_txt.push_str(&strip_dynamic_mark(&m.content));
             }
             "assistant" => contents.push(serde_json::json!({ "role": "model", "parts": [{ "text": m.content }] })),
             _ => {
@@ -1076,9 +1098,19 @@ fn claude_apply_cache(
     msgs: &mut [serde_json::Value],
 ) {
     if !system_txt.is_empty() {
-        body["system"] = serde_json::json!([
-            {"type": "text", "text": system_txt, "cache_control": {"type": "ephemeral"}}
-        ]);
+        // 双块 system：静态前缀打缓存断点，动态尾段（记忆/待办索引）不打——
+        // 动态段变化时已缓存的静态前缀仍然命中，不再整段清零
+        let (head, tail) = split_system_dynamic(system_txt);
+        body["system"] = if tail.is_empty() {
+            serde_json::json!([
+                {"type": "text", "text": head, "cache_control": {"type": "ephemeral"}}
+            ])
+        } else {
+            serde_json::json!([
+                {"type": "text", "text": head.trim_end(), "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": tail}
+            ])
+        };
     }
     if let Some(last) = msgs.last_mut() {
         let content = last.get("content").cloned().unwrap_or(serde_json::json!(""));
@@ -1336,7 +1368,9 @@ pub fn tools_manifest(ctx: &Arc<crate::state::Ctx>) -> serde_json::Value {
         .collect::<Vec<_>>())
 }
 
-/// 组装系统提示词（文本约定模式）：内置能力 + 动态工具清单 + 记忆 + 技能
+/// 组装系统提示词（文本约定模式）：内置能力 + 动态工具清单 + 记忆 + 技能。
+/// 返回值含静态/动态分界标记（PROMPT_DYNAMIC_MARK）：Claude 侧据此拆双块打缓存断点，
+/// 其余协议在请求组装时剥离；展示侧（预览/调试）也需自行剥离
 pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> String {
     system_prompt_mode(ctx, session, false)
 }
@@ -1344,6 +1378,23 @@ pub fn system_prompt(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> Str
 /// 组装系统提示词（原生函数调用模式）：不教文本格式，指导模型直接发起 function call
 pub fn system_prompt_native(ctx: &Arc<crate::state::Ctx>, session: Option<&str>) -> String {
     system_prompt_mode(ctx, session, true)
+}
+
+/// 系统提示词的静态/动态分界标记：之前的段落完全稳定（可安全缓存），
+/// 之后的段落（记忆/待办/技能索引）随时可变——Claude 缓存断点只打在静态段上
+pub const PROMPT_DYNAMIC_MARK: &str = "<<<BIT_DYNAMIC_SEGMENT>>>";
+
+/// 按标记拆成 (静态前缀, 动态尾段)；无标记时整个都是静态（兜底行为与旧版一致）
+pub fn split_system_dynamic(s: &str) -> (&str, &str) {
+    match s.find(PROMPT_DYNAMIC_MARK) {
+        Some(i) => (&s[..i], &s[i + PROMPT_DYNAMIC_MARK.len()..]),
+        None => (s, ""),
+    }
+}
+
+/// 去掉分界标记，返回干净纯文本（不关心缓存结构的消费方用）
+pub fn strip_dynamic_mark(s: &str) -> String {
+    s.replace(PROMPT_DYNAMIC_MARK, "")
 }
 
 /// 记忆主题分词停用词：虚词/代词/万能动词，切出来没有归类价值
@@ -1660,7 +1711,11 @@ let word_lists: Vec<Vec<String>> = mem_items.iter().map(|(_, content)| cut(conte
         if has("skill") {
             p.push_str("\nskill: action=search for full content before following.");
         }
-        return fit_prompt_budget(format!("{custom_prompt}{p}{runtime_info}"));
+        // 静态段与动态段之间打分界标记：缓存断点按此拆分（见 PROMPT_DYNAMIC_MARK）
+        return fit_prompt_budget(format!(
+            "{custom_prompt}{p}{}{runtime_info}",
+            PROMPT_DYNAMIC_MARK
+        ));
     }
 
     fit_prompt_budget(format!(
@@ -1668,12 +1723,13 @@ let word_lists: Vec<Vec<String>> = mem_items.iter().map(|(_, content)| cut(conte
         {manual}\n\
         \n\
         {static}\n\
-{runtime_info}\n\
-{closing}",
+{closing}\n\
+{}\
+{runtime_info}",
+        PROMPT_DYNAMIC_MARK,
         custom_prompt = custom_prompt,
         manual = manual,
         static = static_template,
-        runtime_info = runtime_info,
         closing = closing,
     ))
 }
@@ -2109,10 +2165,7 @@ pub async fn chat_native_round(
             p.name
         )));
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|e| NativeErr::Other(e.to_string()))?;
+    let client = http_client_for(&p.base_url, 180).map_err(|e| NativeErr::Other(e.to_string()))?;
     let defs = native_tool_defs(ctx);
     match p.protocol.as_str() {
         "claude" => native_round_claude(&client, &p, convo, images, exchanges, &defs, &params).await,
@@ -2370,10 +2423,7 @@ pub async fn chat_native_round_stream<F: FnMut(NativeEvent) -> bool + Send>(
             p.name
         )));
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|e| NativeErr::Other(e.to_string()))?;
+    let client = http_client_for(&p.base_url, 180).map_err(|e| NativeErr::Other(e.to_string()))?;
     let defs = native_tool_defs(ctx);
 
     // 记录是否已向调用方发出过增量：发出过就不能再退回一次性重发（会造成文本重复）
@@ -3961,8 +4011,9 @@ mod tool_visible_tests {
     fn default_config_keeps_normal_tools_visible() {
         let cfg = crate::config::Config::default();
         assert!(tool_visible(&cfg, &def("shell", true)));
-        assert!(tool_visible(&cfg, &def("view_image", true)));
         assert!(tool_visible(&cfg, &def("sub_agent", true)));
+        // view_image 属本机操控类：默认关闭（设置页可开），与 tool_gate 默认值一致
+        assert!(!tool_visible(&cfg, &def("view_image", true)));
     }
 
     /// 暂停（enabled=false）的工具不可见

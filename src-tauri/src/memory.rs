@@ -1,6 +1,10 @@
 // yxpil · BIT
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// persist_deferred 的合并标记：800ms 窗口内的多次写入只落一次盘
+static PERSIST_QUEUED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Memory {
@@ -35,7 +39,7 @@ pub fn add_memory(ctx: &Arc<crate::state::Ctx>, content: &str, kind: &str, sourc
         mem.drain(0..drop_n);
     }
     drop(mem);
-    persist(ctx);
+    persist_deferred(ctx);
     m
 }
 
@@ -58,7 +62,7 @@ pub fn add_skill(ctx: &Arc<crate::state::Ctx>, name: &str, summary: &str, source
         skills.drain(0..drop_n);
     }
     drop(skills);
-    persist(ctx);
+    persist_deferred(ctx);
     s
 }
 
@@ -74,6 +78,20 @@ fn persist(ctx: &Arc<crate::state::Ctx>) {
         ctx.data_dir.join("skills.json"),
         serde_json::to_string(&*skills).unwrap_or_default(),
     );
+}
+
+/// 延迟合并落盘：AI 一轮连存 N 条记忆/技能时（如批量提炼 14 条），
+/// 800ms 窗口内的写入合并成一次全量落盘，避免 N×2 次文件写。
+/// 最终回复落盘（session::persist）不等这个窗口，崩溃最多丢窗口内的沉淀
+fn persist_deferred(ctx: &Arc<crate::state::Ctx>) {
+    PERSIST_QUEUED.store(true, Ordering::SeqCst);
+    let c = ctx.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        if PERSIST_QUEUED.swap(false, Ordering::SeqCst) {
+            persist(&c);
+        }
+    });
 }
 
 /// 批量删除记忆，返回实际删除条数

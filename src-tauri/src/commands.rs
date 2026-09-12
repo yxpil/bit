@@ -1538,10 +1538,7 @@ pub async fn fetch_provider_models(
             }
         }
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::ai::http_client_for(&candidates[0], 15).map_err(|e| e.to_string())?;
 
     let mut last_err = String::new();
     for cand in &candidates {
@@ -1754,8 +1751,8 @@ pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> 
             json!({
                 "index": i,
                 "role": m.role,
-                "content": m.content,
-                "preview": preview,
+                "content": crate::ai::strip_dynamic_mark(&m.content),
+                "preview": crate::ai::strip_dynamic_mark(&preview),
             })
         })
         .collect();
@@ -1772,7 +1769,7 @@ pub async fn context_preview(state: State<'_, Arc<Ctx>>, session_id: String) -> 
         })
         .collect::<Vec<_>>();
     Ok(json!({
-        "system": convo.first().map(|m| m.content.clone()).unwrap_or_default(),
+        "system": convo.first().map(|m| crate::ai::strip_dynamic_mark(&m.content)).unwrap_or_default(),
         "messages": messages,
         "tools": tools_list,
         "est_tokens": est_tokens,
