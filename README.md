@@ -1,4 +1,4 @@
-# BIT — Agent Tool Hub
+# BreanInTerminal — Agent Tool Hub
  [虾跑分/clawscore](https://paofen.cocoloop.cn/report/ses_1788600989079_6apd3l) 
 简体中文 | [English](README_EN.md)
 
