@@ -152,7 +152,7 @@ async fn handle(ctx: &Arc<Ctx>, line: &str) -> Result<Flow, String> {
                 }
                 let m = crate::memory::add_memory(ctx, arg, "raw", "user");
                 crate::audit::record(ctx, "local-cli", "memory.add", "memories", serde_json::json!({}), true);
-                println!("已沉淀记忆 {}", &m.id[..8]);
+                println!("已沉淀记忆 {}", &m.id[..m.id.len().min(8)]);
                 Ok(Flow::Continue)
             }
             "mems" => {

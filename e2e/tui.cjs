@@ -115,7 +115,16 @@ async function main() {
   }
 
   // 隔离数据目录 + 指向 mock-ai 的 AI 配置（TUI 与桌面端共用）
+  // config.json 的 compat_mode=true：mock-ai 是文本协议模型（回复正文带调用 JSON），
+  // BIT 默认原生 function-calling 模式（compat_mode=false）不会执行正文里的文本调用，
+  // 工具链路场景必须显式走文本约定协议
   const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-e2e-"));
+  fs.writeFileSync(
+    path.join(DIR, "config.json"),
+    // Config 的 remote_enabled/host/port/client_key/revision 无 serde(default)，
+    // 缺任一字段整份解析失败回退默认值（compat_mode 静默失效）——必须写全
+    JSON.stringify({ compat_mode: true, remote_enabled: false, host: "127.0.0.1", port: 8611, client_key: "bit_e2e_tui_key", revision: 1 })
+  );
   fs.writeFileSync(
     path.join(DIR, "ai_config.json"),
     JSON.stringify({ providers: [{ id: "mock", name: "mock", protocol: "openai", base_url: "http://127.0.0.1:9901/v1", api_key: "e2e", model: "mock", active: true }] })
@@ -247,7 +256,7 @@ async function main() {
     tui.send("/quit");
     const code = await tui.waitExit();
     const out = tui.out;
-    const ok = code === 0 && out.includes("AI 尚未配置") && out.includes("shell") && out.includes("Execute a shell command");
+    const ok = code === 0 && out.includes("AI 尚未配置") && out.includes("shell") && out.includes("Run a shell command");
     record("T12 损坏 ai_config 容错 + 工具描述英文", ok, `exit=${code}`);
   }
 
@@ -312,7 +321,7 @@ async function main() {
     tui.send("/tools");
     tui.send("/quit");
     const code = await tui.waitExit(60000);
-    const garbOk = code === 0 && tui.out.includes("错误：") && tui.out.includes("Execute a shell command");
+    const garbOk = code === 0 && tui.out.includes("错误：") && tui.out.includes("Run a shell command");
     record("T17 垃圾响应容错", garbOk, `exit=${code}`);
   }
 
@@ -373,7 +382,7 @@ async function main() {
     tui.send("/tools");
     tui.send("/quit");
     const code = await tui.waitExit(60000);
-    const errOk = code === 0 && tui.out.includes("HTTP 500") && tui.out.includes("Execute a shell command");
+    const errOk = code === 0 && tui.out.includes("HTTP 500") && tui.out.includes("Run a shell command");
     record("T19d 流式 500 容错", errOk, errOk ? "" : `exit=${code}`);
   }
 

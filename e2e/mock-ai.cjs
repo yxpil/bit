@@ -36,7 +36,12 @@ function imageCount(messages) {
 
 function pickLastUser(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") return contentText(messages[i]);
+    const m = messages[i];
+    // 兼容模式的工具反馈也是 user 角色（"Tool result(s)" 前缀）——跳过，
+    // 否则场景分支按 last 匹配原始指令时会被反馈文本顶掉
+    if (m.role === "user" && !String(m.content || "").startsWith("Tool result(s)")) {
+      return contentText(m);
+    }
   }
   return "";
 }
