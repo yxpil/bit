@@ -1,6 +1,9 @@
 // E2E 模拟上游 AI（OpenAI 兼容）：模仿 BIT 的上游提供方，驱动全功能工具调用测试
 // 用法：node .e2e-mock-ai.cjs  (监听 127.0.0.1:9901)
 const http = require("http");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const PORT = 9901;
 
@@ -61,6 +64,19 @@ function feedbackText(messages) {
   if (lastTool) return String(lastTool.content || "");
   const last = [...messages].reverse().find((m) => m.role === "user" && String(m.content || "").startsWith("Tool result(s)"));
   return last ? String(last.content) : "";
+}
+
+// ── 缓存命中测试支持：把每次 Claude 请求的 system 结构快照落固定 JSONL
+// （mock 是全局单例，测试块在启动前清空该文件；逐字节比对静态前缀）──
+const CACHE_DUMP = path.join(os.tmpdir(), "bit-e2e-cache-dump.jsonl");
+function dumpCacheSnapshot(parsed, marker, note) {
+  const sysBlocks = Array.isArray(parsed.system)
+    ? parsed.system.map((b) => ({ text: b.text || "", cache: !!(b.cache_control && b.cache_control.type) }))
+    : [{ text: typeof parsed.system === "string" ? parsed.system : "", cache: false }];
+  fs.appendFileSync(
+    CACHE_DUMP,
+    JSON.stringify({ ts: Date.now(), marker, note: note || "", role: "messages", blocks: sysBlocks }) + "\n"
+  );
 }
 
 // ── 多协议原生工具调用测试辅助（claude /v1/messages、gemini /v1beta/models/...）──
@@ -167,6 +183,24 @@ function handleClaude(res, parsed) {
     return sseClaude(res, { text: "好的，我来执行命令。", tool: { id: "toolu-e2e-1", name: "shell", input: { command: "echo e2e-claude-native-ok" } } });
   }
   if (all.includes("E2E-PLAIN")) return sseClaude(res, { text: "E2E-FINAL-PLAIN: 你好，普通对话正常。" });
+
+  // ── 缓存命中场景（T20/T21）：每次请求都先落 system 快照 ──
+  if (last.includes("E2E-CACHE-CHAT")) {
+    dumpCacheSnapshot(parsed, "E2E-CACHE-CHAT");
+    return sseClaude(res, { text: "E2E-CACHE-CHAT-OK" });
+  }
+  if (all.includes("E2E-CACHE-SILENT")) {
+    dumpCacheSnapshot(parsed, "E2E-CACHE-SILENT", nativeFb.length > 0 ? "feedback-round" : "first-round");
+    // 沉淀型回合：只发一次 tool_use，BIT 不应回灌触发第二轮请求
+    if (nativeFb.length === 0)
+      return sseClaude(res, {
+        text: "",
+        tool: { id: "toolu-cache-mem", name: "add_memory", input: { content: "CACHE-SILENT-MEM-7788", kind: "raw" } },
+      });
+    // 若错误地发起了反馈轮，给出明显标记让测试抓到
+    return sseClaude(res, { text: "E2E-CACHE-SILENT-BUG: 不应出现的第二轮" });
+  }
+
   if ((last.includes("沉淀") || last.includes("总结")) && !last.startsWith("继续（自动推进）")) return sseClaude(res, { text: "已完成后台整理。" });
   return sseClaude(res, { text: "好的。" });
 }
@@ -305,6 +339,11 @@ const server = http.createServer((req, res) => {
 
     // ── 工具反馈轮：按场景与轮次决定继续调用还是给最终答案 ──
     if (isFeedback) {
+      // 沙箱逃逸场景：反馈必是沙箱错误，直接终结。必须只认最后一条用户指令——
+      // all 含全历史，用 all 会把同会话后续场景（如 /cd 后再 pwd）的反馈轮也劫持
+      if (last.includes("E2E-WS-ESCAPE")) {
+        return respond(res, "E2E-FINAL-OK ws-escape-rejected", sse);
+      }
       // 记忆/技能沉淀等后台请求：直接给个普通文本，避免触发更多工具
       // （自动推进的收尾指令含「简要总结成果」，属于推进轮而非后台整理，需排除）
       if ((last.includes("沉淀") || last.includes("总结")) && !last.startsWith("继续（自动推进）"))
@@ -749,6 +788,16 @@ const server = http.createServer((req, res) => {
 
     if (last.includes("E2E-CMD-SHELL"))
       return respond(res, '好的，我来执行命令。\n[{"tool":"shell","params":{"command":"echo e2e-shell-ok"}}]', sse);
+
+    // ── T22 工作区沙箱：pwd 验默认 cwd / 相对路径写文件 / 绝对路径逃逸必须被拒 ──
+    if (last.includes("E2E-WS-PWD"))
+      return respond(res, '[{"tool":"shell","params":{"command":"pwd"}}]', sse);
+    if (last.includes("E2E-WS-WRITE"))
+      return respond(res, '[{"tool":"write_file","params":{"path":"bit-ws-probe.txt","content":"ws-ok"}}]', sse);
+    if (last.includes("E2E-WS-ESCAPE|")) {
+      const escapePath = last.split("E2E-WS-ESCAPE|")[1].trim().split(/\s/)[0];
+      return respond(res, JSON.stringify([{ tool: "write_file", params: { path: escapePath, content: "x" } }]), sse);
+    }
 
     // 自动续发轮：上一条回复被截断，BIT 自动补发「继续」→ 直接给最终答案
     if (last.startsWith("继续（")) return respond(res, "E2E-CONTINUE-OK 内容已补全完成", sse);

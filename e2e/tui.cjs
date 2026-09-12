@@ -9,7 +9,9 @@ const os = require("os");
 const net = require("net");
 const path = require("path");
 
-const BIN = process.argv[2] || path.join(__dirname, "../src-tauri/target/release/bit");
+// 必须解析为绝对路径：launchTui 支持给子进程指定 cwd（工作区沙箱用例），
+// 相对 BIN 会从该 cwd 解析导致 ENOENT
+const BIN = path.resolve(process.argv[2] || path.join(__dirname, "../src-tauri/target/release/bit"));
 const PORT = 8611; // 桌面端实例远程访问端口（避开默认 8600，防止撞上日常实例）
 const results = [];
 const record = (name, ok, detail) => {
@@ -61,12 +63,13 @@ function findConflicts() {
 
 // 启动 TUI：返回 { proc, out, send, close, waitExit }
 // out 持续累积 stdout；send(line) 写入一行；waitExit 等待进程退出（默认超时强杀）
-function launchTui(dir, extraEnv = {}) {
+function launchTui(dir, extraEnv = {}, opts = {}) {
   const proc = spawn(BIN, ["tui"], {
     // NO_AT_BRIDGE：Linux 下跳过 AT-SPI 无障碍总线查找（CI 无 dbus 时该查找阻塞 ~25s，
     // 会吞掉首个测试标记导致 T17/T19a 假失败；对 macOS/Windows 无影响）
     env: { ...process.env, NO_AT_BRIDGE: "1", BIT_DATA_DIR: dir, ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
+    cwd: opts.cwd || undefined, // 工作区沙箱测试：TUI 锚定子进程 cwd
   });
   let out = "";
   // StringDecoder 按字节安全解码：直接 += d.toString() 会在 chunk 边界切断多字节字符
@@ -430,6 +433,199 @@ async function main() {
     // （T7b/c 已覆盖核心冲突面，此处清理）
     try { desktop.kill(); } catch {}
     await sleep(500);
+  }
+
+  // ── T20 缓存结构：Claude system 双块（静态前缀打 cache_control，动态尾段不打），
+  // 记忆写入只改变动态块——三次请求的静态块必须逐字节一致 ──
+  {
+    const CDIR = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-cache-"));
+    fs.writeFileSync(
+      path.join(CDIR, "config.json"),
+      JSON.stringify({ compat_mode: false, auto_drive: false, remote_enabled: false, host: "127.0.0.1", port: 8612, client_key: "bit_e2e_cache_key", revision: 1 })
+    );
+    fs.writeFileSync(
+      path.join(CDIR, "ai_config.json"),
+      JSON.stringify({ providers: [{ id: "mockc", name: "mockc", protocol: "claude", base_url: "http://127.0.0.1:9901", api_key: "e2e", model: "mock-claude", active: true }] })
+    );
+    const dump = path.join(os.tmpdir(), "bit-e2e-cache-dump.jsonl");
+    try { fs.rmSync(dump, { force: true }); } catch {}
+    const tui = launchTui(CDIR);
+    await tui.ready();
+    tui.send("E2E-CACHE-CHAT 第一轮");
+    for (let i = 0; i < 60 && !tui.out.includes("E2E-CACHE-CHAT-OK"); i++) await sleep(500);
+    tui.send("E2E-CACHE-CHAT 第二轮");
+    for (let i = 0; i < 60; i++) { await sleep(500); const n = (fs.existsSync(dump) ? fs.readFileSync(dump, "utf8").match(/E2E-CACHE-CHAT/g) || [] : []).length; if (n >= 2) break; }
+    tui.send("/mem 缓存探针记忆三七二一号");
+    await sleep(800); // 本地沉淀命令，不发请求
+    tui.send("E2E-CACHE-CHAT 第三轮");
+    for (let i = 0; i < 60; i++) { await sleep(500); const n = (fs.existsSync(dump) ? fs.readFileSync(dump, "utf8").match(/E2E-CACHE-CHAT/g) || [] : []).length; if (n >= 3) break; }
+    tui.send("/quit");
+    await tui.waitExit(30000);
+
+    let detail = "无快照";
+    let ok = false;
+    try {
+      const snaps = fs.readFileSync(dump, "utf8").trim().split("\n").map(JSON.parse).filter((s) => s.marker === "E2E-CACHE-CHAT");
+      // /mem 回显 "已沉淀记忆 <id>"：记忆索引行格式为 "- about <主题词> [<id>]"
+      const idMatch = [...tui.out.matchAll(/已沉淀记忆 (\S+)/g)].pop();
+      const memId = idMatch ? idMatch[1] : "";
+      const memLine = memId ? new RegExp(`- about [^\\n]*\\[${memId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`) : null;
+      if (snaps.length === 3 && memLine && snaps.every((s) => s.blocks.length === 2)) {
+        const heads = snaps.map((s) => s.blocks[0].text);
+        const tails = snaps.map((s) => s.blocks[1].text);
+        const headStable = heads[0] === heads[1] && heads[1] === heads[2];
+        const cacheBreak = snaps.every((s) => s.blocks[0].cache === true && s.blocks[1].cache === false);
+        const headNonEmpty = heads[0].length > 500; // 静态主体（契约/工具说明）应远大于 500 字节
+        const dynamicChanged = !memLine.test(tails[0]) && !memLine.test(tails[1]) && memLine.test(tails[2]);
+        ok = headStable && cacheBreak && headNonEmpty && dynamicChanged;
+        detail = `snaps=${snaps.length} memId=${memId} headStable=${headStable} cacheBreak=${cacheBreak} headBytes=${heads[0].length} dynamicChanged=${dynamicChanged}`;
+      } else {
+        detail = `snaps=${snaps.length} memId=${memId} blockLens=${snaps.map((s) => s.blocks.length).join(",")}`;
+      }
+    } catch (e) { detail = e.message; }
+    record("T20 system 双块缓存断点稳定", ok, detail);
+  }
+
+  // ── T21 沉淀型回合静默：add_memory 工具结果不回灌，mock 只收到 1 次请求 ──
+  {
+    const SDIR = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-silent-"));
+    fs.writeFileSync(
+      path.join(SDIR, "config.json"),
+      JSON.stringify({ compat_mode: false, auto_drive: false, remote_enabled: false, host: "127.0.0.1", port: 8613, client_key: "bit_e2e_silent_key", revision: 1 })
+    );
+    fs.writeFileSync(
+      path.join(SDIR, "ai_config.json"),
+      JSON.stringify({ providers: [{ id: "mockc", name: "mockc", protocol: "claude", base_url: "http://127.0.0.1:9901", api_key: "e2e", model: "mock-claude", active: true }] })
+    );
+    const dump = path.join(os.tmpdir(), "bit-e2e-cache-dump.jsonl");
+    try { fs.rmSync(dump, { force: true }); } catch {}
+    const tui = launchTui(SDIR);
+    await tui.ready();
+    tui.send("E2E-CACHE-SILENT");
+    // 等工具执行回显，再留 4s 观察是否冒出多余的第二轮请求
+    for (let i = 0; i < 60 && !tui.out.includes("[tool] add_memory"); i++) await sleep(500);
+    await sleep(4000);
+    tui.send("/quit");
+    await tui.waitExit(30000);
+
+    let detail = "";
+    let ok = false;
+    try {
+      const snaps = fs.existsSync(dump) ? fs.readFileSync(dump, "utf8").trim().split("\n").map(JSON.parse).filter((s) => s.marker === "E2E-CACHE-SILENT") : [];
+      const oneRequest = snaps.length === 1 && snaps[0].note === "first-round";
+      const toolShown = tui.out.includes("[tool] add_memory") && tui.out.includes("成功");
+      const noBug = !tui.out.includes("E2E-CACHE-SILENT-BUG");
+      ok = oneRequest && toolShown && noBug;
+      detail = `requests=${snaps.length} notes=[${snaps.map((s) => s.note).join(",")}] toolShown=${toolShown}`;
+    } catch (e) { detail = e.message; }
+    record("T21 沉淀回合不触发第二轮", ok, detail);
+  }
+
+  // ── T22 工作区沙箱：shell 默认 cwd=启动目录、相对路径落盘、绝对路径逃逸被拒、/cd 切换 ──
+  {
+    const WS = fs.mkdtempSync(path.join(os.tmpdir(), "bit-ws-root-"));
+    const CDIR = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-ws-"));
+    fs.writeFileSync(path.join(CDIR, "config.json"), JSON.stringify({ compat_mode: true, remote_enabled: false, host: "127.0.0.1", port: 8615, client_key: "bit_e2e_ws_key", revision: 1 }));
+    fs.writeFileSync(path.join(CDIR, "ai_config.json"), JSON.stringify({ providers: [{ id: "mock", name: "mock", protocol: "openai", base_url: "http://127.0.0.1:9901/v1", api_key: "e2e", model: "mock", active: true }] }));
+    const escapeFile = path.join(os.tmpdir(), `bit-escape-${Date.now()}.txt`);
+    const norm = (s) => String(s).replace(/\\/g, "/").toLowerCase();
+    const waitFor = async (tui, needle, ms = 30000) => { for (let i = 0; i < ms / 500; i++) { if (tui.out.includes(needle)) return true; await sleep(500); } return false; };
+    const tui = launchTui(CDIR, {}, { cwd: WS });
+    await tui.ready();
+
+    tui.send("/pwd");
+    await sleep(500);
+    const pwdOk = norm(tui.out).includes(norm(WS));
+
+    tui.send("E2E-WS-PWD 默认cwd");
+    await waitFor(tui, "E2E-FINAL-OK");
+    const shellCwdOk = norm(tui.out).includes(norm(WS));
+
+    tui.send("E2E-WS-WRITE 相对路径写文件");
+    await waitFor(tui, "E2E-FINAL-OK");
+    await sleep(300);
+    const relFile = path.join(WS, "bit-ws-probe.txt");
+    const writeOk = fs.existsSync(relFile) && fs.readFileSync(relFile, "utf8") === "ws-ok";
+
+    tui.send(`E2E-WS-ESCAPE|${escapeFile} 绝对路径逃逸`);
+    await waitFor(tui, "ws-escape-rejected", 20000);
+    await sleep(300);
+    // TUI 只回显工具行不打印结果详情：以"→ 失败"计数增加 + 逃逸文件未创建为据
+    const failLines = (tui.out.match(/→ 失败/g) || []).length;
+    const rejectOk = tui.out.includes("ws-escape-rejected") && failLines > 0 && !fs.existsSync(escapeFile);
+
+    tui.send(`/cd ${CDIR}`);
+    await sleep(500);
+    tui.send("E2E-WS-PWD 切换cwd");
+    // 轮询直到最后一条 FINAL 的 stdout 已变成 CDIR（ESCAPE 回合后节奏可能拖慢，给足 30s）
+    let lastStdout = "";
+    for (let i = 0; i < 60; i++) {
+      const finals = [...tui.out.matchAll(/E2E-FINAL-OK stdout=「([^」]*)」/g)].map((m) => m[1]);
+      lastStdout = norm(finals.at(-1) || "");
+      if (lastStdout.includes(norm(CDIR))) break;
+      await sleep(500);
+    }
+    const cdOk = lastStdout.includes(norm(CDIR));
+
+    tui.send("/quit");
+    await tui.waitExit(30000);
+    try { fs.rmSync(escapeFile, { force: true }); } catch {}
+    const ok = pwdOk && shellCwdOk && writeOk && rejectOk && cdOk;
+    record("T22 工作区沙箱(cwd/相对/逃逸/cd)", ok, `pwd=${pwdOk} shellCwd=${shellCwdOk} write=${writeOk} reject=${rejectOk} cd=${cdOk}`);
+  }
+
+  // ── T23 新增 TUI 命令：rename/approval/goals/todo/interrupt/clear/delete/runtimes ──
+  {
+    const NDIR = fs.mkdtempSync(path.join(os.tmpdir(), "bit-tui-cmds-"));
+    fs.writeFileSync(path.join(NDIR, "config.json"), JSON.stringify({ compat_mode: true, remote_enabled: false, host: "127.0.0.1", port: 8616, client_key: "bit_e2e_cmd_key", revision: 1 }));
+    fs.writeFileSync(path.join(NDIR, "ai_config.json"), JSON.stringify({ providers: [{ id: "mock", name: "mock", protocol: "openai", base_url: "http://127.0.0.1:9901/v1", api_key: "e2e", model: "mock", active: true }] }));
+    const tui = launchTui(NDIR);
+    await tui.ready();
+
+    tui.send("/rename 我的测试会话");
+    await sleep(400);
+    tui.send("/sessions");
+    await sleep(400);
+    const renameOk = tui.out.includes("已重命名会话") && tui.out.includes("我的测试会话");
+
+    tui.send("/goals");
+    await sleep(300);
+    tui.send("/todo");
+    await sleep(300);
+    const listOk = tui.out.includes("（暂无目标）") && tui.out.includes("（暂无待办）");
+
+    tui.send("/approval auto");
+    await sleep(300);
+    tui.send("/approval");
+    await sleep(300);
+    // TUI 不回显输入行：取最后一次"当前审批模式"播报，必须是刚切换的 auto
+    const modeHits = [...tui.out.matchAll(/当前审批模式：(ask|auto|allow_all)/g)];
+    const approvalOk = tui.out.includes("审批模式已切换为：auto") && modeHits.length >= 1 && modeHits.at(-1)[1] === "auto";
+
+    tui.send("/interrupt");
+    await sleep(300);
+    const interruptOk = tui.out.includes("当前会话没有进行中的回合");
+
+    tui.send("/runtimes");
+    await sleep(300);
+    const runtimesOk = !tui.out.includes("错误：");
+
+    // 先对话产生消息再清空
+    tui.send("TUI-MOCK-GREETING");
+    for (let i = 0; i < 40 && !tui.out.includes("好的。"); i++) await sleep(500);
+    tui.send("/clear");
+    await sleep(400);
+    const clearOk = /已清空 \d+ 条消息/.test(tui.out);
+
+    // 删当前会话（唯一会话 → 自动补新会话）
+    tui.send("/delete");
+    await sleep(400);
+    const deleteOk = tui.out.includes("已删除会话") && tui.out.includes("当前会话");
+
+    tui.send("/quit");
+    await tui.waitExit(30000);
+    const ok = renameOk && listOk && approvalOk && interruptOk && runtimesOk && clearOk && deleteOk;
+    record("T23 新增命令(rename/approval/goals/todo/interrupt/clear/delete)", ok, `rename=${renameOk} list=${listOk} approval=${approvalOk} interrupt=${interruptOk} runtimes=${runtimesOk} clear=${clearOk} delete=${deleteOk}`);
   }
 
   const pass = results.filter((r) => r.ok).length;

@@ -1582,6 +1582,13 @@ let word_lists: Vec<Vec<String>> = mem_items.iter().map(|(_, content)| cut(conte
         - Images/videos/SVG generated or drawn are auto-saved under: {} — use it for intermediate media; to show a picture, output an \"image\" field (path/b64:/data:URL) from tool stdout.{diagram_hint}",
         ctx.image_dir().display()
     ));
+    // 工作区沙箱：TUI 模式锚定启动目录，shell 默认 cwd 与文件工具相对路径都基于它，越界会被拒绝
+    if let Some(ws) = crate::sandbox::effective_root(ctx) {
+        runtime_info.push_str(&format!(
+            "\n## Workspace (sandbox)\n- Working directory: {} — shell runs here by default; relative paths in read_file/write_file/edit anchor here; absolute paths outside it are rejected",
+            ws.display()
+        ));
+    }
     if !goal_lines.is_empty() {
         runtime_info.push_str(&format!("\n## Active goals\n{}", goal_lines.join("\n")));
     }

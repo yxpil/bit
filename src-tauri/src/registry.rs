@@ -810,6 +810,8 @@ async fn builtin_invoke(
             let cwd = params.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
             // AI 显式标记长任务：跳过前台窗口直接转后台（对话继续，完成后自动唤回本会话 AI）
             let force_bg = params.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+            // 工作区沙箱：显式 cwd 校验逃逸；未传时 TUI 兜底为启动目录
+            let cwd = crate::sandbox::resolve_cwd(ctx, cwd.as_deref())?;
             // 后台 shell：短命令秒回；长命令自动转后台（shell-job 事件 + 可停止 + 完成时顶层 worker 自动唤回会话 AI）
             crate::shellbg::run(ctx, &command, cwd.as_deref(), session, force_bg).await
         }
@@ -817,15 +819,21 @@ async fn builtin_invoke(
         "write_file" => {
             let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
             let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(parent) = std::path::Path::new(path).parent() {
+            let path = crate::sandbox::resolve_path(ctx, path)?;
+            if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::write(path, content).map_err(|e| format!("Failed to write: {e}"))?;
-            Ok(serde_json::json!({ "path": path, "bytes": content.len() }))
+            let path_str = path.to_string_lossy();
+            std::fs::write(&path, content).map_err(|e| format!("Failed to write: {e}"))?;
+            Ok(serde_json::json!({ "path": path_str, "bytes": content.len() }))
         }
         // ── 2.2 read_file：分块读取 + 行号（模型可直接按行号 edit）──
         "read_file" => {
-            let path = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
+            let path_raw = params.get("path").and_then(|v| v.as_str()).ok_or("Missing parameter: path")?;
+            let resolved = crate::sandbox::resolve_path(ctx, path_raw)?;
+            let path = resolved
+                .to_str()
+                .ok_or_else(|| format!("工作区路径含非 UTF-8 字符：{}", resolved.display()))?;
             let raw = std::fs::read(path).map_err(|e| format!("Failed to read: {e}"))?;
             // 二进制守卫：头部 8KB 含 NUL 即拒绝（不把乱码灌进上下文）
             let head = &raw[..raw.len().min(8192)];
@@ -1105,7 +1113,12 @@ async fn builtin_invoke(
         }
         // ── 4. edit：增量补丁（old_string 精确匹配 或 start_line/end_line 行范围）──
         "edit" => {
-            let path = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
+            let path_raw = params.get("path").and_then(|v| v.as_str()).ok_or("缺少参数 path")?;
+            // 沙箱解析后转回 &str：相对路径锚定工作区、绝对路径禁逃逸，后续逻辑零改动
+            let resolved = crate::sandbox::resolve_path(ctx, path_raw)?;
+            let path = resolved
+                .to_str()
+                .ok_or_else(|| format!("工作区路径含非 UTF-8 字符：{}", resolved.display()))?;
             let new = params.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
             // 行范围模式：read_file 返回的行号直接定位替换，适配大文件（old_string 匹配大段文本既费 token 又易失配）
             if let (Some(sl), Some(el)) = (

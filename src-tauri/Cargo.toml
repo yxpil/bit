@@ -55,7 +55,12 @@ crossbeam-channel = "0.5"
 screenshots = { version = "0.8", optional = true }
 enigo = { version = "0.2", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+# 全屏 TUI（真终端时启用；管道/无 TTY 自动回退行协议，E2E 不受影响）。
+# exotic/musl 目标用 --no-default-features 跳过
+ratatui = { version = "0.28", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [features]
-default = ["desktop-ctl"]
+default = ["desktop-ctl", "tui-ui"]
 desktop-ctl = ["dep:screenshots", "dep:enigo", "dep:image"]
+tui-ui = ["dep:ratatui", "dep:crossterm"]

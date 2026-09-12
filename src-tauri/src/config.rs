@@ -37,6 +37,11 @@ pub struct Config {
     /// 工具调用。只用于不支持 tools 参数的端点（纯文本中转等），无需探测、不做自动降级
     #[serde(default)]
     pub compat_mode: bool,
+    /// 工作区沙箱根（绝对路径）：设置后 shell 未显式传 cwd 时以此为工作目录，
+    /// read_file/write_file/edit 的相对路径锚定于此、绝对路径禁止逃出根外。
+    /// None = 不限制；TUI 模式启动时自动取进程当前目录（运行时值，不回写配置）
+    #[serde(default)]
+    pub workspace_root: Option<String>,
     /// 极简提示词：开启后默认系统提示词只保留一句身份 + 兼容模式契约（如启用）
     /// + 按启用工具动态注入的少量提示；用户自定义覆盖模板时不生效
     #[serde(default)]
@@ -240,6 +245,7 @@ impl Default for Config {
             auto_delegate: false,
             subagent_max: default_subagent_max(),
             compat_mode: false,
+            workspace_root: None,
             minimal_prompt: false,
             tool_screen: false,
             tool_mouse: false,

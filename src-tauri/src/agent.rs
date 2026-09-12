@@ -61,6 +61,17 @@ pub fn interrupted(ctx: &Arc<Ctx>, target: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 请求中断会话当前回合：置位已注册的中断标志（TUI stdin 线程等非前端入口用）。
+/// 返回 false = 该会话没有进行中的回合（标志不存在），调用方可提示"当前没有任务"
+pub fn request_stop(ctx: &Arc<Ctx>, target: &str) -> bool {
+    ctx.interrupts
+        .lock()
+        .unwrap()
+        .get(target)
+        .map(|f| f.store(true, Ordering::Relaxed))
+        .is_some()
+}
+
 /// 中断等待：每 150ms 轮询一次标志。配合 tokio::select! 让长请求（原生模式整段生成）
 /// 和长工具执行随时可被 chat_interrupt 打断，前端无需等请求自然结束
 async fn wait_interrupt(ctx: &Arc<Ctx>, target: &str) {

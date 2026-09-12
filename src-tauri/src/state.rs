@@ -119,6 +119,9 @@ pub struct Ctx {
     pub nonce_seen: Mutex<crate::security::NonceCache>,
     /// 工具质量统计：tool_id → 成功率等（内存态 + tool_stats.json 落盘）
     pub tool_stats: Mutex<toolstats::Store>,
+    /// 工作区沙箱根（运行时）：TUI 启动时默认锚定进程 cwd；None = 不限制（桌面端默认）。
+    /// config.workspace_root 可显式指定；shell 未传 cwd 时以此兜底，文件工具路径禁止逃逸
+    pub workspace_root: Mutex<Option<PathBuf>>,
     /// 进程启动时刻（诊断报告的运行时长）
     pub started: std::time::Instant,
 }
@@ -272,6 +275,7 @@ impl Ctx {
                 8192,
             )),
             tool_stats: Mutex::new(tool_stats),
+            workspace_root: Mutex::new(None),
             started: std::time::Instant::now(),
         })
     }
