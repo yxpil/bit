@@ -1,4 +1,4 @@
-# BreanInTerminal — Agent Tool Hub
+# Brean In Terminal — Agent Tool Hub
 
 简体中文 | [English](README_EN.md)
 
