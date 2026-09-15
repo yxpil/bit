@@ -2,11 +2,11 @@
 > [!IMPORTANT]
 > **本项目已迁移 / MOVED**
 >
-> 软件已更名为「**触手怪**」（Tentacle），新家：**[yxpil/BreanInTentacle](https://github.com/yxpil/BreanInTentacle)**
+> 软件已更名为「**触手怪**」（Tentacle），新家：**[yxpil/BrainTentacle](https://github.com/yxpil/BrainTentacle)**
 >
 > - 新版本发布、问题反馈、文档请移步新仓库（Releases / Issues / Wiki 均在新仓库）
 > - 本仓库（bit）已停止维护，不再发布新版本；已安装的旧版本仍可继续使用
-> - The software has been renamed to **Tentacle** and moved to [yxpil/BreanInTentacle](https://github.com/yxpil/BreanInTentacle). This repo is no longer maintained.
+> - The software has been renamed to **Tentacle** and moved to [yxpil/BrainTentacle](https://github.com/yxpil/BrainTentacle). This repo is no longer maintained.
 
 ---
 
