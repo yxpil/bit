@@ -1,6 +1,6 @@
 
 > [!IMPORTANT]
-> **本项目已迁移 / MOVED**
+> **本项目的另一个版本 / Other**
 >
 > 软件已更名为「**触手怪**」（Tentacle），新家：**[yxpil/BrainTentacle](https://github.com/yxpil/BrainTentacle)**
 >
