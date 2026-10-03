@@ -1,5 +1,12 @@
 # BIT 测试说明
 
+- 测试完成：是（2026-10-04）
+- 测试日期：2026-10-04
+- 测试内容：单元测试（plugins 钩子代码解析/清单容错、sandbox 路径穿越规范化、securefile 加密往返/MAC 篡改、http_api 鉴权、agent 协议解析等）；注入测试 4（sandbox `../` 路径穿越逃逸根目录）；钩子测试 5（plugins `resolve_code` 文件优先/回退/空值、缺 id 清单解析、非法 JSON 拒绝）。本 crate 为 Tauri bin-only，无独立 tests/ 集成目录，测试按惯例落在 `src-tauri/src` 各模块 `#[cfg(test)]`。
+- 运行命令：`cd src-tauri; cargo test --no-fail-fast`
+- 测试框架：Rust `#[cfg(test)]`
+- 模型：豆包（Doubao）生成
+
 BIT 是一个 Tauri 2 桌面应用，Rust crate 位于 `src-tauri/`，是**单一 bin crate**（`src/main.rs`，无 `lib.rs` 库目标）。因此它没有 `tests/` 集成测试目录——Rust 的 `tests/` 只能链接库目标，而为这个 Tauri bin 强行拆出 `lib.rs` 会把整套模块声明复制一份、显著拖慢编译并可能破坏 `tauri::App` 的初始化路径。**该 crate 的测试按 Rust 惯例全部放在各模块内的 `#[cfg(test)]` 单元测试中**，这对 bin crate 是标准做法。
 
 ## 如何运行
