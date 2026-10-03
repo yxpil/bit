@@ -96,4 +96,38 @@ mod tests {
         let norm = normalize(&root.join("src/./main.rs"));
         assert!(norm.starts_with(&root));
     }
+
+    // ── 注入：路径穿越边界 ──
+
+    #[test]
+    fn dotdot_that_cancels_out_stays_inside() {
+        // src/../src 抵消后仍在根内
+        let root = PathBuf::from("/work/proj");
+        let norm = normalize(&root.join("src/../src/main.rs"));
+        assert!(norm.starts_with(&root));
+        assert_eq!(norm, PathBuf::from("/work/proj/src/main.rs"));
+    }
+
+    #[test]
+    fn dotdot_climbing_above_root_is_rejected() {
+        let root = PathBuf::from("/work/proj");
+        // ../../.. 爬到根之上
+        let norm = normalize(&root.join("../../../etc/passwd"));
+        assert!(!norm.starts_with(&root));
+    }
+
+    #[test]
+    fn root_itself_is_allowed() {
+        let root = PathBuf::from("/work/proj");
+        let norm = normalize(&root);
+        assert!(norm.starts_with(&root));
+    }
+
+    #[test]
+    fn current_dir_segments_are_collapsed() {
+        let root = PathBuf::from("/work/proj");
+        let norm = normalize(&root.join("././a/./b.txt"));
+        assert_eq!(norm, PathBuf::from("/work/proj/a/b.txt"));
+        assert!(norm.starts_with(&root));
+    }
 }

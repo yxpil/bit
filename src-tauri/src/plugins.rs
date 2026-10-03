@@ -479,4 +479,62 @@ mod tests {
         assert_eq!(sanitize("我的-工具 v1"), "______v1");
         assert_eq!(sanitize("mouse_move"), "mouse_move");
     }
+
+    // ── 钩子/插件：代码解析与清单容错 ──
+
+    #[test]
+    fn resolve_code_prefers_file_over_inline_code() {
+        let dir = std::env::temp_dir().join(format!("bit-plugin-it-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool.py"), "FILE_CONTENT").unwrap();
+
+        // file 存在 → 用 file 内容，忽略内联 code
+        let got = resolve_code(&dir, &Some("tool.py".into()), &Some("INLINE".into()));
+        assert_eq!(got.as_deref(), Some("FILE_CONTENT"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_code_falls_back_to_inline_when_file_missing() {
+        let dir = std::env::temp_dir().join(format!("bit-plugin-it2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // file 指向不存在的文件 → 回退内联 code
+        let got = resolve_code(&dir, &Some("nope.py".into()), &Some("INLINE_FALLBACK".into()));
+        assert_eq!(got.as_deref(), Some("INLINE_FALLBACK"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_code_empty_inline_is_none() {
+        let dir = std::env::temp_dir().join(format!("bit-plugin-it3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // file 缺失、内联 code 为空白 → None（不注册空工具）
+        let got = resolve_code(&dir, &None, &Some("   ".into()));
+        assert!(got.is_none());
+        let got2 = resolve_code(&dir, &None, &None);
+        assert!(got2.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plugin_manifest_without_id_still_parses() {
+        // 文档格式的 plugin.json 可以不写 id（sync 时用目录名覆盖）；
+        // 缺字段必须能解析而不是让整个插件被静默丢弃。
+        let json = r#"{ "name": "演示", "tools": [{ "name": "t1" }] }"#;
+        let p: Plugin = serde_json::from_str(json).unwrap();
+        assert_eq!(p.name, "演示");
+        assert_eq!(p.tools.len(), 1);
+        assert_eq!(p.tools[0].kind, "interpreter"); // 默认 kind
+        assert!(p.jobs.is_empty());
+    }
+
+    #[test]
+    fn plugin_manifest_rejects_garbage_json() {
+        // 非法 JSON 必须报错而不是 panic —— scan 会据此收集错误列表
+        let bad = r#"{ "name": "#;
+        assert!(serde_json::from_str::<Plugin>(bad).is_err());
+    }
 }
