@@ -273,3 +273,15 @@ installer/bit.iss  Inno Setup 打包脚本
 ## 许可
 
 [Apache License 2.0](LICENSE) — **BIT 永久免费**：所有功能无内购、无订阅、无功能锁，个人与商业使用均免费。
+
+---
+
+<div align="center">
+
+<a href="https://github.com/yxpil/bit">
+  <img width="100%" src="https://alittlecatgirlpanel.yxp.hk/card?repo=yxpil/bit" alt="gh-card · yxpil/bit" />
+</a>
+
+<sub>Powered by <a href="https://alittlecatgirlpanel.yxp.hk"><b>gh-card</b></a> · 粉色手写体 README 仓库名片</sub>
+
+</div>
